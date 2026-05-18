@@ -323,6 +323,7 @@ if __name__ == "__main__":
     argparser = argparse.ArgumentParser()
     argparser.add_argument("--dataset_name", default="f1_subsampled", type=str)
     argparser.add_argument("--data-dir", default="data", type=str)
+    argparser.add_argument("--preprocess-m2m", action="store_true")
     args = argparser.parse_args()
 
     dataset = args.dataset_name
@@ -369,6 +370,12 @@ if __name__ == "__main__":
         fk_tables = None
         split_by_subgraph = True
 
+    if args.preprocess_m2m and fk_tables is not None:
+        fk_tables = None
+        postfix = "gen_m2m"
+    else:
+        postfix = "_gen"
+        
     # Convert the NetworkX graph to a graph-tool format
     g = nx2gt(G)
 
@@ -409,5 +416,5 @@ if __name__ == "__main__":
     assert nkk_orig == nkk
 
     # Save the generated graph
-    with open(f"{data_dir}/structure/{dataset}_graph_gen.pkl", "wb") as f:
+    with open(f"{data_dir}/structure/{dataset}_graph_{postfix}.pkl", "wb") as f:
         pickle.dump(U, f)

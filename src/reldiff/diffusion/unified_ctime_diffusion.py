@@ -836,7 +836,6 @@ class MultiTableUnifiedCtimeDiffusion(UnifiedCtimeDiffusion):
         proportions_dict: dict = {},
         dequantize: bool = False,
         is_disjoint: bool = False,
-        num_seed_nodes: int = 10,
         num_neighbors: int = -1,
         dimension_tables: list | None = None,
         timestep_sampling: str = "uniform",
@@ -857,7 +856,6 @@ class MultiTableUnifiedCtimeDiffusion(UnifiedCtimeDiffusion):
         self.root_table = root_table
         self.n_hops_dataloader = n_hops_dataloader
         self.is_disjoint = is_disjoint
-        self.num_seed_nodes = num_seed_nodes
         self.num_neighbors = num_neighbors
         self.dimension_tables = dimension_tables
         self.timestep_sampling = timestep_sampling
@@ -1040,16 +1038,12 @@ class MultiTableUnifiedCtimeDiffusion(UnifiedCtimeDiffusion):
         sigma_cat_dict = dict()
         dsigma_cat_dict = dict()
         if self.is_disjoint:
-            num_subgraphs = max(
-                {nodes[0] for _, nodes in batch.num_sampled_nodes_dict.items()}
-            )
+            num_subgraphs = max(batch.batch_size_dict.values())
         else:
             num_subgraphs = 1
         if t_batch is None:
             if self.timestep_sampling == "uniform":
-                t_batch = torch.rand(
-                    num_subgraphs, device=self.device, dtype=torch.float32
-                )
+                t_batch = torch.rand(num_subgraphs, device=self.device)
             elif self.timestep_sampling == "low_discrepancy":
                 t_batch = low_discrepancy_sampler(num_subgraphs, device=self.device)
             elif self.timestep_sampling == "antithetic":
@@ -1175,7 +1169,6 @@ class MultiTableUnifiedCtimeDiffusion(UnifiedCtimeDiffusion):
     def sample_all(self, dataset: HeteroData, device=None, batch_size: int = 20000):
         if device is None:
             device = self.device
-        dtype = torch.float32
 
         z_norm_dict = dict()
         z_cat_dict = dict()
@@ -1188,7 +1181,7 @@ class MultiTableUnifiedCtimeDiffusion(UnifiedCtimeDiffusion):
 
         # Create the chain of t
         t = torch.linspace(
-            0, 1, self.num_timesteps, dtype=dtype, device=device
+            0, 1, self.num_timesteps, device=device
         )  # times = 0.0,...,1.0
         t = t[:, None]
 
@@ -1552,10 +1545,8 @@ class MultiTableUnifiedCtimeDiffusion(UnifiedCtimeDiffusion):
             num_neighbors=self.num_neighbors,
             num_workers=0,  # Increase this for faster dataloading
             is_disjoint=self.is_disjoint,
-            num_seed_nodes=self.num_seed_nodes,
             dimension_tables=self.dimension_tables,
             drop_last=False,
-            two_stage=False,
         )
 
 
@@ -1575,7 +1566,7 @@ def low_discrepancy_sampler(num_samples, device):
     Inspired from the Variational Diffusion Paper (Kingma et al., 2022)
     Based on the implementation (https://github.com/muellermarkus/cdtd)
     """
-    single_u = torch.rand((1,), device=device, requires_grad=False, dtype=torch.float32)
+    single_u = torch.rand((1,), device=device, requires_grad=False)
     return (
         single_u
         + torch.arange(

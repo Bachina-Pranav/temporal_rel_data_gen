@@ -8,7 +8,7 @@ aggr="sum"
 type="HeteroGraphSAGE"
 
 [graph]
-num_neighbors=-1
+num_neighbors=64
 n_hops=2
 
 [model]
@@ -18,7 +18,7 @@ transformer_layers=2
 d_token=4
 factor=32
 bias=true
-use_transformers=false
+use_transformers=true
 
 [diffusion_params]
 num_timesteps = 100

@@ -19,7 +19,7 @@ class HeteroGAT(torch.nn.Module):
         node_types: list[NodeType],
         edge_types: list[EdgeType],
         channels: int,
-        aggr: str = "mean",
+        aggr: str = "sum",
         num_layers: int = 2,
     ):
         super().__init__()
@@ -33,7 +33,7 @@ class HeteroGAT(torch.nn.Module):
                     )
                     for edge_type in edge_types
                 },
-                aggr="sum",
+                aggr=aggr,
             )
             self.convs.append(conv)
 
@@ -214,8 +214,9 @@ class GraphDiff(nn.Module):
                 emb += self.order_encoders[table](batch[table].order)
             # Tokenize the input
             e = self.tokenizers[table](x_num_dict[table], x_cat_dict[table])
-            encoder_input = e[:, 1:, :]  # ignore the first CLS token.
+            encoder_input = e[:, 1:, :]
             if self.use_transformers:
+                # remove CLS token.
                 x = self.encoders[table](encoder_input)
             else:
                 x = encoder_input
@@ -231,7 +232,7 @@ class GraphDiff(nn.Module):
             mask = torch.isin(batch[table_name].n_id, batch[table_name].input_id)
 
             timesteps = time_dict[table_name][mask]
-            target_nodes_features = (gnn_out[mask] + x_in[table_name][mask]) * 0.5
+            target_nodes_features = gnn_out[mask]
 
             if mask.sum() == 0:
                 x_num_out_dict[table_name] = torch.zeros(
@@ -289,8 +290,8 @@ class PrecondMulti(nn.Module):
         c_noise_dict = dict()
         mask_dict = dict()
         for table_name, x_num in x_num_dict.items():
-            x_num = x_num.to(torch.float32)
-            sigma = sigma_dict[table_name].to(torch.float32)
+            x_num = x_num
+            sigma = sigma_dict[table_name]
             t = t_dict[table_name]
 
             assert sigma.ndim == 2
@@ -302,7 +303,6 @@ class PrecondMulti(nn.Module):
                 ).pow(7)
             else:
                 sigma_cond = sigma
-            dtype = torch.float32
 
             c_skip = self.sigma_data**2 / (sigma**2 + self.sigma_data**2)
             c_out = sigma * self.sigma_data / (sigma**2 + self.sigma_data**2).sqrt()
@@ -331,8 +331,7 @@ class PrecondMulti(nn.Module):
             F_x = F_x_dict[table_name]
             c_skip = c_skip_dict[table_name]
             c_out = c_out_dict[table_name]
-            assert F_x.dtype == dtype
-            D_x_dict[table_name] = c_skip * x_num[mask] + c_out * F_x.to(torch.float32)
+            D_x_dict[table_name] = c_skip * x_num[mask] + c_out * F_x
 
         return D_x_dict, x_cat_pred_dict
 

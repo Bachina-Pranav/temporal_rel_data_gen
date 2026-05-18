@@ -1,0 +1,8 @@
+# CORA has no numerical features. Use --config-path with a TOML that sets:
+#   [diffusion_params]
+#   scheduler = "power_mean"
+#   [diffusion_params.sampler_params]
+#   stochastic_sampler = false
+#   second_order_correction = false
+
+is_disjoint = false

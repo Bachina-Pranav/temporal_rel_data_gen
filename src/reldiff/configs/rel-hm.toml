@@ -1,5 +1,5 @@
 [data]
-standardize=false
+standardize=true
 dequantize=false
 normalization="quantile"
 
@@ -8,9 +8,8 @@ aggr="sum"
 type="HeteroGraphSAGE"
 
 [graph]
-num_neighbors=-1
+num_neighbors=128
 n_hops=1
-two_stage_sampling=false
 
 [model]
 dim_t=128
@@ -19,7 +18,7 @@ transformer_layers=2
 d_token=4
 factor=32
 bias=true
-use_transformers=true
+use_transformers=false
 
 [diffusion_params]
 num_timesteps = 100

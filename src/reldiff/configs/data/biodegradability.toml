@@ -1,0 +1,2 @@
+is_disjoint = true
+n_hops_dataloader = 3 # ensures full subgraph are loaded at each step (loss uses all node types)

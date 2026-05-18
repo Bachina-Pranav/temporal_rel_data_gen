@@ -9,7 +9,7 @@ from syntherela.metadata import Metadata
 from syntherela.data import load_tables, remove_sdv_columns
 
 from reldiff.metrics import TabMetrics
-from reldiff.configs.utils import load_config
+from reldiff.configs.utils import load_config, load_dataset_config
 from reldiff.data import create_dataset, process_data
 from reldiff.data.utils import get_category_proportions
 from reldiff.data.dataloader import get_subgraph_dataloader
@@ -17,6 +17,7 @@ from reldiff.trainer import MultiTableTrainer
 from reldiff.models import ModelJoint, GraphDiff
 from reldiff.diffusion.unified_ctime_diffusion import MultiTableUnifiedCtimeDiffusion
 
+torch.set_float32_matmul_precision("medium")
 
 argparser = argparse.ArgumentParser()
 argparser.add_argument("dataset_name", default="rossmann_subsampled", type=str)
@@ -32,11 +33,17 @@ argparser.add_argument("--no-wandb", action="store_true")
 argparser.add_argument(
     "--config-path", default="src/reldiff/configs/reldiff_config.toml", type=str
 )
+argparser.add_argument("--dataset-config-path", default=None, type=str)
 argparser.add_argument("--sampling-device", default="cuda", type=str)
 argparser.add_argument(
     "--device", default="cuda", type=str, help="Device to use for training"
 )
+argparser.add_argument("--compile-model", action="store_true", help="Use torch.compile")
+argparser.add_argument("--num-workers", default=os.cpu_count(), type=int)
 argparser.add_argument("--use-ema", action="store_true", help="Use EMA for training")
+argparser.add_argument(
+    "--mixed-precision", action="store_true", help="Use mixed precision training"
+)
 
 args = argparser.parse_args()
 
@@ -48,79 +55,19 @@ batch_size = args.batch_size
 # Load config
 config = load_config(args.config_path)
 
-n_hops_dataloader = config["graph"][
-    "n_hops"
-]  # This can be different for some disjoint datasets
-
-
 DATA_DIR = "./data"
 if args.device == "cuda" and torch.cuda.is_available():
     device = "cuda"
 else:
     device = "cpu"
 
-dimension_tables = []
-order_cols = {}
-if database_name == "rossmann_subsampled":
-    is_disjoint = True
-    order_cols = {"historical": "Date"}
-elif database_name == "airbnb-simplified_subsampled":
-    is_disjoint = True
-elif database_name == "walmart_subsampled":
-    is_disjoint = True
-    order_cols = {"depts": "Date", "features": "Date"}
-elif database_name == "california_clava":
-    is_disjoint = True
-elif database_name == "Biodegradability_v1":
-    is_disjoint = True
-    n_hops_dataloader = 3
-elif database_name == "ccs_clava":
-    is_disjoint = False
-    dimension_tables = ["product"]  # TODO: get this from metadata
-elif database_name == "berka_clava" or database_name == "Berka_subsampled":
-    is_disjoint = False
-    dimension_tables = ["district"]
-elif database_name == "instacart_05_clava":
-    is_disjoint = False
-    dimension_tables = ["aisle", "department", "product"]
-elif database_name == "CORA_v1":
-    is_disjoint = False
-    # The dataset has no numerical features
-    config["diffusion_params"]["sampler_params"]["stochastic_sampler"] = False
-    config["diffusion_params"]["sampler_params"]["second_order_correction"] = False
-    config["diffusion_params"]["scheduler"] = "power_mean"
-elif database_name == "f1_subsampled":
-    is_disjoint = False
-    dimension_tables = ["circuits"]
-elif database_name == "california_clava_dcr" or database_name == "berka_clava_dcr":
-    is_disjoint = True
-elif database_name == "rel-hm":
-    is_disjoint = False
-    dimension_tables = ["article"]
-elif database_name == "adventure_works":
-    is_disjoint = False
-    dimension_tables = [
-        "PhoneNumberType",
-        "ScrapReason",
-        "EmailAddress",
-        "Illustration",
-        "BusinessEntity",
-        "Shift",
-        "UnitMeasure",
-        "ProductPhoto",
-        "Culture",
-        "ContactType",
-        "Currency",
-        "PersonCreditCard",
-        "CountryRegion",
-        "AddressType",
-        "ProductCategory",
-        "ShipMethod",
-    ]
-else:
-    is_disjoint = False
-
-if dimension_tables is not None:
+settings = load_dataset_config(args.dataset_config_path)
+is_disjoint = settings["is_disjoint"]
+order_cols = settings["order_cols"]
+dimension_tables = settings["dimension_tables"]
+nh = settings["n_hops_dataloader"]
+n_hops_dataloader = nh if nh is not None else config["graph"]["n_hops"]
+if dimension_tables:
     print(
         f"Database {database_name} has the following dimension tables: {dimension_tables}"
     )
@@ -233,6 +180,10 @@ model = ModelJoint(
     **config["diffusion_params"]["edm_params"],
 )
 
+if args.compile_model:
+    torch._dynamo.config.capture_dynamic_output_shape_ops = True
+    model = torch.compile(model)
+
 assert n_hops_dataloader == config["graph"]["n_hops"] or is_disjoint
 
 diffusion = MultiTableUnifiedCtimeDiffusion(
@@ -267,8 +218,8 @@ dataloader = get_subgraph_dataloader(
     num_neighbors=config["graph"]["num_neighbors"],
     is_disjoint=is_disjoint,
     dimension_tables=dimension_tables,
-    two_stage=config["graph"]["two_stage_sampling"],
-    num_workers=0,  # Increase this for faster dataloading
+    num_workers=args.num_workers,
+    min_input_nodes=16,  # TODO: hardcoded - move to config
 )
 
 ## Enable Wandb
@@ -300,6 +251,7 @@ trainer = MultiTableTrainer(
     sampling_device=args.sampling_device,
     sampling_batch_size=args.sampling_batch_size,
     use_ema=args.use_ema,
+    mixed_precision=args.mixed_precision,
 )
 
 

@@ -33,3 +33,23 @@ def pack_config(config: RawConfig) -> RawConfig:
 def load_config(path: Path | str) -> RawConfig:
     with open(path, "rb") as f:
         return unpack_config(tomli.load(f))
+
+
+def load_dataset_config(path: Path | str) -> RawConfig:
+    path = Path(path)
+    defaults: RawConfig = {
+        "is_disjoint": False,
+        "order_cols": {},
+        "dimension_tables": [],
+        "n_hops_dataloader": None,
+    }
+    if not path.exists():
+        print(f"Dataset config file {path} not found, using defaults")
+        return dict(defaults)
+    loaded = load_config(path)
+    return {
+        "is_disjoint": loaded.get("is_disjoint", False),
+        "order_cols": loaded.get("order_cols") or {},
+        "dimension_tables": loaded.get("dimension_tables") or [],
+        "n_hops_dataloader": loaded.get("n_hops_dataloader"),
+    }

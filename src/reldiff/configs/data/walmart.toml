@@ -1,0 +1,5 @@
+is_disjoint = true
+
+[order_cols]
+depts = "Date"
+features = "Date"

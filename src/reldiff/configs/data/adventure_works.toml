@@ -1,0 +1,19 @@
+is_disjoint = false
+dimension_tables = [
+    "PhoneNumberType",
+    "ScrapReason",
+    "EmailAddress",
+    "Illustration",
+    "BusinessEntity",
+    "Shift",
+    "UnitMeasure",
+    "ProductPhoto",
+    "Culture",
+    "ContactType",
+    "Currency",
+    "PersonCreditCard",
+    "CountryRegion",
+    "AddressType",
+    "ProductCategory",
+    "ShipMethod",
+]

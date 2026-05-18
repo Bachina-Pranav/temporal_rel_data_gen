@@ -107,7 +107,7 @@ def create_dataset(
             values = values - values.min()
             data[table_name].order = torch.tensor(
                 values / np.timedelta64(1, "D")
-            ).long()
+            )
 
         # store the id mappings to integers
         primary_key = metadata.get_primary_key(table_name)

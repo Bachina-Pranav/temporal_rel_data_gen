@@ -7,6 +7,10 @@ from torch import Tensor
 import math
 
 
+def normalize_emb(emb, dim):
+    return F.normalize(emb, dim=dim, eps=1e-20)
+
+
 class Tokenizer(nn.Module):
     def __init__(self, d_numerical, categories, d_token, bias):
         super().__init__()
@@ -20,7 +24,7 @@ class Tokenizer(nn.Module):
             self.register_buffer("category_offsets", category_offsets)
             self.cat_weight = nn.Parameter(Tensor(sum(categories), d_token))
             nn.init.kaiming_uniform_(self.cat_weight, a=math.sqrt(5))
-
+        self.register_buffer("dim", torch.tensor(d_token))
         # take [CLS] token into account
         self.weight = nn.Parameter(Tensor(d_numerical + 1, d_token))
         self.bias = nn.Parameter(Tensor(d_bias, d_token)) if bias else None
@@ -72,7 +76,7 @@ class Tokenizer(nn.Module):
                 ]
             )
             x = x + bias[None]
-
+        x = normalize_emb(x, dim=2) * self.dim.sqrt()
         return x
 
 

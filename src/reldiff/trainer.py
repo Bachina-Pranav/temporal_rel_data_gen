@@ -733,13 +733,13 @@ class MultiTableTrainer(MultiTableSampler, Trainer):
         sampling_batch_size: int = 20000,
         timestep_sampling: str = "uniform",
         use_ema: bool = True,
+        mixed_precision: bool = False,
         **kwargs,
     ):
         self.diffusion = diffusion
-        self.ema_decay = ema_decay
-        self.ema_model = ExponentialMovingAverage(
-            self.diffusion.parameters(), decay=self.ema_decay
-        )
+        self.mixed_precision = mixed_precision
+        self.device = device
+        self.sampling_device = sampling_device
 
         # self.ema_num_schedule = ExponentialMovingAverage(
         #     self.diffusion.num_schedule.parameters(), decay=self.ema_decay
@@ -756,8 +756,19 @@ class MultiTableTrainer(MultiTableSampler, Trainer):
         self.init_lr = lr
         self.use_ema = use_ema
 
+        if self.use_ema:
+            self.ema_decay = ema_decay
+            self.ema_model = ExponentialMovingAverage(
+                self.diffusion.parameters(), decay=self.ema_decay
+            )
+
         self.separate_optimizers = separate_optimizers
         self.lr_scheduler = lr_scheduler
+
+        self.scaler = torch.amp.GradScaler(self.device, enabled=self.mixed_precision)
+        self.amp_dtype = torch.float16
+        if self.mixed_precision and torch.cuda.is_bf16_supported(False):
+            self.amp_dtype = torch.bfloat16
 
         if self.separate_optimizers:
             self.optimizers: dict[str, torch.optim.AdamW] = dict()
@@ -796,8 +807,6 @@ class MultiTableTrainer(MultiTableSampler, Trainer):
         self.logger = logger
         self.check_val_every = check_val_every
 
-        self.device = device
-        self.sampling_device = sampling_device
         self.sampling_batch_size = sampling_batch_size
         self.timestep_sampling = timestep_sampling
         self.model_save_path = model_save_path
@@ -828,17 +837,32 @@ class MultiTableTrainer(MultiTableSampler, Trainer):
         else:
             self.optimizer.zero_grad()
 
-        dloss, closs = self.diffusion.mixed_loss(data, t_batch=t_batch)
+        with torch.autocast(
+            device_type=self.device, dtype=self.amp_dtype, enabled=self.mixed_precision
+        ):
+            dloss, closs = self.diffusion.mixed_loss(data, t_batch=t_batch)
 
-        loss = dloss_weight * dloss["total"] + closs_weight * closs["total"]
+            loss = dloss_weight * dloss["total"] + closs_weight * closs["total"]
 
-        loss.backward()
+        self.scaler.scale(loss).backward()
 
+        # clip gradients
+        if self.separate_optimizers:
+            for optimizer in self.optimizers.values():
+                self.scaler.unscale_(optimizer)
+        else:
+            self.scaler.unscale_(self.optimizer)
+        torch.nn.utils.clip_grad_norm_(
+            self.diffusion.parameters(), max_norm=1.0, norm_type=2.0
+        )
+
+        # step optimizer
         if self.separate_optimizers:
             for optimizer in self.optimizers.values():
                 optimizer.step()
         else:
-            self.optimizer.step()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
 
         return dloss, closs
 
@@ -1072,7 +1096,8 @@ class MultiTableTrainer(MultiTableSampler, Trainer):
                 )
 
             # Update EMA models
-            self.ema_model.update()
+            if self.use_ema:
+                self.ema_model.update()
 
             # Save ckpt base on the best training loss
             if total_loss < best_loss and self.curr_epoch > self.steps // 2:

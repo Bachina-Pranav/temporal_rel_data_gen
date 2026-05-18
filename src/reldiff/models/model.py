@@ -16,7 +16,7 @@ class PositionalEmbedding(torch.nn.Module):
 
     def forward(self, x):
         freqs = torch.arange(
-            start=0, end=self.num_channels // 2, dtype=torch.float32, device=x.device
+            start=0, end=self.num_channels // 2, dtype=x.dtype, device=x.device
         )
         freqs = freqs / (self.num_channels // 2 - (1 if self.endpoint else 0))
         freqs = (1 / self.max_positions) ** freqs

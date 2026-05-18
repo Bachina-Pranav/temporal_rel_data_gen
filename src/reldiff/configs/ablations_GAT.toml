@@ -10,7 +10,6 @@ type="HeteroGAT"
 [graph]
 num_neighbors=-1
 n_hops=2
-two_stage_sampling=false
 
 [model]
 dim_t=128
