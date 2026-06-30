@@ -22,6 +22,7 @@ dependencies = [
   "torch_ema",
   "wandb",
   "kaleido",
+  "gdown",
   "relbench[full]",
   "tomli==2.0.1",
   "syntheval"

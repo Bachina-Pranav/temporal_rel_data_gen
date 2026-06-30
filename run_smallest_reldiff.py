@@ -121,6 +121,16 @@ def maybe_download(args: argparse.Namespace, env: dict[str, str]) -> None:
         raise SystemExit(
             f"Missing {metadata.relative_to(ROOT)} and --skip-download was passed."
         )
+    try:
+        import gdown  # noqa: F401
+    except ImportError as exc:
+        raise SystemExit(
+            "The downloader requires gdown. Install the reproducibility extras with:\n"
+            "    pip install -r reproducibility/requirements.txt\n"
+            "or just:\n"
+            "    pip install gdown\n"
+            "Then re-run this command."
+        ) from exc
     run([sys.executable, "reproducibility/download_data.py"], env)
     if not metadata.exists():
         raise SystemExit(
