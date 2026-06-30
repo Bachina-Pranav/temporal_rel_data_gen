@@ -112,3 +112,45 @@ python src/scripts/evaluate_ct_2k_sbm_plus.py \
   --real-reviews data/amazon-toy/review.csv \
   --synthetic-reviews outputs/amazon-toy/ct_2k_sbm_plus/synthetic_review.csv
 ```
+
+## ContinuousTime2KSBMTemporalStubsGenerator / ct_2k_sbm_temporal_stubs
+
+`ContinuousTime2KSBMTemporalStubsGenerator` is the third structural event-spine
+generator. It keeps `continuous_time_temporal_sbm` and `ct_2k_sbm_plus` intact,
+reuses RelDiff's SBM block inference, and generates temporal review events by
+preserving three stub multisets inside each SBM block pair:
+
+```text
+customer stubs
+product stubs
+timestamp stubs
+```
+
+The method preserves customer/product degree counts and block-pair timestamp
+distributions while using local temporal-window shuffling to reduce direct edge
+memorization. Timestamp granularity is preserved, so date-only datasets do not
+receive fake hour/min/sec values. Attribute generation is intentionally not
+implemented yet.
+
+Example for the rel-amazon toy data:
+
+```bash
+python src/scripts/generate_amazon_ct_2k_sbm_temporal_stubs.py \
+  --customers data/original/rel-amazon-toy/customer.csv \
+  --products data/original/rel-amazon-toy/product.csv \
+  --reviews data/original/rel-amazon-toy/review.csv \
+  --output outputs/amazon-toy/ct_2k_sbm_temporal_stubs/synthetic_review.csv \
+  --seed 42 \
+  --stub-pairing temporal_window_shuffle \
+  --timestamp-stub-mode reuse_block_pair_timestamps \
+  --avoid-real-edge-prob 0.95 \
+  --debug-dir outputs/amazon-toy/ct_2k_sbm_temporal_stubs/debug
+```
+
+Evaluate:
+
+```bash
+python src/scripts/evaluate_ct_2k_sbm_temporal_stubs.py \
+  --real-reviews data/original/rel-amazon-toy/review.csv \
+  --synthetic-reviews outputs/amazon-toy/ct_2k_sbm_temporal_stubs/synthetic_review.csv
+```
