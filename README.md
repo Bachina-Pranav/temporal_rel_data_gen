@@ -75,3 +75,40 @@ python src/scripts/evaluate_temporal_sbm_event_spine.py \
   --synthetic-reviews outputs/amazon-toy/continuous_time_temporal_sbm/synthetic_review.csv
 ```
 
+## ContinuousTime2KSBMPlusGenerator / ct_2k_sbm_plus
+
+`ContinuousTime2KSBMPlusGenerator` is an improved continuous-time temporal SBM
+structural generator. It keeps the older `continuous_time_temporal_sbm` method
+available, reuses RelDiff's SBM block inference, and generates only:
+
+```text
+customer_id, product_id, review_time
+```
+
+The method preserves block-pair event cardinalities and uses microcanonical
+customer/product endpoint stubs inside each block pair, which is closer in
+spirit to RelDiff's 2K+SBM structure generator. Timestamps are still sampled
+from continuous learned KDE intensities, then passed through a timestamp
+granularity model so date-only datasets do not receive fake hour/min/sec values.
+Attribute generation is intentionally not implemented yet.
+
+Example:
+
+```bash
+python src/scripts/generate_amazon_ct_2k_sbm_plus.py \
+  --customers data/amazon-toy/customer.csv \
+  --products data/amazon-toy/product.csv \
+  --reviews data/amazon-toy/review.csv \
+  --output outputs/amazon-toy/ct_2k_sbm_plus/synthetic_review.csv \
+  --seed 42 \
+  --stub-pairing time_sorted \
+  --debug-dir outputs/amazon-toy/ct_2k_sbm_plus/debug
+```
+
+Evaluate:
+
+```bash
+python src/scripts/evaluate_ct_2k_sbm_plus.py \
+  --real-reviews data/amazon-toy/review.csv \
+  --synthetic-reviews outputs/amazon-toy/ct_2k_sbm_plus/synthetic_review.csv
+```
