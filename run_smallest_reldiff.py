@@ -102,8 +102,14 @@ def ensure_cuda_or_explain(args: argparse.Namespace) -> None:
         return
     try:
         import torch
-    except ImportError:
-        return
+    except ImportError as exc:
+        raise SystemExit(
+            "PyTorch failed to import before training started:\n"
+            f"    {exc}\n\n"
+            "For the common libtorch_cpu.so iJIT_NotifyEvent error, run:\n"
+            "    conda install -y mkl=2024.0 intel-openmp=2024.0\n"
+            "Then re-run this script."
+        ) from exc
     if args.device == "cuda" and not torch.cuda.is_available():
         raise SystemExit(
             "CUDA is not available. The upstream train/sample scripts currently "
