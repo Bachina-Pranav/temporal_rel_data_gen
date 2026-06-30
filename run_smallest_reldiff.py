@@ -6,7 +6,7 @@ This wrapper orchestrates the repository scripts so you can run:
 
     python run_smallest_reldiff.py --epochs 100
 
-For a paper-scale run, use --epochs 10000.
+For a paper-scale run, use --epochs 10000 and tune --batch-size for your GPU.
 """
 
 from __future__ import annotations
@@ -41,7 +41,16 @@ def parse_args() -> argparse.Namespace:
         default=100,
         help="Training epochs. Use 10000 for the paper-scale setting.",
     )
-    parser.add_argument("--batch-size", type=int, default=4096)
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=32,
+        help=(
+            "Training root-node batch size. Walmart has only 45 root Store nodes, "
+            "and the disjoint PyG loader repeats roots when this is larger than "
+            "the root table, which can cause very large duplicated subgraphs."
+        ),
+    )
     parser.add_argument("--sampling-batch-size", type=int, default=20000)
     parser.add_argument("--num-samples", type=int, default=1)
     parser.add_argument("--run-id", default="_smallest")
