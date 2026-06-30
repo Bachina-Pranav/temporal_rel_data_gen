@@ -36,6 +36,22 @@ def _make_grad_scaler(device, enabled: bool):
     return torch.cuda.amp.GradScaler(enabled=False)
 
 
+def _cuda_bf16_supported() -> bool:
+    is_supported = getattr(torch.cuda, "is_bf16_supported", None)
+    if is_supported is None:
+        return False
+    for args, kwargs in (
+        ((), {"including_emulation": False}),
+        ((False,), {}),
+        ((), {}),
+    ):
+        try:
+            return bool(is_supported(*args, **kwargs))
+        except TypeError:
+            continue
+    return False
+
+
 class Trainer:
     def __init__(
         self,
@@ -784,7 +800,7 @@ class MultiTableTrainer(MultiTableSampler, Trainer):
         if (
             self.mixed_precision
             and _device_type(self.device) == "cuda"
-            and torch.cuda.is_bf16_supported(False)
+            and _cuda_bf16_supported()
         ):
             self.amp_dtype = torch.bfloat16
 
