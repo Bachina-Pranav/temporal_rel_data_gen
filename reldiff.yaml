@@ -10,8 +10,8 @@ dependencies:
   - torchaudio==2.0.2
   - pytorch-cuda=11.7
   - numpy<2
-  - mkl=2024.0
-  - intel-openmp=2024.0
+  - mkl<2024.1
+  - intel-openmp<2024.1
   - pip
   - pip:
     - pandas

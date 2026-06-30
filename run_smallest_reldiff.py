@@ -107,7 +107,7 @@ def ensure_cuda_or_explain(args: argparse.Namespace) -> None:
             "PyTorch failed to import before training started:\n"
             f"    {exc}\n\n"
             "For the common libtorch_cpu.so iJIT_NotifyEvent error, run:\n"
-            "    conda install -y mkl=2024.0 intel-openmp=2024.0\n"
+            "    conda install -y 'mkl<2024.1' 'intel-openmp<2024.1'\n"
             "Then re-run this script."
         ) from exc
     if args.device == "cuda" and not torch.cuda.is_available():
