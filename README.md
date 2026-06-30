@@ -154,3 +154,54 @@ python src/scripts/evaluate_ct_2k_sbm_temporal_stubs.py \
   --real-reviews data/original/rel-amazon-toy/review.csv \
   --synthetic-reviews outputs/amazon-toy/ct_2k_sbm_temporal_stubs/synthetic_review.csv
 ```
+
+## TemporalLatentTextAttributeDiffusion
+
+`TemporalLatentTextAttributeDiffusion` is an attribute generator conditioned on
+an existing temporal review spine. It does not regenerate:
+
+```text
+customer_id, product_id, review_time
+```
+
+Instead, it generates Amazon-style review attributes:
+
+```text
+rating, verified, summary, review_text
+```
+
+The v1 model is inspired by RelDiff's graph-conditioned mixed-type diffusion. It
+uses temporally filtered customer/product history, masked categorical diffusion
+for `rating` and `verified`, latent Gaussian diffusion for `summary` and
+`review_text`, and nearest-neighbor latent retrieval for text decoding. The
+default text encoder tries local transformer embeddings when available and falls
+back to deterministic hashing embeddings for offline runs.
+
+Train on the real rel-amazon toy review table:
+
+```bash
+python src/scripts/train_temporal_attr_diffusion.py \
+  --reviews data/original/rel-amazon-toy/review.csv \
+  --cat-cols rating verified \
+  --text-cols summary review_text \
+  --output-dir outputs/amazon-toy/temporal_attr_diffusion \
+  --seed 42
+```
+
+Sample attributes onto a generated temporal spine:
+
+```bash
+python src/scripts/sample_temporal_attr_diffusion.py \
+  --synthetic-spine outputs/amazon-toy/ct_2k_sbm_temporal_stubs/synthetic_review.csv \
+  --checkpoint outputs/amazon-toy/temporal_attr_diffusion/checkpoints/best.pt \
+  --output outputs/amazon-toy/final_synthetic_review.csv \
+  --seed 42
+```
+
+Evaluate the full synthetic review table:
+
+```bash
+python src/scripts/evaluate_temporal_attr_generation.py \
+  --real-reviews data/original/rel-amazon-toy/review.csv \
+  --synthetic-reviews outputs/amazon-toy/final_synthetic_review.csv
+```
