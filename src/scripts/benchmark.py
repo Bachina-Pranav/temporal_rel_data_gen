@@ -15,6 +15,12 @@ args.add_argument("--dataset-name", type=str, default="rossmann_subsampled")
 args.add_argument("--real-data-dir", type=str, default="data/original")
 args.add_argument("--synthetic-data-dir", type=str, default="data/synthetic")
 args.add_argument("--run-id", type=str, default="1")
+args.add_argument(
+    "--methods",
+    nargs="+",
+    default=["RelDiff_gen", "RelDiff"],
+    help="Synthetic methods to evaluate, for example: --methods RelDiff",
+)
 
 args = args.parse_args()
 dataset_name = args.dataset_name
@@ -61,7 +67,7 @@ benchmark = Benchmark(
     run_id=run_id,
     sample_id="sample1",
     datasets=[dataset_name],
-    methods=["RelDiff_gen", "RelDiff"],
+    methods=args.methods,
 )
 
 benchmark.run()
