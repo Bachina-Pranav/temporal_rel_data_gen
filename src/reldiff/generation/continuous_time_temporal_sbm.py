@@ -20,6 +20,7 @@ from typing import Any, Iterable
 
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 
 
 GENERATOR_NAME = "continuous_time_temporal_sbm"
@@ -208,22 +209,37 @@ def fit_type_constrained_sbm_blocks(
         return type_only_blocks(customer_ids, product_ids)
 
     try:
+        print(
+            "Fitting aggregate type-constrained SBM "
+            f"({len(customer_ids):,} customers, {len(product_ids):,} products, "
+            f"{len(unique_pairs):,} unique pairs)"
+        )
         gt.seed_rng(seed)
         graph = gt.Graph(directed=True)
         vertex_map: dict[tuple[str, Any], Any] = {}
         type_label = graph.new_vertex_property("int")
 
-        for customer_id in customer_ids:
+        for customer_id in tqdm(
+            customer_ids, desc="Adding customer vertices", unit="customer"
+        ):
             vertex = graph.add_vertex()
             vertex_map[("customer", customer_id)] = vertex
             type_label[vertex] = 0
-        for product_id in product_ids:
+        for product_id in tqdm(
+            product_ids, desc="Adding product vertices", unit="product"
+        ):
             vertex = graph.add_vertex()
             vertex_map[("product", product_id)] = vertex
             type_label[vertex] = 1
         graph.vertex_properties["block"] = type_label
 
-        for row in unique_pairs[[customer_col, product_col]].itertuples(index=False):
+        pair_rows = unique_pairs[[customer_col, product_col]].itertuples(index=False)
+        for row in tqdm(
+            pair_rows,
+            total=len(unique_pairs),
+            desc="Adding aggregate review edges",
+            unit="edge",
+        ):
             customer_id, product_id = row
             graph.add_edge(
                 vertex_map[("customer", customer_id)],
@@ -233,18 +249,24 @@ def fit_type_constrained_sbm_blocks(
         if graph.num_edges() == 0:
             return type_only_blocks(customer_ids, product_ids)
 
+        print("Minimizing nested degree-corrected SBM description length...")
         state = gt.minimize_nested_blockmodel_dl(
             graph, state_args={"deg_corr": True, "clabel": graph.vp["block"]}
         )
+        print("Finished SBM fitting.")
         bottom_state = state.levels[0]
         block_array = bottom_state.b.a
 
         customer_raw = []
         product_raw = []
-        for customer_id in customer_ids:
+        for customer_id in tqdm(
+            customer_ids, desc="Reading customer block assignments", unit="customer"
+        ):
             vertex = vertex_map[("customer", customer_id)]
             customer_raw.append((customer_id, int(block_array[int(vertex)])))
-        for product_id in product_ids:
+        for product_id in tqdm(
+            product_ids, desc="Reading product block assignments", unit="product"
+        ):
             vertex = vertex_map[("product", product_id)]
             product_raw.append((product_id, int(block_array[int(vertex)])))
 
@@ -334,6 +356,7 @@ class ContinuousTimeTemporalSBMGenerator:
         )
 
     def _preprocess_reviews(self) -> pd.DataFrame:
+        print(f"Preprocessing {len(self.raw_reviews):,} review rows...")
         reviews = self.raw_reviews.copy()
         required = [self.customer_id_col, self.product_id_col, self.timestamp_col]
         missing = [column for column in required if column not in reviews.columns]
@@ -363,6 +386,7 @@ class ContinuousTimeTemporalSBMGenerator:
         )
         if reviews.empty:
             raise ValueError("No valid review rows remain after preprocessing.")
+        print(f"Kept {len(reviews):,} valid review rows after preprocessing.")
 
         min_time = reviews[self.timestamp_col].min()
         max_time = reviews[self.timestamp_col].max()
@@ -382,6 +406,12 @@ class ContinuousTimeTemporalSBMGenerator:
         unique_pairs = self.reviews[
             [self.customer_id_col, self.product_id_col]
         ].drop_duplicates()
+        print(
+            "Preparing temporal SBM fit: "
+            f"{len(active_customer_ids):,} active customers, "
+            f"{len(active_product_ids):,} active products, "
+            f"{len(unique_pairs):,} unique customer-product pairs."
+        )
 
         self.sbm_result = fit_type_constrained_sbm_blocks(
             customer_ids=active_customer_ids,
@@ -396,6 +426,7 @@ class ContinuousTimeTemporalSBMGenerator:
 
     def _build_event_collections(self) -> None:
         assert self.sbm_result is not None
+        print("Building continuous-time event collections...")
         reviews = self.reviews.copy()
         reviews["_customer_block"] = reviews[self.customer_id_col].map(
             self.sbm_result.customer_blocks
@@ -419,8 +450,11 @@ class ContinuousTimeTemporalSBMGenerator:
 
         self.block_pair_events = {}
         self.block_pair_event_count = {}
-        for (customer_block, product_block), group in reviews.groupby(
-            ["_customer_block", "_product_block"], sort=True
+        block_pair_groups = list(
+            reviews.groupby(["_customer_block", "_product_block"], sort=True)
+        )
+        for (customer_block, product_block), group in tqdm(
+            block_pair_groups, desc="Building block-pair event collections", unit="pair"
         ):
             key = (int(customer_block), int(product_block))
             collection = EventCollection.from_records(
@@ -433,7 +467,12 @@ class ContinuousTimeTemporalSBMGenerator:
             self.block_pair_event_count[key] = len(group)
 
         self.customer_block_events = {}
-        for customer_block, group in reviews.groupby("_customer_block", sort=True):
+        customer_block_groups = list(reviews.groupby("_customer_block", sort=True))
+        for customer_block, group in tqdm(
+            customer_block_groups,
+            desc="Building customer-block event collections",
+            unit="block",
+        ):
             self.customer_block_events[int(customer_block)] = EventCollection.from_records(
                 group["_time_x"],
                 group[self.customer_id_col],
@@ -441,7 +480,12 @@ class ContinuousTimeTemporalSBMGenerator:
             )
 
         self.product_block_events = {}
-        for product_block, group in reviews.groupby("_product_block", sort=True):
+        product_block_groups = list(reviews.groupby("_product_block", sort=True))
+        for product_block, group in tqdm(
+            product_block_groups,
+            desc="Building product-block event collections",
+            unit="block",
+        ):
             self.product_block_events[int(product_block)] = EventCollection.from_records(
                 group["_time_x"],
                 product_ids=group[self.product_id_col],
@@ -449,7 +493,12 @@ class ContinuousTimeTemporalSBMGenerator:
             )
 
         self.customers_by_block = defaultdict(list)
-        for customer_id, block in self.sbm_result.customer_blocks.items():
+        for customer_id, block in tqdm(
+            self.sbm_result.customer_blocks.items(),
+            total=len(self.sbm_result.customer_blocks),
+            desc="Indexing customers by block",
+            unit="customer",
+        ):
             self.customers_by_block[block].append(customer_id)
         self.customers_by_block = {
             block: np.asarray(ids, dtype=object)
@@ -457,7 +506,12 @@ class ContinuousTimeTemporalSBMGenerator:
         }
 
         self.products_by_block = defaultdict(list)
-        for product_id, block in self.sbm_result.product_blocks.items():
+        for product_id, block in tqdm(
+            self.sbm_result.product_blocks.items(),
+            total=len(self.sbm_result.product_blocks),
+            desc="Indexing products by block",
+            unit="product",
+        ):
             self.products_by_block[block].append(product_id)
         self.products_by_block = {
             block: np.asarray(ids, dtype=object)
@@ -487,29 +541,40 @@ class ContinuousTimeTemporalSBMGenerator:
 
         records = []
         synthetic_times_by_pair: dict[tuple[int, int], list[float]] = defaultdict(list)
-        for block_pair, count in sorted(target_counts.items()):
-            customer_block, product_block = block_pair
-            for _ in range(count):
-                x, fallback_level = self.sample_timestamp_for_block_pair(block_pair)
-                self.timestamp_fallback_counts[block_pair][fallback_level] += 1
-                customer_id = self.sample_customer_given_block_time(
-                    customer_block, product_block, x
+        total_events = sum(target_counts.values())
+        with tqdm(
+            total=total_events, desc="Generating temporal SBM events", unit="event"
+        ) as pbar:
+            for block_pair, count in sorted(target_counts.items()):
+                customer_block, product_block = block_pair
+                pbar.set_postfix(
+                    customer_block=customer_block,
+                    product_block=product_block,
+                    refresh=False,
                 )
-                product_id = self.sample_product_given_block_time(
-                    customer_block, product_block, x
-                )
-                synthetic_times_by_pair[block_pair].append(x)
-                records.append(
-                    {
-                        self.customer_id_col: customer_id,
-                        self.product_id_col: product_id,
-                        self.timestamp_col: self.denormalize_time(x),
-                        "_customer_block": customer_block,
-                        "_product_block": product_block,
-                        "_time_x": x,
-                    }
-                )
+                for _ in range(count):
+                    x, fallback_level = self.sample_timestamp_for_block_pair(block_pair)
+                    self.timestamp_fallback_counts[block_pair][fallback_level] += 1
+                    customer_id = self.sample_customer_given_block_time(
+                        customer_block, product_block, x
+                    )
+                    product_id = self.sample_product_given_block_time(
+                        customer_block, product_block, x
+                    )
+                    synthetic_times_by_pair[block_pair].append(x)
+                    records.append(
+                        {
+                            self.customer_id_col: customer_id,
+                            self.product_id_col: product_id,
+                            self.timestamp_col: self.denormalize_time(x),
+                            "_customer_block": customer_block,
+                            "_product_block": product_block,
+                            "_time_x": x,
+                        }
+                    )
+                    pbar.update(1)
 
+        print("Sorting generated events by review_time...")
         synthetic = pd.DataFrame.from_records(records)
         synthetic = synthetic.sort_values(self.timestamp_col, kind="mergesort")
         output = synthetic[
@@ -519,6 +584,7 @@ class ContinuousTimeTemporalSBMGenerator:
         if output_path is not None:
             output_path = Path(output_path)
             output_path.parent.mkdir(parents=True, exist_ok=True)
+            print(f"Writing synthetic event spine to {output_path}...")
             output.to_csv(output_path, index=False)
 
         if debug_dir is not None:
@@ -633,6 +699,7 @@ class ContinuousTimeTemporalSBMGenerator:
         assert self.sbm_result is not None
         assert self.global_events is not None
         debug_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Writing temporal SBM debug outputs to {debug_dir}...")
 
         real_times = self.reviews["_time_x"].to_numpy(dtype=float)
         synthetic_times = (
@@ -670,7 +737,12 @@ class ContinuousTimeTemporalSBMGenerator:
         self.write_assignment_debug(debug_dir)
 
         per_pair_ks = []
-        for block_pair, real_count in self.block_pair_event_count.items():
+        for block_pair, real_count in tqdm(
+            self.block_pair_event_count.items(),
+            total=len(self.block_pair_event_count),
+            desc="Computing block-pair timestamp diagnostics",
+            unit="pair",
+        ):
             if real_count == 0:
                 continue
             real_pair_times = self.block_pair_events[block_pair].times

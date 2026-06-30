@@ -18,10 +18,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate customer-product-review_time events with ContinuousTimeTemporalSBMGenerator."
     )
-    parser.add_argument("--customers", required=True, help="Path to customers CSV.")
-    parser.add_argument("--products", required=True, help="Path to products CSV.")
-    parser.add_argument("--reviews", required=True, help="Path to reviews CSV.")
-    parser.add_argument("--output", required=True, help="Output synthetic reviews CSV.")
+    parser.add_argument("--customers", required=True, help="Path to customer table CSV.")
+    parser.add_argument("--products", required=True, help="Path to product table CSV.")
+    parser.add_argument("--reviews", required=True, help="Path to review table CSV.")
+    parser.add_argument("--output", required=True, help="Output synthetic review CSV.")
     parser.add_argument("--customer-id-col", default="customer_id")
     parser.add_argument("--product-id-col", default="product_id")
     parser.add_argument("--timestamp-col", default="review_time")
