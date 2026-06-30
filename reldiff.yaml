@@ -14,6 +14,10 @@ dependencies:
   - intel-openmp<2024.1
   - pip
   - pip:
+    - --find-links https://data.pyg.org/whl/torch-2.0.1+cu117.html
+    - pyg_lib
+    - torch_scatter
+    - torch_sparse
     - pandas
     - scikit-learn
     - scipy

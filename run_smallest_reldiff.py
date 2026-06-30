@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import importlib
 import json
 import os
 import shutil
@@ -126,6 +127,40 @@ def ensure_cuda_or_explain(args: argparse.Namespace) -> None:
             "instantiate the model with .cuda(), so use a GPU system or patch the "
             "scripts for CPU before running."
         )
+
+
+def _pyg_wheel_url(torch_module) -> str:
+    torch_version = torch_module.__version__.split("+", maxsplit=1)[0]
+    cuda_version = torch_module.version.cuda
+    cuda_tag = "cpu"
+    if cuda_version:
+        cuda_tag = "cu" + "".join(cuda_version.split(".")[:2])
+    return f"https://data.pyg.org/whl/torch-{torch_version}+{cuda_tag}.html"
+
+
+def ensure_pyg_sampler_backend_or_explain() -> None:
+    errors: list[str] = []
+    for module_name in ("pyg_lib", "torch_sparse"):
+        try:
+            importlib.import_module(module_name)
+            return
+        except Exception as exc:  # ImportError, ABI mismatch, or missing CUDA symbols.
+            errors.append(f"{module_name}: {exc}")
+
+    import torch
+
+    wheel_url = _pyg_wheel_url(torch)
+    raise SystemExit(
+        "PyG NeighborLoader requires either pyg_lib or torch_sparse, but neither "
+        "backend could be imported.\n\n"
+        "Install the PyG extension wheels that match your current Torch/CUDA build:\n"
+        f"    pip install --no-index pyg_lib torch_scatter torch_sparse -f {wheel_url}\n\n"
+        "Then verify and re-run:\n"
+        "    python -c \"import pyg_lib, torch_sparse; print('PyG sampling backend ok')\"\n"
+        "    python run_smallest_reldiff.py --epochs 100 --num-samples 1\n\n"
+        "Import attempts:\n"
+        + "\n".join(f"    {error}" for error in errors)
+    )
 
 
 def maybe_download(args: argparse.Namespace, env: dict[str, str]) -> None:
@@ -351,6 +386,7 @@ def main() -> None:
     args = parse_args()
     env = python_env()
     ensure_cuda_or_explain(args)
+    ensure_pyg_sampler_backend_or_explain()
     maybe_download(args, env)
     fix_integer_id_metadata_regexes(args)
 
