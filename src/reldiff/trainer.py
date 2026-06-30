@@ -22,6 +22,20 @@ from reldiff.diffusion import (
 )
 
 
+def _device_type(device) -> str:
+    return torch.device(device).type
+
+
+def _make_grad_scaler(device, enabled: bool):
+    device_type = _device_type(device)
+    amp = getattr(torch, "amp", None)
+    if amp is not None and hasattr(amp, "GradScaler"):
+        return amp.GradScaler(device_type, enabled=enabled)
+    if device_type == "cuda":
+        return torch.cuda.amp.GradScaler(enabled=enabled)
+    return torch.cuda.amp.GradScaler(enabled=False)
+
+
 class Trainer:
     def __init__(
         self,
@@ -765,9 +779,13 @@ class MultiTableTrainer(MultiTableSampler, Trainer):
         self.separate_optimizers = separate_optimizers
         self.lr_scheduler = lr_scheduler
 
-        self.scaler = torch.amp.GradScaler(self.device, enabled=self.mixed_precision)
+        self.scaler = _make_grad_scaler(self.device, enabled=self.mixed_precision)
         self.amp_dtype = torch.float16
-        if self.mixed_precision and torch.cuda.is_bf16_supported(False):
+        if (
+            self.mixed_precision
+            and _device_type(self.device) == "cuda"
+            and torch.cuda.is_bf16_supported(False)
+        ):
             self.amp_dtype = torch.bfloat16
 
         if self.separate_optimizers:
@@ -838,7 +856,9 @@ class MultiTableTrainer(MultiTableSampler, Trainer):
             self.optimizer.zero_grad()
 
         with torch.autocast(
-            device_type=self.device, dtype=self.amp_dtype, enabled=self.mixed_precision
+            device_type=_device_type(self.device),
+            dtype=self.amp_dtype,
+            enabled=self.mixed_precision,
         ):
             dloss, closs = self.diffusion.mixed_loss(data, t_batch=t_batch)
 
