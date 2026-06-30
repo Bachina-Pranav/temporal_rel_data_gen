@@ -15,6 +15,7 @@ class PositionalEmbedding(torch.nn.Module):
         self.endpoint = endpoint
 
     def forward(self, x):
+        x = x.to(torch.float32)
         freqs = torch.arange(
             start=0, end=self.num_channels // 2, dtype=x.dtype, device=x.device
         )
