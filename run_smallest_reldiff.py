@@ -12,6 +12,8 @@ For a paper-scale run, use --epochs 10000.
 from __future__ import annotations
 
 import argparse
+import csv
+import json
 import os
 import shutil
 import subprocess
@@ -62,6 +64,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--skip-download", action="store_true")
+    parser.add_argument(
+        "--skip-metadata-fix",
+        action="store_true",
+        help=(
+            "Do not patch downloaded SDV metadata. Newer SDV versions reject "
+            "integer ID columns that still carry regex_format constraints."
+        ),
+    )
     parser.add_argument("--skip-train", action="store_true")
     parser.add_argument("--skip-sample", action="store_true")
     parser.add_argument("--wandb", action="store_true", help="Enable online wandb logging.")
@@ -143,6 +153,71 @@ def maybe_download(args: argparse.Namespace, env: dict[str, str]) -> None:
             f"Download finished, but {metadata.relative_to(ROOT)} was not found. "
             "Check the extracted dataset names under data/original."
         )
+
+
+def _is_integer_like_csv_column(csv_path: Path, column: str) -> bool:
+    seen_value = False
+    with csv_path.open(newline="") as handle:
+        reader = csv.DictReader(handle)
+        if column not in (reader.fieldnames or []):
+            return False
+        for row in reader:
+            value = row.get(column, "").strip()
+            if value == "":
+                continue
+            seen_value = True
+            if value.startswith(("+", "-")):
+                value = value[1:]
+            if not value.isdigit():
+                return False
+    return seen_value
+
+
+def fix_integer_id_metadata_regexes(args: argparse.Namespace) -> None:
+    """Remove stale regex constraints that newer SDV rejects for integer IDs."""
+    if args.skip_metadata_fix:
+        return
+
+    dataset_dir = ROOT / "data" / "original" / args.dataset
+    metadata_path = dataset_dir / "metadata.json"
+    if not metadata_path.exists():
+        return
+
+    with metadata_path.open() as handle:
+        metadata = json.load(handle)
+
+    changed: list[str] = []
+    for table_name, table_metadata in metadata.get("tables", {}).items():
+        csv_path = dataset_dir / f"{table_name}.csv"
+        if not csv_path.exists():
+            continue
+        for column_name, column_metadata in table_metadata.get("columns", {}).items():
+            if column_metadata.get("sdtype") != "id":
+                continue
+            regex_keys = [
+                key for key in ("regex_format", "regex") if key in column_metadata
+            ]
+            if not regex_keys:
+                continue
+            if not _is_integer_like_csv_column(csv_path, column_name):
+                continue
+            for key in regex_keys:
+                column_metadata.pop(key, None)
+            changed.append(f"{table_name}.{column_name}")
+
+    if not changed:
+        return
+
+    backup_path = metadata_path.with_suffix(".json.bak")
+    if not backup_path.exists():
+        shutil.copyfile(metadata_path, backup_path)
+    with metadata_path.open("w") as handle:
+        json.dump(metadata, handle, indent=4)
+        handle.write("\n")
+    print(
+        "Removed SDV regex constraints from integer ID columns: "
+        + ", ".join(changed)
+    )
 
 
 def structure_path(dataset: str, structure: str) -> Path:
@@ -277,6 +352,7 @@ def main() -> None:
     env = python_env()
     ensure_cuda_or_explain(args)
     maybe_download(args, env)
+    fix_integer_id_metadata_regexes(args)
 
     if not args.skip_train:
         train(args, env)
