@@ -33,4 +33,45 @@ RelDiff is a novel generative framework for synthesizing relational databases wi
 
 The schema of RelDiff is presented in the figure above. <!--  For more details, please refer to [our paper](). -->
 
+## ContinuousTimeTemporalSBMGenerator
+
+`ContinuousTimeTemporalSBMGenerator` is a structural-only temporal event
+generator for Amazon-style review tables. It generates only the event spine:
+
+```text
+customer_id, product_id, review_time
+```
+
+It reuses RelDiff's type-constrained, degree-corrected SBM idea to infer
+customer/product blocks on the aggregate customer-product graph, then extends
+the static structure model to continuous-time review events. Conceptually, it
+samples from a temporal degree-corrected SBM:
+
+```text
+lambda_ui(tau) = omega_blockpair(tau) * theta_user(tau) * phi_product(tau)
+```
+
+Timestamps are sampled from learned continuous KDE-style intensities, not from
+uniform assignments inside coarse temporal bins. Attribute generation is
+intentionally not implemented yet.
+
+Example:
+
+```bash
+python src/scripts/generate_amazon_temporal_sbm.py \
+  --customers data/amazon-toy/customer.csv \
+  --products data/amazon-toy/product.csv \
+  --reviews data/amazon-toy/review.csv \
+  --output outputs/amazon-toy/continuous_time_temporal_sbm/synthetic_review.csv \
+  --seed 42 \
+  --debug-dir outputs/amazon-toy/continuous_time_temporal_sbm/debug
+```
+
+To evaluate the generated event spine:
+
+```bash
+python src/scripts/evaluate_temporal_sbm_event_spine.py \
+  --real-reviews data/amazon-toy/review.csv \
+  --synthetic-reviews outputs/amazon-toy/continuous_time_temporal_sbm/synthetic_review.csv
+```
 
