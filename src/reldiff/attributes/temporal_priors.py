@@ -79,29 +79,34 @@ class TemporalAttributePrior:
     def rating_logits_for_timestamps(self, timestamps: pd.Series) -> np.ndarray:
         rows = []
         for bucket in temporal_bucket(pd.to_datetime(timestamps), self.temporal_prior_level):
-            dist = self.per_bucket_rating_distribution.get(
-                str(bucket), self.rating_global_distribution
-            )
+            dist = self._rating_distribution_for_bucket(bucket)
             rows.append(np.log(np.asarray(dist, dtype=float) + self.eps))
         return np.vstack(rows).astype(np.float32)
 
     def verified_logits_for_timestamps(self, timestamps: pd.Series) -> np.ndarray:
         rows = []
         for bucket in temporal_bucket(pd.to_datetime(timestamps), self.temporal_prior_level):
-            rate = self.per_bucket_verified_rate.get(str(bucket), self.verified_global_rate)
+            rate = self._verified_rate_for_bucket(bucket)
             rows.append(logit(rate))
         return np.asarray(rows, dtype=np.float32)
 
     def target_rating_distribution(self, bucket: Any) -> np.ndarray:
-        return np.asarray(
-            self.per_bucket_rating_distribution.get(
-                str(bucket), self.rating_global_distribution
-            ),
-            dtype=np.float32,
-        )
+        return np.asarray(self._rating_distribution_for_bucket(bucket), dtype=np.float32)
 
     def target_verified_rate(self, bucket: Any) -> float:
-        return float(self.per_bucket_verified_rate.get(str(bucket), self.verified_global_rate))
+        return float(self._verified_rate_for_bucket(bucket))
+
+    def _rating_distribution_for_bucket(self, bucket: Any) -> List[float]:
+        key = temporal_prior_lookup_key(bucket, self.per_bucket_rating_distribution)
+        if key is None:
+            return self.rating_global_distribution
+        return self.per_bucket_rating_distribution[key]
+
+    def _verified_rate_for_bucket(self, bucket: Any) -> float:
+        key = temporal_prior_lookup_key(bucket, self.per_bucket_verified_rate)
+        if key is None:
+            return self.verified_global_rate
+        return float(self.per_bucket_verified_rate[key])
 
     def _alpha(self, n: float) -> float:
         if self.smoothing_alpha == "auto":
@@ -150,7 +155,8 @@ class TemporalAttributePrior:
 
 
 def temporal_bucket(timestamps: pd.Series, level: str) -> pd.Series:
-    values = pd.to_datetime(timestamps, errors="coerce")
+    index = timestamps.index if isinstance(timestamps, pd.Series) else None
+    values = pd.Series(pd.to_datetime(timestamps, errors="coerce"), index=index)
     if level == "global":
         return pd.Series(["global"] * len(values), index=values.index)
     if level == "date":
@@ -158,6 +164,60 @@ def temporal_bucket(timestamps: pd.Series, level: str) -> pd.Series:
     if level in {"year_month", "month"}:
         return values.dt.strftime("%Y-%m")
     raise ValueError("temporal prior level must be month, year_month, date, or global")
+
+
+def temporal_prior_lookup_key(bucket: Any, mapping: Dict[str, Any]) -> str | None:
+    key = str(bucket)
+    if key in mapping:
+        return key
+    legacy_key = legacy_month_number_key(key)
+    if legacy_key is not None and legacy_key in mapping:
+        return legacy_key
+    return None
+
+
+def legacy_month_number_key(bucket: Any) -> str | None:
+    key = str(bucket)
+    if len(key) >= 7 and key[4] == "-":
+        try:
+            month = int(key[5:7])
+        except ValueError:
+            return None
+        if 1 <= month <= 12:
+            return str(month)
+    return None
+
+
+def bucket_key_format(keys: set[str]) -> str:
+    if not keys:
+        return "empty"
+    if all(is_year_month_key(key) for key in keys):
+        return "YYYY-MM"
+    if all(is_legacy_month_number_key(key) for key in keys):
+        return "legacy-month-number"
+    if keys == {"global"}:
+        return "global"
+    return "mixed"
+
+
+def is_year_month_key(key: Any) -> bool:
+    value = str(key)
+    if len(value) != 7 or value[4] != "-":
+        return False
+    try:
+        year = int(value[:4])
+        month = int(value[5:])
+    except ValueError:
+        return False
+    return year >= 1 and 1 <= month <= 12
+
+
+def is_legacy_month_number_key(key: Any) -> bool:
+    try:
+        month = int(str(key))
+    except ValueError:
+        return False
+    return 1 <= month <= 12 and str(key) == str(month)
 
 
 def check_temporal_bucket_consistency(
@@ -172,6 +232,11 @@ def check_temporal_bucket_consistency(
     prior_buckets = set(prior.per_bucket_rating_distribution)
     synthetic_buckets = set(temporal_bucket(synthetic_timestamps, bucket_level).dropna().astype(str))
     evaluator_buckets = set(temporal_bucket(evaluator_timestamps, bucket_level).dropna().astype(str))
+    prior_format = bucket_key_format(prior_buckets)
+    expected_format = "YYYY-MM" if bucket_level in {"month", "year_month"} else bucket_level
+    format_is_consistent = prior_format in {expected_format, "empty"} or (
+        prior_format == "global" and expected_format == "global"
+    )
     return {
         "train_prior_num_buckets": len(prior_buckets),
         "sampling_num_buckets": len(synthetic_buckets),
@@ -179,12 +244,16 @@ def check_temporal_bucket_consistency(
         "train_prior_bucket_examples": sorted(prior_buckets)[:5],
         "synthetic_bucket_examples": sorted(synthetic_buckets)[:5],
         "evaluator_bucket_examples": sorted(evaluator_buckets)[:5],
+        "train_prior_bucket_format": prior_format,
+        "sampling_bucket_format": expected_format,
+        "evaluator_bucket_format": expected_format,
         "buckets_missing_in_synthetic": sorted(prior_buckets - synthetic_buckets),
         "buckets_missing_in_prior": sorted((synthetic_buckets | evaluator_buckets) - prior_buckets),
         "buckets_missing_in_evaluator": sorted(prior_buckets - evaluator_buckets),
-        "bucket_format": "YYYY-MM" if bucket_level in {"month", "year_month"} else bucket_level,
+        "bucket_format": expected_format if format_is_consistent else prior_format,
         "is_consistent": bool(
-            not (prior_buckets - synthetic_buckets)
+            format_is_consistent
+            and not (prior_buckets - synthetic_buckets)
             and not (prior_buckets - evaluator_buckets)
             and not ((synthetic_buckets | evaluator_buckets) - prior_buckets)
         ),

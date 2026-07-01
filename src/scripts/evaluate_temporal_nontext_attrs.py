@@ -237,8 +237,8 @@ def corr(a: np.ndarray, b: np.ndarray) -> Optional[float]:
 
 
 def grouped_rate_corr(real, synthetic, timestamp_col, value_col, freq, min_periods=2):
-    real_s = real.set_index(timestamp_col)[value_col].astype(float).resample(freq).mean()
-    syn_s = synthetic.set_index(timestamp_col)[value_col].astype(float).resample(freq).mean()
+    real_s = grouped_mean_series(real, timestamp_col, pd.to_numeric(real[value_col], errors="coerce"), freq)
+    syn_s = grouped_mean_series(synthetic, timestamp_col, pd.to_numeric(synthetic[value_col], errors="coerce"), freq)
     index = real_s.index.union(syn_s.index)
     real_v = real_s.reindex(index).dropna()
     syn_v = syn_s.reindex(index).dropna()
@@ -249,8 +249,8 @@ def grouped_rate_corr(real, synthetic, timestamp_col, value_col, freq, min_perio
 
 
 def grouped_series_corr(real, synthetic, timestamp_col, real_values, syn_values, freq, min_periods=2):
-    real_s = pd.DataFrame({timestamp_col: real[timestamp_col], "value": real_values}).set_index(timestamp_col)["value"].resample(freq).mean()
-    syn_s = pd.DataFrame({timestamp_col: synthetic[timestamp_col], "value": syn_values}).set_index(timestamp_col)["value"].resample(freq).mean()
+    real_s = grouped_mean_series(real, timestamp_col, real_values, freq)
+    syn_s = grouped_mean_series(synthetic, timestamp_col, syn_values, freq)
     index = real_s.index.intersection(syn_s.index)
     if len(index) < min_periods:
         return None
@@ -258,8 +258,8 @@ def grouped_series_corr(real, synthetic, timestamp_col, real_values, syn_values,
 
 
 def grouped_series_mae(real, synthetic, timestamp_col, real_values, syn_values, freq, min_periods=2):
-    real_s = pd.DataFrame({timestamp_col: real[timestamp_col], "value": real_values}).set_index(timestamp_col)["value"].resample(freq).mean()
-    syn_s = pd.DataFrame({timestamp_col: synthetic[timestamp_col], "value": syn_values}).set_index(timestamp_col)["value"].resample(freq).mean()
+    real_s = grouped_mean_series(real, timestamp_col, real_values, freq)
+    syn_s = grouped_mean_series(synthetic, timestamp_col, syn_values, freq)
     index = real_s.index.intersection(syn_s.index)
     if len(index) < min_periods:
         return None
@@ -267,6 +267,22 @@ def grouped_series_mae(real, synthetic, timestamp_col, real_values, syn_values, 
 
 
 def grouped_distribution_js(real, synthetic, timestamp_col, value_col, freq, min_periods=2):
+    if is_month_frequency(freq):
+        real_frame = pd.DataFrame(
+            {"bucket": temporal_bucket(real[timestamp_col], "month"), value_col: real[value_col]}
+        )
+        syn_frame = pd.DataFrame(
+            {"bucket": temporal_bucket(synthetic[timestamp_col], "month"), value_col: synthetic[value_col]}
+        )
+        values = []
+        for bucket in sorted(set(real_frame["bucket"].dropna()) & set(syn_frame["bucket"].dropna())):
+            real_group = real_frame[real_frame["bucket"] == bucket]
+            syn_group = syn_frame[syn_frame["bucket"] == bucket]
+            if len(real_group) and len(syn_group):
+                values.append(js_divergence(real_group[value_col], syn_group[value_col]))
+        if len(values) < min_periods:
+            return None
+        return float(np.mean(values))
     real_groups = real.set_index(timestamp_col).groupby(pd.Grouper(freq=freq))
     syn_groups = synthetic.set_index(timestamp_col).groupby(pd.Grouper(freq=freq))
     values = []
@@ -280,6 +296,18 @@ def grouped_distribution_js(real, synthetic, timestamp_col, value_col, freq, min
     if len(values) < min_periods:
         return None
     return float(np.mean(values))
+
+
+def grouped_mean_series(frame: pd.DataFrame, timestamp_col: str, values: pd.Series, freq: str) -> pd.Series:
+    values = pd.to_numeric(pd.Series(values, index=frame.index), errors="coerce")
+    if is_month_frequency(freq):
+        bucket = temporal_bucket(frame[timestamp_col], "month")
+        return pd.DataFrame({"bucket": bucket, "value": values}).dropna().groupby("bucket")["value"].mean()
+    return pd.DataFrame({timestamp_col: frame[timestamp_col], "value": values}).set_index(timestamp_col)["value"].resample(freq).mean()
+
+
+def is_month_frequency(freq: str) -> bool:
+    return str(freq).upper() in {"M", "ME"}
 
 
 def entity_mean_corr(real, synthetic, entity_col, value_col):

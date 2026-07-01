@@ -107,25 +107,40 @@ def enrich_temporal_prior_diagnostics(diagnostics_dir: Path) -> Dict[str, Any]:
         if summary:
             summary.setdefault("diagnostic_status", "missing_monthly_or_prior_curve")
         return summary
-    curve = pd.read_csv(curve_path)
-    monthly = pd.read_csv(monthly_path)
+    curve = pd.read_csv(curve_path, dtype={"month": str})
+    monthly = pd.read_csv(monthly_path, dtype={"month": str})
     if "month" not in curve.columns or "month" not in monthly.columns:
         summary["diagnostic_status"] = "missing_month_column"
         return summary
-    merged = curve.merge(monthly, on="month", how="inner")
+    curve["_month_key"] = curve["month"].map(normalize_month_key)
+    monthly["_month_key"] = monthly["month"].map(normalize_month_key)
+    curve_format = month_key_format(curve["_month_key"])
+    monthly_format = month_key_format(monthly["_month_key"])
+    merged = pd.DataFrame()
+    if curve_format == monthly_format:
+        merged = curve.merge(monthly, on="_month_key", how="inner", suffixes=("_prior", "_monthly"))
     summary.update(
         {
             "prior_monthly_avg_rating_std": std_or_none(curve.get("prior_avg_rating")),
             "real_monthly_avg_rating_std": std_or_none(monthly.get("real_avg_rating")),
             "prior_to_real_monthly_avg_rating_corr": corr_or_none(
                 merged.get("prior_avg_rating"), merged.get("real_avg_rating")
-            ),
+            ) if not merged.empty else None,
             "prior_monthly_verified_std": std_or_none(curve.get("prior_verified_rate")),
             "real_monthly_verified_std": std_or_none(monthly.get("real_verified_rate")),
             "prior_to_real_monthly_verified_corr": corr_or_none(
                 merged.get("prior_verified_rate"), merged.get("real_verified_rate")
+            ) if not merged.empty else None,
+            "prior_curve_month_format": curve_format,
+            "monthly_table_month_format": monthly_format,
+            "prior_month_examples": sorted(set(curve["_month_key"].dropna().astype(str)))[:5],
+            "monthly_table_month_examples": sorted(set(monthly["_month_key"].dropna().astype(str)))[:5],
+            "num_months_merged_for_prior_diagnostics": int(len(merged)),
+            "diagnostic_status": "loaded" if curve_format == monthly_format else "bucket_mismatch",
+            "diagnostic_reason": None if curve_format == monthly_format else (
+                "Temporal prior curve and evaluator monthly table use different month bucket formats. "
+                "This usually means the checkpoint was trained before YYYY-MM month buckets were introduced."
             ),
-            "diagnostic_status": "loaded",
         }
     )
     return summary
@@ -254,6 +269,54 @@ def corr_or_none(left: Any, right: Any) -> Optional[float]:
     if len(frame) < 2 or frame["left"].std() == 0 or frame["right"].std() == 0:
         return None
     return float(np.corrcoef(frame["left"], frame["right"])[0, 1])
+
+
+def normalize_month_key(value: Any) -> Optional[str]:
+    if value is None or pd.isna(value):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        numeric = float(text)
+    except ValueError:
+        numeric = None
+    if numeric is not None and numeric.is_integer() and 1 <= int(numeric) <= 12:
+        return str(int(numeric))
+    parsed = pd.to_datetime(pd.Series([text]), errors="coerce").iloc[0]
+    if pd.notna(parsed):
+        return pd.Timestamp(parsed).strftime("%Y-%m")
+    return text
+
+
+def month_key_format(values: pd.Series) -> str:
+    keys = set(values.dropna().astype(str))
+    if not keys:
+        return "empty"
+    if all(is_year_month_key(key) for key in keys):
+        return "YYYY-MM"
+    if all(is_legacy_month_key(key) for key in keys):
+        return "legacy-month-number"
+    return "mixed"
+
+
+def is_year_month_key(key: str) -> bool:
+    if len(key) != 7 or key[4] != "-":
+        return False
+    try:
+        month = int(key[5:])
+        int(key[:4])
+    except ValueError:
+        return False
+    return 1 <= month <= 12
+
+
+def is_legacy_month_key(key: str) -> bool:
+    try:
+        month = int(key)
+    except ValueError:
+        return False
+    return str(month) == key and 1 <= month <= 12
 
 
 if __name__ == "__main__":
