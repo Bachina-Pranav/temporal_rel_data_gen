@@ -17,6 +17,10 @@ if __package__ is None:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from evaluate_temporal_sbm_event_spine import evaluate, load_reviews
+from reldiff.generation.block_diagnostics import (  # noqa: E402
+    compute_block_pair_count_metrics,
+    load_block_map,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -45,11 +49,6 @@ def exact_degree_match_rate(real: pd.DataFrame, synthetic: pd.DataFrame, column:
             == synthetic_counts.reindex(index, fill_value=0)
         ).mean()
     )
-
-
-def load_block_map(path: str | Path, id_col: str, block_col: str) -> dict[Any, int]:
-    df = pd.read_csv(path)
-    return dict(zip(df[id_col], df[block_col].astype(int)))
 
 
 def block_pair_count_exact_match_rate(
@@ -108,16 +107,22 @@ def evaluate_plus(
             real, synthetic, customer_col
         ),
         "block_pair_count_exact_match_rate": None,
+        "block_pair_count_num_pairs_real": None,
+        "block_pair_count_num_pairs_synthetic": None,
+        "block_pair_count_num_pairs_union": None,
+        "block_pair_count_abs_error_sum": None,
+        "block_pair_count_max_abs_error": None,
+        "block_pair_count_l1_relative_error": None,
     }
     if customer_blocks is not None and product_blocks is not None:
-        additional["block_pair_count_exact_match_rate"] = (
-            block_pair_count_exact_match_rate(
+        additional.update(
+            compute_block_pair_count_metrics(
                 real,
                 synthetic,
-                customer_col,
-                product_col,
                 customer_blocks,
                 product_blocks,
+                customer_col,
+                product_col,
             )
         )
     results["additional"] = additional

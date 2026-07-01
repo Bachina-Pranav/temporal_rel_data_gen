@@ -22,6 +22,11 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
+from .block_diagnostics import (
+    block_assignment_frame,
+    block_pair_counts_frame,
+    compute_all_block_diagnostics,
+)
 from .continuous_time_2k_sbm_plus import (
     TimestampGranularityModel,
     count_correlation,
@@ -400,6 +405,16 @@ class ContinuousTime2KSBMTemporalStubsGenerator(ContinuousTimeTemporalSBMGenerat
 
         annotated_real = self._annotated_reviews()
         annotated_synthetic = self._annotate_synthetic(synthetic)
+        block_diagnostics = compute_all_block_diagnostics(
+            self.reviews,
+            synthetic,
+            self.sbm_result.customer_blocks,
+            self.sbm_result.product_blocks,
+            self.customer_id_col,
+            self.product_id_col,
+            self.timestamp_col,
+            min_count=5,
+        )
 
         summary = {
             "generator": GENERATOR_NAME,
@@ -414,6 +429,11 @@ class ContinuousTime2KSBMTemporalStubsGenerator(ContinuousTimeTemporalSBMGenerat
             "num_customer_blocks": int(self.sbm_result.num_customer_blocks),
             "num_product_blocks": int(self.sbm_result.num_product_blocks),
             "num_nonzero_block_pairs": int(len(self.block_pair_event_count)),
+            "sbm_backend": "graph_tool"
+            if self.sbm_result.used_existing_reldiff_sbm
+            else "type_only_fallback",
+            "used_existing_reldiff_sbm": self.sbm_result.used_existing_reldiff_sbm,
+            "sbm_description_length": self.sbm_result.description_length,
             "stub_pairing": self.stub_pairing,
             "timestamp_stub_mode": self.timestamp_stub_mode,
             "temporal_window_size": self.temporal_window_size,
@@ -421,12 +441,14 @@ class ContinuousTime2KSBMTemporalStubsGenerator(ContinuousTimeTemporalSBMGenerat
             "pair_multiplicity_mode": self.pair_multiplicity_mode,
             "seed": self.seed,
             **self.granularity_model.to_debug_dict(),
+            **block_diagnostics,
         }
         self._write_json(
             debug_dir / "ct_2k_sbm_temporal_stubs_summary.json", summary
         )
         self.write_sbm_summary(debug_dir / "sbm_summary.json")
-        self._write_assignment_debug(debug_dir)
+        self._write_assignment_debug(debug_dir, synthetic)
+        self._write_canonical_block_pair_counts(debug_dir, synthetic)
         self._write_block_pair_debug(
             debug_dir,
             annotated_real,
@@ -444,26 +466,47 @@ class ContinuousTime2KSBMTemporalStubsGenerator(ContinuousTimeTemporalSBMGenerat
         )
         self._write_pair_multiplicity(debug_dir, synthetic)
 
-    def _write_assignment_debug(self, debug_dir: Path) -> None:
+    def _write_assignment_debug(
+        self, debug_dir: Path, synthetic: pd.DataFrame | None = None
+    ) -> None:
         assert self.sbm_result is not None
-        pd.DataFrame(
-            [
-                {self.customer_id_col: customer_id, "customer_block": block}
-                for customer_id, block in self.sbm_result.customer_blocks.items()
-            ]
-        ).to_csv(
+        customer_blocks = block_assignment_frame(
+            self.sbm_result.customer_blocks,
+            self.customer_id_col,
+            "customer_block",
+            self.reviews,
+            synthetic,
+        )
+        product_blocks = block_assignment_frame(
+            self.sbm_result.product_blocks,
+            self.product_id_col,
+            "product_block",
+            self.reviews,
+            synthetic,
+        )
+        customer_blocks.to_csv(debug_dir / "customer_blocks.csv", index=False)
+        product_blocks.to_csv(debug_dir / "product_blocks.csv", index=False)
+        customer_blocks[[self.customer_id_col, "customer_block"]].to_csv(
             debug_dir / "ct_2k_sbm_temporal_stubs_customer_assignments.csv",
             index=False,
         )
-        pd.DataFrame(
-            [
-                {self.product_id_col: product_id, "product_block": block}
-                for product_id, block in self.sbm_result.product_blocks.items()
-            ]
-        ).to_csv(
+        product_blocks[[self.product_id_col, "product_block"]].to_csv(
             debug_dir / "ct_2k_sbm_temporal_stubs_product_assignments.csv",
             index=False,
         )
+
+    def _write_canonical_block_pair_counts(
+        self, debug_dir: Path, synthetic: pd.DataFrame
+    ) -> None:
+        assert self.sbm_result is not None
+        block_pair_counts_frame(
+            self.reviews,
+            synthetic,
+            self.sbm_result.customer_blocks,
+            self.sbm_result.product_blocks,
+            self.customer_id_col,
+            self.product_id_col,
+        ).to_csv(debug_dir / "block_pair_counts.csv", index=False)
 
     def _write_block_pair_debug(
         self,
@@ -574,16 +617,26 @@ class ContinuousTime2KSBMTemporalStubsGenerator(ContinuousTimeTemporalSBMGenerat
         )
 
         per_pair_ks = []
-        for block_pair, real_count in self.block_pair_event_count.items():
-            if real_count == 0:
-                continue
-            real_pair_times = self.block_pair_events[block_pair].times
+        per_pair_weights = []
+        skipped_pairs = 0
+        min_count = 5
+        for block_pair in sorted(
+            set(self.block_pair_event_count) | set(synthetic_times_by_pair)
+        ):
+            real_count = self.block_pair_event_count.get(block_pair, 0)
             synthetic_pair_times = np.asarray(
                 synthetic_times_by_pair.get(block_pair, []), dtype=float
             )
+            if real_count < min_count or len(synthetic_pair_times) < min_count:
+                skipped_pairs += 1
+                continue
+            real_pair_times = self.block_pair_events[block_pair].times
             ks = empirical_ks_statistic(real_pair_times, synthetic_pair_times)
             if ks is not None:
-                per_pair_ks.append(ks)
+                per_pair_ks.append(float(ks))
+                per_pair_weights.append(float(real_count))
+            else:
+                skipped_pairs += 1
 
         diagnostics = {
             "global_timestamp_ks": empirical_ks_statistic(real_x, synthetic_x),
@@ -609,6 +662,20 @@ class ContinuousTime2KSBMTemporalStubsGenerator(ContinuousTimeTemporalSBMGenerat
             if per_pair_ks
             else None,
             "per_block_pair_timestamp_ks_num_pairs": len(per_pair_ks),
+            "block_pair_timestamp_ks_mean": float(np.mean(per_pair_ks))
+            if per_pair_ks
+            else None,
+            "block_pair_timestamp_ks_median": float(np.median(per_pair_ks))
+            if per_pair_ks
+            else None,
+            "block_pair_timestamp_ks_weighted_mean": float(
+                np.average(per_pair_ks, weights=per_pair_weights)
+            )
+            if per_pair_ks
+            else None,
+            "block_pair_timestamp_ks_num_pairs": len(per_pair_ks),
+            "block_pair_timestamp_ks_skipped_pairs": skipped_pairs,
+            "block_pair_timestamp_ks_min_count": min_count,
         }
         self._write_json(
             debug_dir / "ct_2k_sbm_temporal_stubs_timestamp_diagnostics.json",

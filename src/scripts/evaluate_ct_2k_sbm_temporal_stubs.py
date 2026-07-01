@@ -9,7 +9,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import pandas as pd
 
 
@@ -17,13 +16,13 @@ if __package__ is None:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from evaluate_ct_2k_sbm_plus import (  # noqa: E402
-    evaluate_plus,
-    load_block_map,
-)
+from evaluate_ct_2k_sbm_plus import evaluate_plus  # noqa: E402
 from evaluate_temporal_sbm_event_spine import load_reviews  # noqa: E402
-from reldiff.generation.continuous_time_temporal_sbm import (  # noqa: E402
-    empirical_ks_statistic,
+from reldiff.generation.block_diagnostics import (  # noqa: E402
+    compute_all_block_diagnostics,
+    load_block_map,
+    load_block_maps_from_debug_dir,
+    missing_block_diagnostics,
 )
 
 
@@ -38,57 +37,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timestamp-col", default="review_time")
     parser.add_argument("--customer-blocks", default=None)
     parser.add_argument("--product-blocks", default=None)
+    parser.add_argument("--debug-dir", default=None)
+    parser.add_argument("--block-pair-min-count", type=int, default=5)
+    parser.add_argument(
+        "--fallback-single-block-pair",
+        action="store_true",
+        help="Explicitly collapse all rows to one block pair when no block metadata exists.",
+    )
     parser.add_argument("--output", default=None)
     parser.add_argument("--trajectory-bins", default="M")
     return parser.parse_args()
-
-
-def block_pair_timestamp_ks_summary(
-    real: pd.DataFrame,
-    synthetic: pd.DataFrame,
-    customer_col: str,
-    product_col: str,
-    timestamp_col: str,
-    customer_blocks: dict[Any, int],
-    product_blocks: dict[Any, int],
-) -> dict[str, float | int | None]:
-    real_annotated = _annotate_with_blocks(
-        real, customer_col, product_col, customer_blocks, product_blocks
-    )
-    synthetic_annotated = _annotate_with_blocks(
-        synthetic, customer_col, product_col, customer_blocks, product_blocks
-    )
-    synthetic_groups = {
-        (int(customer_block), int(product_block)): group
-        for (customer_block, product_block), group in synthetic_annotated.groupby(
-            ["customer_block", "product_block"]
-        )
-    }
-
-    ks_values = []
-    for (customer_block, product_block), real_group in real_annotated.groupby(
-        ["customer_block", "product_block"], sort=True
-    ):
-        synthetic_group = synthetic_groups.get(
-            (int(customer_block), int(product_block))
-        )
-        if synthetic_group is None or synthetic_group.empty:
-            continue
-        real_values = _timestamp_values(real_group[timestamp_col])
-        synthetic_values = _timestamp_values(synthetic_group[timestamp_col])
-        ks = empirical_ks_statistic(real_values, synthetic_values)
-        if ks is not None:
-            ks_values.append(ks)
-
-    return {
-        "block_pair_timestamp_ks_mean": float(np.mean(ks_values))
-        if ks_values
-        else None,
-        "block_pair_timestamp_ks_median": float(np.median(ks_values))
-        if ks_values
-        else None,
-        "block_pair_timestamp_ks_num_pairs": len(ks_values),
-    }
 
 
 def evaluate_temporal_stubs(
@@ -100,7 +58,16 @@ def evaluate_temporal_stubs(
     trajectory_bins: str = "M",
     customer_blocks: dict[Any, int] | None = None,
     product_blocks: dict[Any, int] | None = None,
+    block_pair_min_count: int = 5,
+    warn_missing_blocks: bool = True,
 ) -> dict[str, Any]:
+    real = real.copy()
+    synthetic = synthetic.copy()
+    real[timestamp_col] = pd.to_datetime(real[timestamp_col], errors="coerce")
+    synthetic[timestamp_col] = pd.to_datetime(synthetic[timestamp_col], errors="coerce")
+    real = real.dropna(subset=[timestamp_col])
+    synthetic = synthetic.dropna(subset=[timestamp_col])
+
     results = evaluate_plus(
         real,
         synthetic,
@@ -111,40 +78,21 @@ def evaluate_temporal_stubs(
         customer_blocks=customer_blocks,
         product_blocks=product_blocks,
     )
-    block_pair_timestamp = {
-        "block_pair_timestamp_ks_mean": None,
-        "block_pair_timestamp_ks_median": None,
-        "block_pair_timestamp_ks_num_pairs": 0,
-    }
     if customer_blocks is not None and product_blocks is not None:
-        block_pair_timestamp = block_pair_timestamp_ks_summary(
+        block_diagnostics = compute_all_block_diagnostics(
             real,
             synthetic,
+            customer_blocks,
+            product_blocks,
             customer_col,
             product_col,
             timestamp_col,
-            customer_blocks,
-            product_blocks,
+            min_count=block_pair_min_count,
         )
-    results["additional"].update(block_pair_timestamp)
+    else:
+        block_diagnostics = missing_block_diagnostics(warn=warn_missing_blocks)
+    results["additional"].update(block_diagnostics)
     return results
-
-
-def _annotate_with_blocks(
-    df: pd.DataFrame,
-    customer_col: str,
-    product_col: str,
-    customer_blocks: dict[Any, int],
-    product_blocks: dict[Any, int],
-) -> pd.DataFrame:
-    annotated = df.copy()
-    annotated["customer_block"] = annotated[customer_col].map(customer_blocks)
-    annotated["product_block"] = annotated[product_col].map(product_blocks)
-    return annotated.dropna(subset=["customer_block", "product_block"]).copy()
-
-
-def _timestamp_values(timestamps: pd.Series) -> np.ndarray:
-    return pd.to_datetime(timestamps).astype("int64").to_numpy(dtype=float)
 
 
 def main() -> None:
@@ -162,6 +110,29 @@ def main() -> None:
         product_blocks = load_block_map(
             args.product_blocks, args.product_id_col, "product_block"
         )
+    if (
+        (customer_blocks is None or product_blocks is None)
+        and args.debug_dir is not None
+    ):
+        customer_blocks, product_blocks, _, _ = load_block_maps_from_debug_dir(
+            args.debug_dir, args.customer_id_col, args.product_id_col
+        )
+    if (
+        (customer_blocks is None or product_blocks is None)
+        and args.fallback_single_block_pair
+    ):
+        customer_blocks = {
+            customer_id: 0
+            for customer_id in pd.concat(
+                [real[args.customer_id_col], synthetic[args.customer_id_col]]
+            ).dropna().unique()
+        }
+        product_blocks = {
+            product_id: 0
+            for product_id in pd.concat(
+                [real[args.product_id_col], synthetic[args.product_id_col]]
+            ).dropna().unique()
+        }
 
     results = evaluate_temporal_stubs(
         real,
@@ -172,6 +143,7 @@ def main() -> None:
         trajectory_bins=args.trajectory_bins,
         customer_blocks=customer_blocks,
         product_blocks=product_blocks,
+        block_pair_min_count=args.block_pair_min_count,
     )
     print(json.dumps(results, indent=2))
     if args.output is not None:

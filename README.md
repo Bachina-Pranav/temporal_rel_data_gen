@@ -155,6 +155,22 @@ python src/scripts/evaluate_ct_2k_sbm_temporal_stubs.py \
   --synthetic-reviews outputs/amazon-toy/ct_2k_sbm_temporal_stubs/synthetic_review.csv
 ```
 
+Block-pair diagnostics require customer/product block assignment metadata. When
+`--debug-dir` is available, the evaluator looks for `customer_blocks.csv` and
+`product_blocks.csv` there. If these files are missing, block-pair KS and
+block-pair count metrics are skipped with a warning instead of falling back to a
+fake single block pair.
+
+Standalone block diagnostics:
+
+```bash
+python src/scripts/diagnose_temporal_sbm_blocks.py \
+  --real-reviews data/original/rel-amazon-toy/review.csv \
+  --synthetic-reviews outputs/amazon-toy/ct_2k_sbm_temporal_stubs/synthetic_review.csv \
+  --debug-dir outputs/amazon-toy/ct_2k_sbm_temporal_stubs/debug \
+  --output outputs/amazon-toy/ct_2k_sbm_temporal_stubs/debug/block_diagnostics.json
+```
+
 ## TemporalLatentTextAttributeDiffusion
 
 `TemporalLatentTextAttributeDiffusion` is an attribute generator conditioned on
