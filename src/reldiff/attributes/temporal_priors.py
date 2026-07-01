@@ -155,8 +155,37 @@ def temporal_bucket(timestamps: pd.Series, level: str) -> pd.Series:
         return pd.Series(["global"] * len(values), index=values.index)
     if level == "date":
         return values.dt.strftime("%Y-%m-%d")
-    if level == "year_month":
+    if level in {"year_month", "month"}:
         return values.dt.strftime("%Y-%m")
-    if level == "month":
-        return values.dt.month.astype(str)
     raise ValueError("temporal prior level must be month, year_month, date, or global")
+
+
+def check_temporal_bucket_consistency(
+    prior: TemporalAttributePrior,
+    synthetic_timestamps: pd.Series,
+    evaluator_timestamps: pd.Series,
+    level: str | None = None,
+) -> Dict[str, Any]:
+    """Compare prior, sampling, and evaluator temporal bucket keys."""
+
+    bucket_level = level or prior.temporal_prior_level
+    prior_buckets = set(prior.per_bucket_rating_distribution)
+    synthetic_buckets = set(temporal_bucket(synthetic_timestamps, bucket_level).dropna().astype(str))
+    evaluator_buckets = set(temporal_bucket(evaluator_timestamps, bucket_level).dropna().astype(str))
+    return {
+        "train_prior_num_buckets": len(prior_buckets),
+        "sampling_num_buckets": len(synthetic_buckets),
+        "evaluator_num_buckets": len(evaluator_buckets),
+        "train_prior_bucket_examples": sorted(prior_buckets)[:5],
+        "synthetic_bucket_examples": sorted(synthetic_buckets)[:5],
+        "evaluator_bucket_examples": sorted(evaluator_buckets)[:5],
+        "buckets_missing_in_synthetic": sorted(prior_buckets - synthetic_buckets),
+        "buckets_missing_in_prior": sorted((synthetic_buckets | evaluator_buckets) - prior_buckets),
+        "buckets_missing_in_evaluator": sorted(prior_buckets - evaluator_buckets),
+        "bucket_format": "YYYY-MM" if bucket_level in {"month", "year_month"} else bucket_level,
+        "is_consistent": bool(
+            not (prior_buckets - synthetic_buckets)
+            and not (prior_buckets - evaluator_buckets)
+            and not ((synthetic_buckets | evaluator_buckets) - prior_buckets)
+        ),
+    }

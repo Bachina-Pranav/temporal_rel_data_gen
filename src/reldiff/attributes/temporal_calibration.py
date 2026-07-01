@@ -2,12 +2,26 @@
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Any, Dict, Tuple
 
 import numpy as np
 import torch
 
 from .entity_latent_effects import logit
+
+
+def js_divergence_probs(p: np.ndarray, q: np.ndarray, eps: float = 1e-12) -> float:
+    p = np.asarray(p, dtype=float)
+    q = np.asarray(q, dtype=float)
+    p = p / max(p.sum(), eps)
+    q = q / max(q.sum(), eps)
+    m = 0.5 * (p + q)
+    p_mask = p > 0
+    q_mask = q > 0
+    return float(
+        0.5 * np.sum(p[p_mask] * np.log2(p[p_mask] / np.maximum(m[p_mask], eps)))
+        + 0.5 * np.sum(q[q_mask] * np.log2(q[q_mask] / np.maximum(m[q_mask], eps)))
+    )
 
 
 def calibrate_rating_logits_np(
@@ -63,6 +77,50 @@ def calibrate_logits_torch(
     calibrated_verified[:, 0] -= float(strength) * verified_correction
     norm = float(torch.norm(correction.detach()).cpu() + torch.abs(verified_correction.detach()).cpu())
     return calibrated_rating, calibrated_verified, norm
+
+
+def calibration_group_stats_torch(
+    group: Any,
+    rating_logits_pre: torch.Tensor,
+    rating_logits_post: torch.Tensor,
+    verified_logits_pre: torch.Tensor,
+    verified_logits_post: torch.Tensor,
+    target_rating_distribution: np.ndarray,
+    target_verified_rate: float,
+    strength: float,
+    rating_values: list[Any],
+) -> Dict[str, Any]:
+    """Summarize one temporal calibration group."""
+
+    pre_rating = torch.softmax(rating_logits_pre, dim=1).mean(dim=0).detach().cpu().numpy()
+    post_rating = torch.softmax(rating_logits_post, dim=1).mean(dim=0).detach().cpu().numpy()
+    target_rating = np.asarray(target_rating_distribution, dtype=float)
+    target_rating = target_rating / max(target_rating.sum(), 1e-12)
+    pre_verified = float(torch.softmax(verified_logits_pre, dim=1)[:, 1].mean().detach().cpu())
+    post_verified = float(torch.softmax(verified_logits_post, dim=1)[:, 1].mean().detach().cpu())
+    verified_correction = logit(float(target_verified_rate)) - logit(pre_verified)
+    row: Dict[str, Any] = {
+        "group": str(group),
+        "num_rows": int(rating_logits_pre.shape[0]),
+        "rating_correction_norm": float(
+            np.linalg.norm(np.log(target_rating + 1e-8) - np.log(pre_rating + 1e-8))
+        ),
+        "target_verified_rate": float(target_verified_rate),
+        "expected_precal_verified_rate": pre_verified,
+        "expected_postcal_verified_rate": post_verified,
+        "verified_logit_correction": float(verified_correction),
+        "calibration_strength": float(strength),
+        "precal_rating_target_js": js_divergence_probs(pre_rating, target_rating),
+        "postcal_rating_target_js": js_divergence_probs(post_rating, target_rating),
+        "precal_verified_target_abs_error": float(abs(pre_verified - target_verified_rate)),
+        "postcal_verified_target_abs_error": float(abs(post_verified - target_verified_rate)),
+    }
+    for idx, value in enumerate(rating_values):
+        suffix = str(value)
+        row[f"target_rating_p_{suffix}"] = float(target_rating[idx])
+        row[f"expected_precal_rating_p_{suffix}"] = float(pre_rating[idx])
+        row[f"expected_postcal_rating_p_{suffix}"] = float(post_rating[idx])
+    return row
 
 
 def softmax_np(logits: np.ndarray) -> np.ndarray:

@@ -19,6 +19,35 @@ if __package__ is None:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from reldiff.generation.block_diagnostics import load_block_maps_from_debug_dir  # noqa: E402
+from reldiff.attributes.temporal_priors import temporal_bucket  # noqa: E402
+
+
+DECOMPOSITION_DIAGNOSTIC_KEYS = [
+    "average_norm_base_rating_logits",
+    "average_norm_residual_rating_logits",
+    "average_norm_final_rating_logits_pre_calibration",
+    "average_norm_final_rating_logits_post_calibration",
+    "residual_to_base_norm_ratio",
+    "average_abs_base_verified_logit",
+    "average_abs_residual_verified_logit",
+    "verified_residual_to_base_abs_ratio",
+    "sampled_product_rating_effect_variance",
+    "sampled_customer_rating_effect_variance",
+    "sampled_product_verified_effect_variance",
+    "sampled_customer_verified_effect_variance",
+    "sampled_product_effect_variance",
+    "sampled_customer_effect_variance",
+    "average_temporal_rating_prior_entropy",
+    "average_model_rating_entropy_pre_calibration",
+    "average_model_rating_entropy_post_calibration",
+    "temporal_calibration_average_correction_norm",
+    "temporal_calibration_max_correction_norm",
+    "temporal_calibration_num_groups_calibrated",
+    "average_precal_rating_target_js",
+    "average_postcal_rating_target_js",
+    "average_precal_verified_target_abs_error",
+    "average_postcal_verified_target_abs_error",
+]
 
 
 def parse_args() -> argparse.Namespace:
@@ -31,6 +60,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timestamp-col", default="review_time")
     parser.add_argument("--cat-cols", nargs="+", default=["rating", "verified"])
     parser.add_argument("--num-cols", nargs="*", default=[])
+    parser.add_argument("--diagnostics-dir", default=None)
     parser.add_argument("--output", required=True)
     return parser.parse_args()
 
@@ -58,6 +88,7 @@ def main() -> None:
         num_cols=num_cols,
         customer_blocks=customer_blocks,
         product_blocks=product_blocks,
+        diagnostics_dir=args.diagnostics_dir,
     )
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -84,6 +115,7 @@ def evaluate_nontext_attrs(
     num_cols: List[str],
     customer_blocks: Optional[Dict[Any, int]] = None,
     product_blocks: Optional[Dict[Any, int]] = None,
+    diagnostics_dir: Optional[str | Path] = None,
 ) -> Dict[str, Any]:
     metrics: Dict[str, Any] = {
         "categorical": {},
@@ -91,6 +123,7 @@ def evaluate_nontext_attrs(
         "relational": {},
         "block": {},
         "entity_distribution": {},
+        "temporal_diagnostics": {},
         "numerical": {},
         "c2st": {},
     }
@@ -152,10 +185,22 @@ def evaluate_nontext_attrs(
     if customer_blocks is not None and product_blocks is not None:
         metrics["block"].update(block_metrics(real, synthetic, customer_col, product_col, rating_col, verified_col, customer_blocks, product_blocks))
 
+    monthly_table, monthly_summary = monthly_diagnostics(
+        real, synthetic, timestamp_col, rating_col, verified_col
+    )
+    metrics["temporal_diagnostics"].update(monthly_summary)
+    if diagnostics_dir is not None:
+        diagnostics_path = Path(diagnostics_dir)
+        diagnostics_path.mkdir(parents=True, exist_ok=True)
+        monthly_table.to_csv(diagnostics_path / "monthly_real_vs_synthetic.csv", index=False)
+        with (diagnostics_path / "monthly_summary.json").open("w") as handle:
+            json.dump(monthly_summary, handle, indent=2)
+            handle.write("\n")
+
     for col in num_cols:
         metrics["numerical"][col] = numerical_metrics(real, synthetic, customer_col, product_col, timestamp_col, col)
     metrics["c2st"]["c2st_accuracy"] = c2st_accuracy(real, synthetic, customer_col, product_col, timestamp_col, cat_cols, num_cols)
-    metrics["decomposition"] = decomposition_diagnostics(synthetic)
+    metrics["decomposition"] = decomposition_diagnostics(synthetic, diagnostics_dir)
     return metrics
 
 
@@ -266,6 +311,123 @@ def trajectory_corr_top_entities(real, synthetic, entity_col, timestamp_col, val
 def rating_vs_degree_corr(df, entity_col, rating_col):
     grouped = df.groupby(entity_col).agg(degree=(rating_col, "size"), rating=(rating_col, "mean"))
     return corr(grouped["degree"].to_numpy(dtype=float), grouped["rating"].to_numpy(dtype=float))
+
+
+def monthly_diagnostics(
+    real: pd.DataFrame,
+    synthetic: pd.DataFrame,
+    timestamp_col: str,
+    rating_col: str,
+    verified_col: str,
+) -> tuple[pd.DataFrame, Dict[str, Optional[float]]]:
+    real_frame = real.copy()
+    synthetic_frame = synthetic.copy()
+    real_frame["_month"] = temporal_bucket(real_frame[timestamp_col], "month")
+    synthetic_frame["_month"] = temporal_bucket(synthetic_frame[timestamp_col], "month")
+    rating_values = sorted(
+        set(real_frame[rating_col].dropna().tolist())
+        | set(synthetic_frame[rating_col].dropna().tolist()),
+        key=lambda value: str(value),
+    )
+    numeric_rating_values = pd.to_numeric(pd.Series(rating_values), errors="coerce")
+    if numeric_rating_values.notna().all():
+        numeric_array = numeric_rating_values.to_numpy(dtype=float)
+        integer_like = np.allclose(numeric_array, np.round(numeric_array))
+        existing = {int(value) for value in np.round(numeric_array).tolist()}
+        if integer_like and existing.issubset({1, 2, 3, 4, 5}):
+            rating_values = [1, 2, 3, 4, 5]
+    rows = []
+    months = sorted(set(real_frame["_month"].dropna()) | set(synthetic_frame["_month"].dropna()))
+    for month in months:
+        real_m = real_frame[real_frame["_month"] == month]
+        syn_m = synthetic_frame[synthetic_frame["_month"] == month]
+        real_rating = pd.to_numeric(real_m[rating_col], errors="coerce")
+        syn_rating = pd.to_numeric(syn_m[rating_col], errors="coerce")
+        real_verified = normalize_binary(real_m[verified_col]) if verified_col in real_m else pd.Series(dtype=float)
+        syn_verified = normalize_binary(syn_m[verified_col]) if verified_col in syn_m else pd.Series(dtype=float)
+        row = {
+            "month": month,
+            "real_count": int(len(real_m)),
+            "synthetic_count": int(len(syn_m)),
+            "real_avg_rating": float(real_rating.mean()) if len(real_rating) else None,
+            "synthetic_avg_rating": float(syn_rating.mean()) if len(syn_rating) else None,
+            "real_verified_rate": float(real_verified.mean()) if len(real_verified) else None,
+            "synthetic_verified_rate": float(syn_verified.mean()) if len(syn_verified) else None,
+        }
+        row["rating_abs_error"] = abs_or_none(row["synthetic_avg_rating"], row["real_avg_rating"])
+        row["verified_abs_error"] = abs_or_none(row["synthetic_verified_rate"], row["real_verified_rate"])
+        for value in rating_values:
+            suffix = str(value)
+            row[f"real_rating_dist_{suffix}"] = float((real_m[rating_col] == value).mean()) if len(real_m) else 0.0
+            row[f"synthetic_rating_dist_{suffix}"] = float((syn_m[rating_col] == value).mean()) if len(syn_m) else 0.0
+        row["monthly_rating_distribution_js"] = js_divergence(real_m[rating_col], syn_m[rating_col]) if len(real_m) and len(syn_m) else None
+        row["synthetic_minus_real_avg_rating"] = diff_or_none(row["synthetic_avg_rating"], row["real_avg_rating"])
+        row["synthetic_minus_real_verified_rate"] = diff_or_none(row["synthetic_verified_rate"], row["real_verified_rate"])
+        rows.append(row)
+    table = pd.DataFrame(rows)
+    summary = monthly_summary(table)
+    return table, summary
+
+
+def monthly_summary(table: pd.DataFrame) -> Dict[str, Optional[float]]:
+    if table.empty:
+        return {
+            "monthly_avg_rating_corr": None,
+            "monthly_avg_rating_mae": None,
+            "monthly_avg_rating_rmse": None,
+            "monthly_avg_rating_real_std": None,
+            "monthly_avg_rating_synthetic_std": None,
+            "monthly_avg_rating_variance_ratio": None,
+            "monthly_verified_corr": None,
+            "monthly_verified_mae": None,
+            "monthly_verified_rmse": None,
+            "monthly_verified_real_std": None,
+            "monthly_verified_synthetic_std": None,
+            "monthly_verified_variance_ratio": None,
+            "monthly_rating_distribution_js_mean": None,
+        }
+    real_rating = pd.to_numeric(table["real_avg_rating"], errors="coerce")
+    syn_rating = pd.to_numeric(table["synthetic_avg_rating"], errors="coerce")
+    real_verified = pd.to_numeric(table["real_verified_rate"], errors="coerce")
+    syn_verified = pd.to_numeric(table["synthetic_verified_rate"], errors="coerce")
+    rating_mask = real_rating.notna() & syn_rating.notna()
+    verified_mask = real_verified.notna() & syn_verified.notna()
+    rating_errors = (syn_rating[rating_mask] - real_rating[rating_mask]).to_numpy(dtype=float)
+    verified_errors = (syn_verified[verified_mask] - real_verified[verified_mask]).to_numpy(dtype=float)
+    return {
+        "monthly_avg_rating_corr": corr(real_rating[rating_mask].to_numpy(dtype=float), syn_rating[rating_mask].to_numpy(dtype=float)) if rating_mask.any() else None,
+        "monthly_avg_rating_mae": float(np.mean(np.abs(rating_errors))) if len(rating_errors) else None,
+        "monthly_avg_rating_rmse": float(np.sqrt(np.mean(rating_errors**2))) if len(rating_errors) else None,
+        "monthly_avg_rating_real_std": finite_or_none(real_rating[rating_mask].std()) if rating_mask.any() else None,
+        "monthly_avg_rating_synthetic_std": finite_or_none(syn_rating[rating_mask].std()) if rating_mask.any() else None,
+        "monthly_avg_rating_variance_ratio": variance_ratio(syn_rating[rating_mask].to_numpy(dtype=float), real_rating[rating_mask].to_numpy(dtype=float)) if rating_mask.any() else None,
+        "monthly_verified_corr": corr(real_verified[verified_mask].to_numpy(dtype=float), syn_verified[verified_mask].to_numpy(dtype=float)) if verified_mask.any() else None,
+        "monthly_verified_mae": float(np.mean(np.abs(verified_errors))) if len(verified_errors) else None,
+        "monthly_verified_rmse": float(np.sqrt(np.mean(verified_errors**2))) if len(verified_errors) else None,
+        "monthly_verified_real_std": finite_or_none(real_verified[verified_mask].std()) if verified_mask.any() else None,
+        "monthly_verified_synthetic_std": finite_or_none(syn_verified[verified_mask].std()) if verified_mask.any() else None,
+        "monthly_verified_variance_ratio": variance_ratio(syn_verified[verified_mask].to_numpy(dtype=float), real_verified[verified_mask].to_numpy(dtype=float)) if verified_mask.any() else None,
+        "monthly_rating_distribution_js_mean": finite_or_none(pd.to_numeric(table["monthly_rating_distribution_js"], errors="coerce").mean()),
+    }
+
+
+def abs_or_none(a, b):
+    if a is None or b is None or pd.isna(a) or pd.isna(b):
+        return None
+    return float(abs(a - b))
+
+
+def diff_or_none(a, b):
+    if a is None or b is None or pd.isna(a) or pd.isna(b):
+        return None
+    return float(a - b)
+
+
+def finite_or_none(value):
+    if value is None or pd.isna(value):
+        return None
+    value = float(value)
+    return value if np.isfinite(value) else None
 
 
 def entity_average_distribution_metrics(
@@ -403,42 +565,71 @@ def featurize_for_c2st(df, columns, timestamp_col):
     return frame
 
 
-def decomposition_diagnostics(synthetic: pd.DataFrame) -> Dict[str, Optional[float]]:
-    result = {
-        "average_norm_base_rating_logits": None,
-        "average_norm_residual_rating_logits": None,
-        "residual_to_base_norm_ratio": None,
-        "temporal_calibration_average_correction_norm": None,
-        "sampled_product_effect_variance": None,
-        "sampled_customer_effect_variance": None,
+def decomposition_diagnostics(
+    synthetic: pd.DataFrame,
+    diagnostics_dir: Optional[str | Path] = None,
+) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        key: None for key in DECOMPOSITION_DIAGNOSTIC_KEYS
     }
+    if diagnostics_dir is not None:
+        path = Path(diagnostics_dir) / "decomposition_diagnostics.json"
+        if path.exists():
+            with path.open() as handle:
+                loaded = json.load(handle)
+            result.update({key: finite_or_none(loaded.get(key)) for key in DECOMPOSITION_DIAGNOSTIC_KEYS})
+            result["diagnostic_status"] = "loaded"
+            result["diagnostic_source"] = str(path)
+            return result
+        result["diagnostic_status"] = "missing_diagnostics_file"
+        result["diagnostic_reason"] = f"{path} does not exist"
+        return result
+
+    legacy_columns = {
+        "base_rating_logit_norm",
+        "residual_rating_logit_norm",
+        "temporal_calibration_correction_norm",
+    }
+    if not legacy_columns.intersection(synthetic.columns):
+        result["diagnostic_status"] = "not_v3_output"
+        result["diagnostic_reason"] = (
+            "Pass --diagnostics-dir from V3 sampling to include decomposition diagnostics."
+        )
+        return result
+
+    result["diagnostic_status"] = "legacy_columns"
     if "base_rating_logit_norm" in synthetic.columns:
-        result["average_norm_base_rating_logits"] = float(
+        result["average_norm_base_rating_logits"] = finite_or_none(
             pd.to_numeric(synthetic["base_rating_logit_norm"], errors="coerce").mean()
         )
     if "residual_rating_logit_norm" in synthetic.columns:
-        result["average_norm_residual_rating_logits"] = float(
+        result["average_norm_residual_rating_logits"] = finite_or_none(
             pd.to_numeric(synthetic["residual_rating_logit_norm"], errors="coerce").mean()
         )
-    if result["average_norm_base_rating_logits"] and result["average_norm_residual_rating_logits"] is not None:
+    if (
+        result["average_norm_base_rating_logits"] is not None
+        and result["average_norm_residual_rating_logits"] is not None
+    ):
         result["residual_to_base_norm_ratio"] = float(
             result["average_norm_residual_rating_logits"]
             / max(result["average_norm_base_rating_logits"], 1e-12)
         )
     if "temporal_calibration_correction_norm" in synthetic.columns:
-        result["temporal_calibration_average_correction_norm"] = float(
+        result["temporal_calibration_average_correction_norm"] = finite_or_none(
             pd.to_numeric(synthetic["temporal_calibration_correction_norm"], errors="coerce").mean()
         )
     product_cols = [col for col in synthetic.columns if col.startswith("sampled_product_rating_effect_")]
     customer_cols = [col for col in synthetic.columns if col.startswith("sampled_customer_rating_effect_")]
     if product_cols:
-        result["sampled_product_effect_variance"] = float(
+        result["sampled_product_rating_effect_variance"] = finite_or_none(
             synthetic[product_cols].to_numpy(dtype=float).var()
         )
+        result["sampled_product_effect_variance"] = result["sampled_product_rating_effect_variance"]
     if customer_cols:
-        result["sampled_customer_effect_variance"] = float(
+        result["sampled_customer_rating_effect_variance"] = finite_or_none(
             synthetic[customer_cols].to_numpy(dtype=float).var()
         )
+        result["sampled_customer_effect_variance"] = result["sampled_customer_rating_effect_variance"]
     return result
 
 

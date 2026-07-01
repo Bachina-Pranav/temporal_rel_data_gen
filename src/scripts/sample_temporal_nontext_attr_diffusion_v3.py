@@ -31,6 +31,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use-temporal-calibration", action="store_true")
     parser.add_argument("--temporal-calibration-strength", type=float, default=0.75)
     parser.add_argument("--debug-use-posterior-effects", action="store_true")
+    parser.add_argument("--diagnostics-dir", default=None)
+    parser.add_argument("--diagnostic-row-sample-size", type=int, default=5000)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
@@ -52,11 +54,15 @@ def main() -> None:
         use_temporal_calibration=args.use_temporal_calibration,
         temporal_calibration_strength=args.temporal_calibration_strength,
         debug_use_posterior_effects=args.debug_use_posterior_effects,
+        diagnostics_dir=args.diagnostics_dir,
+        diagnostic_row_sample_size=args.diagnostic_row_sample_size,
         device=args.device,
     )
     print(f"Wrote {args.output} ({len(output)} rows)")
     print(f"Wrote {Path(args.output).with_name(Path(args.output).stem + '_metadata.json')}")
     print(f"Wrote sampled V3 effects in {Path(args.output).parent}")
+    if args.diagnostics_dir:
+        print(f"Wrote V3 diagnostics in {args.diagnostics_dir}")
 
 
 if __name__ == "__main__":

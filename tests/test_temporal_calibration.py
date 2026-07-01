@@ -10,7 +10,11 @@ import sys
 
 sys.path.insert(0, str(ROOT / "src"))
 
-from reldiff.attributes.temporal_calibration import calibrate_rating_logits_np, softmax_np  # noqa: E402
+from reldiff.attributes.temporal_calibration import (  # noqa: E402
+    calibrate_rating_logits_np,
+    js_divergence_probs,
+    softmax_np,
+)
 
 
 def test_temporal_calibration_moves_distribution_toward_target():
@@ -20,4 +24,5 @@ def test_temporal_calibration_moves_distribution_toward_target():
     calibrated, correction = calibrate_rating_logits_np(logits, target, strength=0.75)
     after = softmax_np(calibrated).mean(axis=0)
     assert np.linalg.norm(after - target) < np.linalg.norm(before - target)
+    assert js_divergence_probs(after, target) < js_divergence_probs(before, target)
     assert correction.shape == (3,)
