@@ -155,6 +155,47 @@ python src/scripts/evaluate_ct_2k_sbm_temporal_stubs.py \
   --synthetic-reviews outputs/amazon-toy/ct_2k_sbm_temporal_stubs/synthetic_review.csv
 ```
 
+## ContinuousTime2KSBMTemporalKDEStubsGenerator / ct_2k_sbm_temporal_kde_stubs
+
+`ContinuousTime2KSBMTemporalKDEStubsGenerator` is the generated-timestamp
+variant of the temporal stub generator. It preserves customer/product degree
+stubs and SBM block-pair counts exactly, but samples timestamps from a learned
+block-pair temporal intensity model instead of reusing exact timestamp stubs.
+
+Use `ct_2k_sbm_temporal_stubs` as the microcanonical upper-bound baseline when
+you want exact timestamp-multiset preservation. Use
+`ct_2k_sbm_temporal_kde_stubs` when you want the relaxed, generative temporal
+stub method.
+
+Example:
+
+```bash
+python src/scripts/generate_ct_2k_sbm_temporal_kde_stubs.py \
+  --real-reviews data/original/rel-amazon-toy/review.csv \
+  --output-dir outputs/amazon-toy/ct_2k_sbm_temporal_kde_stubs \
+  --customer-id-col customer_id \
+  --product-id-col product_id \
+  --timestamp-col review_time \
+  --sbm-block-level bottom \
+  --timestamp-model auto \
+  --pairing-mode temporal_window_shuffle \
+  --avoid-real-edge-prob 0.95 \
+  --seed 42
+```
+
+Evaluate all four structural methods together:
+
+```bash
+python src/scripts/evaluate_all_structure_methods.py \
+  --real-reviews data/original/rel-amazon-toy/review.csv \
+  --outputs-root outputs/amazon-toy \
+  --customer-id-col customer_id \
+  --product-id-col product_id \
+  --timestamp-col review_time \
+  --output-json outputs/amazon-toy/all_structure_metrics.json \
+  --output-csv outputs/amazon-toy/all_structure_metrics.csv
+```
+
 Block-pair diagnostics require customer/product block assignment metadata. When
 `--debug-dir` is available, the evaluator looks for `customer_blocks.csv` and
 `product_blocks.csv` there. If these files are missing, block-pair KS and

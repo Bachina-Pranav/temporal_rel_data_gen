@@ -19,6 +19,7 @@ from reldiff.attributes import (  # noqa: E402
 )
 from reldiff.generation import (  # noqa: E402
     ContinuousTime2KSBMPlusGenerator,
+    ContinuousTime2KSBMTemporalKDEStubsGenerator,
     ContinuousTime2KSBMTemporalStubsGenerator,
     ContinuousTimeTemporalSBMGenerator,
 )
@@ -167,3 +168,4 @@ def test_existing_structural_generators_still_import():
     assert ContinuousTimeTemporalSBMGenerator is not None
     assert ContinuousTime2KSBMPlusGenerator is not None
     assert ContinuousTime2KSBMTemporalStubsGenerator is not None
+    assert ContinuousTime2KSBMTemporalKDEStubsGenerator is not None

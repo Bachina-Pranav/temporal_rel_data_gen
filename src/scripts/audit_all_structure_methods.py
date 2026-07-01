@@ -21,8 +21,11 @@ from evaluate_temporal_sbm_event_spine import (  # noqa: E402
     degree_counts,
     edge_overlap_rate,
     load_reviews,
+    timestamp_count_l1_by_date,
+    timestamp_generation_metrics,
 )
 from reldiff.generation.block_diagnostics import (  # noqa: E402
+    annotate_with_blocks,
     compute_all_block_diagnostics,
     load_block_maps_from_debug_dir,
     missing_block_diagnostics,
@@ -37,6 +40,7 @@ KNOWN_METHODS = [
     "continuous_time_temporal_sbm",
     "ct_2k_sbm_plus",
     "ct_2k_sbm_temporal_stubs",
+    "ct_2k_sbm_temporal_kde_stubs",
     "product_time_ipf_temporal_auto_icl",
 ]
 
@@ -150,8 +154,37 @@ def audit_method(
             real[timestamp_col], synthetic[timestamp_col]
         ),
     }
+    timestamp_metrics = timestamp_generation_metrics(
+        real[timestamp_col], synthetic[timestamp_col]
+    )
+    if customer_blocks is not None and product_blocks is not None:
+        timestamp_metrics.update(
+            block_pair_date_count_l1_metrics(
+                real,
+                synthetic,
+                customer_blocks,
+                product_blocks,
+                customer_col,
+                product_col,
+                timestamp_col,
+            )
+        )
+    else:
+        timestamp_metrics.update(
+            {
+                "block_pair_timestamp_count_l1_by_date_mean": None,
+                "block_pair_timestamp_count_l1_by_date_weighted_mean": None,
+            }
+        )
     learned_vs_preserved = learned_vs_preserved_summary(
-        real, synthetic, customer_col, product_col, timestamp_col, block_diagnostics
+        real,
+        synthetic,
+        customer_col,
+        product_col,
+        timestamp_col,
+        block_diagnostics,
+        timestamp_metrics,
+        method,
     )
     interpretation = interpret_method(block_diagnostics, learned_vs_preserved, method)
     return {
@@ -162,6 +195,7 @@ def audit_method(
         "interpretation": interpretation,
         "learned_vs_preserved_summary": learned_vs_preserved,
         **structural,
+        **timestamp_metrics,
         **block_diagnostics,
     }
 
@@ -173,23 +207,23 @@ def learned_vs_preserved_summary(
     product_col: str,
     timestamp_col: str,
     block_diagnostics: Dict[str, Any],
+    timestamp_metrics: Dict[str, Any],
+    method: str,
 ) -> Dict[str, Any]:
     return {
         "preserves_customer_degree_exactly": exact_degree_match(real, synthetic, customer_col),
         "preserves_product_degree_exactly": exact_degree_match(real, synthetic, product_col),
-        "preserves_timestamp_multiset_exactly": timestamp_exact_reuse_rate(
-            real[timestamp_col], synthetic[timestamp_col]
-        )
-        == 1.0,
+        "preserves_timestamp_multiset_exactly": bool(
+            timestamp_metrics.get("timestamp_multiset_exact_match")
+        ),
         "has_nontrivial_block_structure": bool(
             (block_diagnostics.get("num_customer_blocks") or 0) > 1
             or (block_diagnostics.get("num_product_blocks") or 0) > 1
         ),
-        "generates_timestamps_from_kde": "temporal_sbm" in str(block_diagnostics),
-        "reuses_exact_timestamps": timestamp_exact_reuse_rate(
-            real[timestamp_col], synthetic[timestamp_col]
-        )
-        > 0.99,
+        "generates_timestamps_from_kde": method == "ct_2k_sbm_temporal_kde_stubs",
+        "reuses_exact_timestamps": bool(
+            timestamp_metrics.get("timestamp_multiset_exact_match")
+        ),
     }
 
 
@@ -232,6 +266,56 @@ def timestamp_exact_reuse_rate(real_times: pd.Series, synthetic_times: pd.Series
     for timestamp, count in synthetic_counts.items():
         reused += min(int(count), int(real_counts.get(timestamp, 0)))
     return float(reused / synthetic_counts.sum())
+
+
+def block_pair_date_count_l1_metrics(
+    real: pd.DataFrame,
+    synthetic: pd.DataFrame,
+    customer_blocks: Dict[Any, int],
+    product_blocks: Dict[Any, int],
+    customer_col: str,
+    product_col: str,
+    timestamp_col: str,
+) -> Dict[str, Any]:
+    real_annotated = annotate_with_blocks(
+        real, customer_blocks, product_blocks, customer_col, product_col
+    )
+    synthetic_annotated = annotate_with_blocks(
+        synthetic, customer_blocks, product_blocks, customer_col, product_col
+    )
+    real_groups = {
+        (int(a), int(b)): group
+        for (a, b), group in real_annotated.groupby(["customer_block", "product_block"])
+    }
+    synthetic_groups = {
+        (int(a), int(b)): group
+        for (a, b), group in synthetic_annotated.groupby(
+            ["customer_block", "product_block"]
+        )
+    }
+    values = []
+    weights = []
+    for block_pair, real_group in real_groups.items():
+        synthetic_group = synthetic_groups.get(block_pair)
+        if synthetic_group is None or synthetic_group.empty:
+            continue
+        value = timestamp_count_l1_by_date(
+            real_group[timestamp_col], synthetic_group[timestamp_col]
+        )
+        if value is None:
+            continue
+        values.append(float(value))
+        weights.append(float(len(real_group)))
+    return {
+        "block_pair_timestamp_count_l1_by_date_mean": float(np.mean(values))
+        if values
+        else None,
+        "block_pair_timestamp_count_l1_by_date_weighted_mean": float(
+            np.average(values, weights=weights)
+        )
+        if values
+        else None,
+    }
 
 
 def flatten_for_csv(row: Dict[str, Any]) -> Dict[str, Any]:

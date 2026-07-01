@@ -111,6 +111,96 @@ def count_correlation(
     return float(np.corrcoef(real_values, syn_values)[0, 1])
 
 
+def timestamp_granularity_is_date_only(timestamps: pd.Series) -> bool:
+    values = pd.to_datetime(timestamps, errors="coerce").dropna()
+    if len(values) == 0:
+        return False
+    offsets = (values - values.dt.floor("D")).dt.total_seconds()
+    return bool((offsets == 0).mean() >= 0.99)
+
+
+def timestamp_multiset_counts(timestamps: pd.Series, date_only: bool) -> dict[Any, int]:
+    values = pd.to_datetime(timestamps, errors="coerce").dropna()
+    if date_only:
+        values = values.dt.floor("D")
+    return {key: int(value) for key, value in values.value_counts().items()}
+
+
+def timestamp_multiset_exact_match(
+    real_times: pd.Series, synthetic_times: pd.Series, date_only: bool
+) -> bool:
+    return timestamp_multiset_counts(real_times, date_only) == timestamp_multiset_counts(
+        synthetic_times, date_only
+    )
+
+
+def timestamp_multiset_overlap_rate(
+    real_times: pd.Series, synthetic_times: pd.Series, date_only: bool
+) -> float:
+    real_counts = timestamp_multiset_counts(real_times, date_only)
+    synthetic_counts = timestamp_multiset_counts(synthetic_times, date_only)
+    total = sum(synthetic_counts.values())
+    if total == 0:
+        return 0.0
+    overlap = 0
+    for timestamp, count in synthetic_counts.items():
+        overlap += min(int(count), int(real_counts.get(timestamp, 0)))
+    return float(overlap / total)
+
+
+def timestamp_count_l1_by_date(
+    real_times: pd.Series, synthetic_times: pd.Series
+) -> float | None:
+    real_counts = pd.to_datetime(real_times).dt.floor("D").value_counts()
+    synthetic_counts = pd.to_datetime(synthetic_times).dt.floor("D").value_counts()
+    index = real_counts.index.union(synthetic_counts.index)
+    if len(index) == 0:
+        return None
+    total = int(real_counts.sum())
+    if total == 0:
+        return None
+    abs_error = (
+        real_counts.reindex(index, fill_value=0)
+        - synthetic_counts.reindex(index, fill_value=0)
+    ).abs()
+    return float(abs_error.sum() / total)
+
+
+def timestamp_count_correlation_by_date(
+    real_times: pd.Series, synthetic_times: pd.Series
+) -> float | None:
+    real_counts = pd.to_datetime(real_times).dt.floor("D").value_counts()
+    synthetic_counts = pd.to_datetime(synthetic_times).dt.floor("D").value_counts()
+    index = real_counts.index.union(synthetic_counts.index)
+    if len(index) < 2:
+        return None
+    real_values = real_counts.reindex(index, fill_value=0).to_numpy(dtype=float)
+    synthetic_values = synthetic_counts.reindex(index, fill_value=0).to_numpy(dtype=float)
+    if real_values.std() == 0 or synthetic_values.std() == 0:
+        return None
+    return float(np.corrcoef(real_values, synthetic_values)[0, 1])
+
+
+def timestamp_generation_metrics(
+    real_times: pd.Series, synthetic_times: pd.Series
+) -> dict[str, Any]:
+    date_only = timestamp_granularity_is_date_only(real_times)
+    return {
+        "timestamp_multiset_exact_match": timestamp_multiset_exact_match(
+            real_times, synthetic_times, date_only
+        ),
+        "timestamp_multiset_overlap_rate": timestamp_multiset_overlap_rate(
+            real_times, synthetic_times, date_only
+        ),
+        "timestamp_count_l1_by_date": timestamp_count_l1_by_date(
+            real_times, synthetic_times
+        ),
+        "timestamp_count_correlation_by_date": timestamp_count_correlation_by_date(
+            real_times, synthetic_times
+        ),
+    }
+
+
 def top_product_trajectory_corr(
     real: pd.DataFrame,
     synthetic: pd.DataFrame,
@@ -190,6 +280,7 @@ def evaluate(
             "monthly_or_daily_count_correlation": count_correlation(
                 real, synthetic, timestamp_col, trajectory_bins
             ),
+            **timestamp_generation_metrics(real[timestamp_col], synthetic[timestamp_col]),
             "product_inter_event_time_ks": empirical_ks_statistic(
                 real_product_intervals, syn_product_intervals
             ),
