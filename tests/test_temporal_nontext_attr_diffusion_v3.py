@@ -90,6 +90,11 @@ def test_v3_train_sample_and_evaluate(tmp_path):
     )
     assert result.best_checkpoint.exists()
     assert (tmp_path / "v3" / "temporal_priors.json").exists()
+    with (tmp_path / "v3" / "temporal_priors.json").open() as handle:
+        prior_metadata = json.load(handle)
+    assert prior_metadata["temporal_prior_level"] == "year_month"
+    assert prior_metadata["bucket_format"] == "YYYY-MM"
+    assert prior_metadata["num_buckets"] >= 2
     spine = reviews[["customer_id", "product_id", "review_time"]].iloc[:24].copy()
     spine_path = tmp_path / "spine.csv"
     output_path = tmp_path / "synthetic_review_nontext_v3.csv"
@@ -110,6 +115,9 @@ def test_v3_train_sample_and_evaluate(tmp_path):
     assert metadata["uses_real_entity_effect_lookup"] is False
     assert metadata["samples_entity_effects_from_prior"] is True
     assert metadata["uses_temporal_calibration"] is True
+    assert metadata["temporal_prior_level_used_for_sampling"] == "year_month"
+    assert metadata["temporal_bucket_format_used_for_sampling"] == "YYYY-MM"
+    assert metadata["checkpoint_uses_legacy_temporal_buckets"] is False
     assert (tmp_path / "sampled_customer_effects_v3.csv").exists()
     assert (tmp_path / "sampled_product_effects_v3.csv").exists()
     assert set(synthetic["rating"]).issubset(set(reviews["rating"]))

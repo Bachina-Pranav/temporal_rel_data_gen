@@ -27,7 +27,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temporal-split", action="store_true", default=True)
     parser.add_argument("--random-split", action="store_true")
     parser.add_argument("--entity-effect-prior", default="logistic_normal")
-    parser.add_argument("--temporal-prior-level", default="month")
+    parser.add_argument(
+        "--temporal-prior-level",
+        default="year_month",
+        choices=["year_month", "month", "date", "year", "global"],
+        help=(
+            "Temporal bucket level for priors. year_month uses chronological YYYY-MM buckets; "
+            "month uses month-of-year seasonality buckets 01..12."
+        ),
+    )
     parser.add_argument("--use-temporal-calibration", action="store_true")
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=256)

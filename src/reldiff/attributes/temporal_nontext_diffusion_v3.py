@@ -28,6 +28,7 @@ from .temporal_calibration import (
     calibration_group_stats_torch,
     js_divergence_probs,
 )
+from .temporal_buckets import infer_bucket_format
 from .temporal_causal_features import (
     CAUSAL_CONTINUOUS_FEATURES,
     TemporalCausalFeatureBuilder,
@@ -227,7 +228,8 @@ class TemporalNonTextAttributeDiffusionV3(TemporalNonTextAttributeDiffusion):
         self.entity_feature_names = entity_feature_names(len(self.category_values[rating_col]))
         self.config["entity_feature_names"] = self.entity_feature_names
 
-        temporal_level = kwargs.get("temporal_prior_level", "month")
+        temporal_level = kwargs.get("temporal_prior_level", "year_month")
+        self.config["temporal_prior_level"] = temporal_level
         self.temporal_prior = TemporalAttributePrior(self.category_values[rating_col], temporal_prior_level=temporal_level).fit(reviews, self.timestamp_col, rating_col, verified_col)
         self.block_prior = BlockAttributePrior(self.category_values[rating_col]).fit(reviews, structure_debug_dir, self.customer_id_col, self.product_id_col, rating_col, verified_col)
         customer_effects, product_effects, effect_stats = estimate_entity_effects_v3(
@@ -317,6 +319,18 @@ class TemporalNonTextAttributeDiffusionV3(TemporalNonTextAttributeDiffusion):
         self.model.eval()
         spine = synthetic_spine.copy()
         spine[self.timestamp_col] = pd.to_datetime(spine[self.timestamp_col], errors="coerce")
+        temporal_prior_level = self.temporal_prior.temporal_prior_level
+        prior_bucket_keys = set(self.temporal_prior.per_bucket_rating_distribution)
+        sampling_bucket_keys = set(temporal_bucket(spine[self.timestamp_col], temporal_prior_level).dropna().astype(str))
+        sampling_bucket_format = infer_bucket_format(sampling_bucket_keys)
+        missing_sampling_buckets = sorted(sampling_bucket_keys - prior_bucket_keys)
+        checkpoint_uses_legacy_buckets = self.temporal_prior.uses_legacy_temporal_buckets()
+        if checkpoint_uses_legacy_buckets:
+            warnings.warn(
+                "Checkpoint uses legacy month-number temporal priors. "
+                "Retrain V3 with --temporal-prior-level year_month.",
+                RuntimeWarning,
+            )
         customer_blocks, product_blocks = load_block_maps(structure_debug_dir, self.customer_id_col, self.product_id_col)
         customer_effects, product_effects = self.sample_effects_for_spine(spine, customer_blocks, product_blocks, rng, debug_use_posterior_effects)
         if sampled_effects_output_dir is not None:
@@ -478,6 +492,13 @@ class TemporalNonTextAttributeDiffusionV3(TemporalNonTextAttributeDiffusion):
             "uses_temporal_calibration": bool(use_temporal_calibration),
             "temporal_calibration_strength": float(temporal_calibration_strength),
             "temporal_calibration_level": self.temporal_prior.temporal_prior_level,
+            "temporal_prior_level_used_for_sampling": temporal_prior_level,
+            "temporal_bucket_format_used_for_sampling": sampling_bucket_format,
+            "temporal_prior_num_buckets": int(len(prior_bucket_keys)),
+            "sampling_num_buckets": int(len(sampling_bucket_keys)),
+            "num_sampling_buckets_missing_in_prior": int(len(missing_sampling_buckets)),
+            "sampling_buckets_missing_in_prior_examples": missing_sampling_buckets[:20],
+            "checkpoint_uses_legacy_temporal_buckets": bool(checkpoint_uses_legacy_buckets),
             "temporal_calibration_average_correction_norm": float(np.mean(calibration_norms)) if calibration_norms else 0.0,
             "temporal_calibration_num_groups_calibrated": int(len(calibration_rows)),
             "calibration_applied_before_sampling": bool(use_temporal_calibration),
@@ -502,6 +523,7 @@ class TemporalNonTextAttributeDiffusionV3(TemporalNonTextAttributeDiffusion):
                 int(diagnostic_row_sample_size),
                 self.temporal_prior,
                 spine[self.timestamp_col],
+                sampling_metadata=self._last_sampling_metadata,
             )
         columns = [self.customer_id_col, self.product_id_col, self.timestamp_col] + self.cat_cols + self.num_cols
         return output[columns].reset_index(drop=True)
@@ -642,6 +664,12 @@ class TemporalNonTextAttributeDiffusionV3(TemporalNonTextAttributeDiffusion):
             "temporal_calibration_average_correction_norm": sampling.get("temporal_calibration_average_correction_norm", 0.0),
             "temporal_calibration_strength": sampling.get("temporal_calibration_strength"),
             "temporal_calibration_level": sampling.get("temporal_calibration_level"),
+            "temporal_prior_level_used_for_sampling": sampling.get("temporal_prior_level_used_for_sampling"),
+            "temporal_bucket_format_used_for_sampling": sampling.get("temporal_bucket_format_used_for_sampling"),
+            "temporal_prior_num_buckets": sampling.get("temporal_prior_num_buckets"),
+            "sampling_num_buckets": sampling.get("sampling_num_buckets"),
+            "num_sampling_buckets_missing_in_prior": sampling.get("num_sampling_buckets_missing_in_prior"),
+            "checkpoint_uses_legacy_temporal_buckets": sampling.get("checkpoint_uses_legacy_temporal_buckets", False),
             "temporal_calibration_num_groups_calibrated": sampling.get("temporal_calibration_num_groups_calibrated", 0),
             "calibration_applied_before_sampling": sampling.get("calibration_applied_before_sampling", False),
             "structure_source": "ct_2k_sbm_temporal_kde_stubs",
@@ -929,6 +957,7 @@ def write_v3_sampling_diagnostics(
     diagnostic_row_sample_size,
     temporal_prior: TemporalAttributePrior,
     synthetic_timestamps: pd.Series,
+    sampling_metadata=None,
 ) -> None:
     diagnostics_dir = Path(diagnostics_dir)
     diagnostics_dir.mkdir(parents=True, exist_ok=True)
@@ -950,6 +979,21 @@ def write_v3_sampling_diagnostics(
             RuntimeWarning,
         )
     save_json(diagnostics_dir / "temporal_bucket_consistency.json", to_jsonable(consistency))
+    sampling_metadata = sampling_metadata or {}
+    save_json(
+        diagnostics_dir / "temporal_missing_bucket_diagnostics.json",
+        to_jsonable(
+            {
+                "temporal_prior_level_used_for_sampling": sampling_metadata.get("temporal_prior_level_used_for_sampling", temporal_prior.temporal_prior_level),
+                "temporal_bucket_format_used_for_sampling": sampling_metadata.get("temporal_bucket_format_used_for_sampling", temporal_prior.bucket_format),
+                "temporal_prior_num_buckets": sampling_metadata.get("temporal_prior_num_buckets", len(temporal_prior.per_bucket_rating_distribution)),
+                "sampling_num_buckets": sampling_metadata.get("sampling_num_buckets"),
+                "num_sampling_buckets_missing_in_prior": sampling_metadata.get("num_sampling_buckets_missing_in_prior"),
+                "sampling_buckets_missing_in_prior_examples": sampling_metadata.get("sampling_buckets_missing_in_prior_examples", []),
+                "checkpoint_uses_legacy_temporal_buckets": sampling_metadata.get("checkpoint_uses_legacy_temporal_buckets", temporal_prior.uses_legacy_temporal_buckets()),
+            }
+        ),
+    )
     prior_curve, prior_summary = temporal_prior_diagnostics_from_prior(
         temporal_prior, synthetic_timestamps
     )
@@ -999,6 +1043,9 @@ def temporal_prior_diagnostics_from_prior(
         "prior_monthly_verified_std": float(curve["prior_verified_rate"].std()) if not curve.empty else None,
         "real_monthly_verified_std": None,
         "prior_to_real_monthly_verified_corr": None,
+        "temporal_prior_level": temporal_prior.temporal_prior_level,
+        "prior_curve_month_format": temporal_prior.bucket_format,
+        "temporal_prior_num_buckets": temporal_prior.num_buckets,
         "synthetic_bucket_examples": sorted(set(temporal_bucket(timestamps, temporal_prior.temporal_prior_level)))[:5],
     }
     return curve, summary

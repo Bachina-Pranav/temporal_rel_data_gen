@@ -20,6 +20,7 @@ if __package__ is None:
 
 from reldiff.generation.block_diagnostics import load_block_maps_from_debug_dir  # noqa: E402
 from reldiff.attributes.temporal_priors import temporal_bucket  # noqa: E402
+from reldiff.attributes.temporal_buckets import expected_bucket_format  # noqa: E402
 
 
 DECOMPOSITION_DIAGNOSTIC_KEYS = [
@@ -60,6 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timestamp-col", default="review_time")
     parser.add_argument("--cat-cols", nargs="+", default=["rating", "verified"])
     parser.add_argument("--num-cols", nargs="*", default=[])
+    parser.add_argument("--temporal-bucket-level", default="year_month")
     parser.add_argument("--diagnostics-dir", default=None)
     parser.add_argument("--output", required=True)
     return parser.parse_args()
@@ -88,6 +90,7 @@ def main() -> None:
         num_cols=num_cols,
         customer_blocks=customer_blocks,
         product_blocks=product_blocks,
+        temporal_bucket_level=args.temporal_bucket_level,
         diagnostics_dir=args.diagnostics_dir,
     )
     output_path = Path(args.output)
@@ -115,6 +118,7 @@ def evaluate_nontext_attrs(
     num_cols: List[str],
     customer_blocks: Optional[Dict[Any, int]] = None,
     product_blocks: Optional[Dict[Any, int]] = None,
+    temporal_bucket_level: str = "year_month",
     diagnostics_dir: Optional[str | Path] = None,
 ) -> Dict[str, Any]:
     metrics: Dict[str, Any] = {
@@ -127,6 +131,8 @@ def evaluate_nontext_attrs(
         "numerical": {},
         "c2st": {},
     }
+    metrics["temporal_diagnostics"]["evaluator_temporal_bucket_level"] = temporal_bucket_level
+    metrics["temporal_diagnostics"]["evaluator_bucket_format"] = expected_bucket_format(temporal_bucket_level)
     for col in cat_cols:
         if col not in real.columns or col not in synthetic.columns:
             continue
@@ -136,11 +142,11 @@ def evaluate_nontext_attrs(
     rating_col = "rating" if "rating" in cat_cols else cat_cols[0]
     verified_col = "verified" if "verified" in cat_cols else (cat_cols[1] if len(cat_cols) > 1 else cat_cols[0])
     if rating_col in real.columns and rating_col in synthetic.columns:
-        metrics["temporal"]["rating_by_month_correlation"] = grouped_rate_corr(real, synthetic, timestamp_col, rating_col, "M")
-        metrics["temporal"]["monthly_average_rating_correlation"] = grouped_rate_corr(real, synthetic, timestamp_col, rating_col, "M")
+        metrics["temporal"]["rating_by_month_correlation"] = grouped_rate_corr(real, synthetic, timestamp_col, rating_col, "M", bucket_level=temporal_bucket_level)
+        metrics["temporal"]["monthly_average_rating_correlation"] = grouped_rate_corr(real, synthetic, timestamp_col, rating_col, "M", bucket_level=temporal_bucket_level)
         metrics["temporal"]["daily_average_rating_correlation"] = grouped_rate_corr(real, synthetic, timestamp_col, rating_col, "D", min_periods=7)
         metrics["temporal"]["monthly_rating_distribution_js_mean"] = grouped_distribution_js(
-            real, synthetic, timestamp_col, rating_col, "M"
+            real, synthetic, timestamp_col, rating_col, "M", bucket_level=temporal_bucket_level
         )
         metrics["relational"]["product_average_rating_correlation"] = entity_mean_corr(real, synthetic, product_col, rating_col)
         metrics["relational"]["customer_average_rating_correlation"] = entity_mean_corr(real, synthetic, customer_col, rating_col)
@@ -163,11 +169,11 @@ def evaluate_nontext_attrs(
     if verified_col in real.columns and verified_col in synthetic.columns:
         real_v = normalize_binary(real[verified_col])
         syn_v = normalize_binary(synthetic[verified_col])
-        metrics["temporal"]["verified_by_month_correlation"] = grouped_series_corr(real, synthetic, timestamp_col, real_v, syn_v, "M")
-        metrics["temporal"]["monthly_verified_rate_correlation"] = grouped_series_corr(real, synthetic, timestamp_col, real_v, syn_v, "M")
+        metrics["temporal"]["verified_by_month_correlation"] = grouped_series_corr(real, synthetic, timestamp_col, real_v, syn_v, "M", bucket_level=temporal_bucket_level)
+        metrics["temporal"]["monthly_verified_rate_correlation"] = grouped_series_corr(real, synthetic, timestamp_col, real_v, syn_v, "M", bucket_level=temporal_bucket_level)
         metrics["temporal"]["daily_verified_rate_correlation"] = grouped_series_corr(real, synthetic, timestamp_col, real_v, syn_v, "D", min_periods=7)
         metrics["temporal"]["monthly_verified_rate_mae"] = grouped_series_mae(
-            real, synthetic, timestamp_col, real_v, syn_v, "M"
+            real, synthetic, timestamp_col, real_v, syn_v, "M", bucket_level=temporal_bucket_level
         )
         metrics["relational"]["product_verified_rate_correlation"] = entity_series_corr(real, synthetic, product_col, real_v, syn_v)
         metrics["relational"]["customer_verified_rate_correlation"] = entity_series_corr(real, synthetic, customer_col, real_v, syn_v)
@@ -186,8 +192,10 @@ def evaluate_nontext_attrs(
         metrics["block"].update(block_metrics(real, synthetic, customer_col, product_col, rating_col, verified_col, customer_blocks, product_blocks))
 
     monthly_table, monthly_summary = monthly_diagnostics(
-        real, synthetic, timestamp_col, rating_col, verified_col
+        real, synthetic, timestamp_col, rating_col, verified_col, temporal_bucket_level
     )
+    monthly_summary["evaluator_temporal_bucket_level"] = temporal_bucket_level
+    monthly_summary["evaluator_bucket_format"] = expected_bucket_format(temporal_bucket_level)
     metrics["temporal_diagnostics"].update(monthly_summary)
     if diagnostics_dir is not None:
         diagnostics_path = Path(diagnostics_dir)
@@ -198,7 +206,7 @@ def evaluate_nontext_attrs(
             handle.write("\n")
 
     for col in num_cols:
-        metrics["numerical"][col] = numerical_metrics(real, synthetic, customer_col, product_col, timestamp_col, col)
+        metrics["numerical"][col] = numerical_metrics(real, synthetic, customer_col, product_col, timestamp_col, col, temporal_bucket_level)
     metrics["c2st"]["c2st_accuracy"] = c2st_accuracy(real, synthetic, customer_col, product_col, timestamp_col, cat_cols, num_cols)
     metrics["decomposition"] = decomposition_diagnostics(synthetic, diagnostics_dir)
     return metrics
@@ -236,9 +244,9 @@ def corr(a: np.ndarray, b: np.ndarray) -> Optional[float]:
     return float(np.corrcoef(a, b)[0, 1])
 
 
-def grouped_rate_corr(real, synthetic, timestamp_col, value_col, freq, min_periods=2):
-    real_s = grouped_mean_series(real, timestamp_col, pd.to_numeric(real[value_col], errors="coerce"), freq)
-    syn_s = grouped_mean_series(synthetic, timestamp_col, pd.to_numeric(synthetic[value_col], errors="coerce"), freq)
+def grouped_rate_corr(real, synthetic, timestamp_col, value_col, freq, min_periods=2, bucket_level="year_month"):
+    real_s = grouped_mean_series(real, timestamp_col, pd.to_numeric(real[value_col], errors="coerce"), freq, bucket_level)
+    syn_s = grouped_mean_series(synthetic, timestamp_col, pd.to_numeric(synthetic[value_col], errors="coerce"), freq, bucket_level)
     index = real_s.index.union(syn_s.index)
     real_v = real_s.reindex(index).dropna()
     syn_v = syn_s.reindex(index).dropna()
@@ -248,31 +256,31 @@ def grouped_rate_corr(real, synthetic, timestamp_col, value_col, freq, min_perio
     return corr(real_v.loc[index].to_numpy(), syn_v.loc[index].to_numpy())
 
 
-def grouped_series_corr(real, synthetic, timestamp_col, real_values, syn_values, freq, min_periods=2):
-    real_s = grouped_mean_series(real, timestamp_col, real_values, freq)
-    syn_s = grouped_mean_series(synthetic, timestamp_col, syn_values, freq)
+def grouped_series_corr(real, synthetic, timestamp_col, real_values, syn_values, freq, min_periods=2, bucket_level="year_month"):
+    real_s = grouped_mean_series(real, timestamp_col, real_values, freq, bucket_level)
+    syn_s = grouped_mean_series(synthetic, timestamp_col, syn_values, freq, bucket_level)
     index = real_s.index.intersection(syn_s.index)
     if len(index) < min_periods:
         return None
     return corr(real_s.loc[index].to_numpy(), syn_s.loc[index].to_numpy())
 
 
-def grouped_series_mae(real, synthetic, timestamp_col, real_values, syn_values, freq, min_periods=2):
-    real_s = grouped_mean_series(real, timestamp_col, real_values, freq)
-    syn_s = grouped_mean_series(synthetic, timestamp_col, syn_values, freq)
+def grouped_series_mae(real, synthetic, timestamp_col, real_values, syn_values, freq, min_periods=2, bucket_level="year_month"):
+    real_s = grouped_mean_series(real, timestamp_col, real_values, freq, bucket_level)
+    syn_s = grouped_mean_series(synthetic, timestamp_col, syn_values, freq, bucket_level)
     index = real_s.index.intersection(syn_s.index)
     if len(index) < min_periods:
         return None
     return float(np.mean(np.abs(real_s.loc[index].to_numpy() - syn_s.loc[index].to_numpy())))
 
 
-def grouped_distribution_js(real, synthetic, timestamp_col, value_col, freq, min_periods=2):
+def grouped_distribution_js(real, synthetic, timestamp_col, value_col, freq, min_periods=2, bucket_level="year_month"):
     if is_month_frequency(freq):
         real_frame = pd.DataFrame(
-            {"bucket": temporal_bucket(real[timestamp_col], "month"), value_col: real[value_col]}
+            {"bucket": temporal_bucket(real[timestamp_col], bucket_level), value_col: real[value_col]}
         )
         syn_frame = pd.DataFrame(
-            {"bucket": temporal_bucket(synthetic[timestamp_col], "month"), value_col: synthetic[value_col]}
+            {"bucket": temporal_bucket(synthetic[timestamp_col], bucket_level), value_col: synthetic[value_col]}
         )
         values = []
         for bucket in sorted(set(real_frame["bucket"].dropna()) & set(syn_frame["bucket"].dropna())):
@@ -298,10 +306,10 @@ def grouped_distribution_js(real, synthetic, timestamp_col, value_col, freq, min
     return float(np.mean(values))
 
 
-def grouped_mean_series(frame: pd.DataFrame, timestamp_col: str, values: pd.Series, freq: str) -> pd.Series:
+def grouped_mean_series(frame: pd.DataFrame, timestamp_col: str, values: pd.Series, freq: str, bucket_level: str = "year_month") -> pd.Series:
     values = pd.to_numeric(pd.Series(values, index=frame.index), errors="coerce")
     if is_month_frequency(freq):
-        bucket = temporal_bucket(frame[timestamp_col], "month")
+        bucket = temporal_bucket(frame[timestamp_col], bucket_level)
         return pd.DataFrame({"bucket": bucket, "value": values}).dropna().groupby("bucket")["value"].mean()
     return pd.DataFrame({timestamp_col: frame[timestamp_col], "value": values}).set_index(timestamp_col)["value"].resample(freq).mean()
 
@@ -347,11 +355,12 @@ def monthly_diagnostics(
     timestamp_col: str,
     rating_col: str,
     verified_col: str,
+    temporal_bucket_level: str = "year_month",
 ) -> tuple[pd.DataFrame, Dict[str, Optional[float]]]:
     real_frame = real.copy()
     synthetic_frame = synthetic.copy()
-    real_frame["_month"] = temporal_bucket(real_frame[timestamp_col], "month")
-    synthetic_frame["_month"] = temporal_bucket(synthetic_frame[timestamp_col], "month")
+    real_frame["_month"] = temporal_bucket(real_frame[timestamp_col], temporal_bucket_level)
+    synthetic_frame["_month"] = temporal_bucket(synthetic_frame[timestamp_col], temporal_bucket_level)
     rating_values = sorted(
         set(real_frame[rating_col].dropna().tolist())
         | set(synthetic_frame[rating_col].dropna().tolist()),
@@ -519,7 +528,7 @@ def block_metrics(real, synthetic, customer_col, product_col, rating_col, verifi
     return result
 
 
-def numerical_metrics(real, synthetic, customer_col, product_col, timestamp_col, col):
+def numerical_metrics(real, synthetic, customer_col, product_col, timestamp_col, col, temporal_bucket_level="year_month"):
     real_v = pd.to_numeric(real[col], errors="coerce").dropna().to_numpy(dtype=float)
     syn_v = pd.to_numeric(synthetic[col], errors="coerce").dropna().to_numpy(dtype=float)
     result = {
@@ -531,7 +540,7 @@ def numerical_metrics(real, synthetic, customer_col, product_col, timestamp_col,
         "wasserstein": wasserstein_1d(real_v, syn_v),
         "product_average_correlation": entity_mean_corr(real, synthetic, product_col, col),
         "customer_average_correlation": entity_mean_corr(real, synthetic, customer_col, col),
-        "monthly_average_correlation": grouped_rate_corr(real, synthetic, timestamp_col, col, "M"),
+        "monthly_average_correlation": grouped_rate_corr(real, synthetic, timestamp_col, col, "M", bucket_level=temporal_bucket_level),
     }
     return result
 

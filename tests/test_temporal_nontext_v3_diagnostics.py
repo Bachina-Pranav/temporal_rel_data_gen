@@ -79,6 +79,9 @@ def test_v3_sampling_evaluator_diagnostics_and_sweep_smoke(tmp_path):
         metadata = json.load(handle)
     assert metadata["calibration_applied_before_sampling"] is True
     assert metadata["temporal_calibration_num_groups_calibrated"] > 0
+    assert metadata["temporal_prior_level_used_for_sampling"] == "year_month"
+    assert metadata["temporal_bucket_format_used_for_sampling"] == "YYYY-MM"
+    assert metadata["checkpoint_uses_legacy_temporal_buckets"] is False
 
     metrics = evaluate_nontext_attrs(
         load_reviews(train_path, "review_time"),
@@ -125,6 +128,12 @@ def test_v3_sampling_evaluator_diagnostics_and_sweep_smoke(tmp_path):
     assert required.issubset(set(monthly.columns))
     assert (diagnostics_dir / "decomposition_diagnostics.json").exists()
     assert (diagnostics_dir / "temporal_bucket_consistency.json").exists()
+    with (diagnostics_dir / "temporal_bucket_consistency.json").open() as handle:
+        consistency = json.load(handle)
+    assert consistency["train_prior_bucket_format"] == "YYYY-MM"
+    assert consistency["sampling_bucket_format"] == "YYYY-MM"
+    assert consistency["evaluator_bucket_format"] == "YYYY-MM"
+    assert consistency["is_consistent"] is True
     assert (diagnostics_dir / "v3_row_level_logit_components_sample.csv").exists()
     assert (diagnostics_dir / "temporal_calibration_by_group.csv").exists()
 

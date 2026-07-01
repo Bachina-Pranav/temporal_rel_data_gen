@@ -441,6 +441,11 @@ posterior-effect mode is diagnostic upper bound only.
 
 Train V3:
 
+For temporal review data, V3 defaults to `--temporal-prior-level year_month`,
+which uses chronological `YYYY-MM` buckets. Use `month` only when you want
+month-of-year seasonality (`01` through `12`) instead of chronological monthly
+trends.
+
 ```bash
 python src/scripts/train_temporal_nontext_attr_diffusion_v3.py \
   --real-reviews data/original/rel-amazon-toy/review.csv \
@@ -452,7 +457,7 @@ python src/scripts/train_temporal_nontext_attr_diffusion_v3.py \
   --output-dir outputs/amazon-toy/temporal_nontext_attr_diffusion_v3 \
   --temporal-split \
   --entity-effect-prior logistic_normal \
-  --temporal-prior-level month \
+  --temporal-prior-level year_month \
   --use-temporal-calibration \
   --seed 42
 ```
@@ -481,6 +486,7 @@ python src/scripts/evaluate_temporal_nontext_attrs.py \
   --synthetic-reviews outputs/amazon-toy/synthetic_review_nontext_v3.csv \
   --structure-debug-dir outputs/amazon-toy/ct_2k_sbm_temporal_kde_stubs/debug \
   --cat-cols rating verified \
+  --temporal-bucket-level year_month \
   --output outputs/amazon-toy/nontext_attr_metrics_v3.json
 ```
 

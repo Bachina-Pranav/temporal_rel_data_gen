@@ -19,6 +19,7 @@ if __package__ is None:
 
 from evaluate_temporal_nontext_attrs import evaluate_nontext_attrs, load_reviews  # noqa: E402
 from reldiff.attributes import TemporalNonTextAttributeDiffusionV3  # noqa: E402
+from reldiff.attributes.temporal_buckets import infer_bucket_format  # noqa: E402
 from reldiff.attributes.temporal_priors import check_temporal_bucket_consistency  # noqa: E402
 from reldiff.attributes.temporal_nontext_diffusion import to_jsonable  # noqa: E402
 
@@ -35,6 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timestamp-col", default="review_time")
     parser.add_argument("--cat-cols", nargs="+", default=["rating", "verified"])
     parser.add_argument("--num-cols", nargs="*", default=[])
+    parser.add_argument("--temporal-bucket-level", default="year_month")
     parser.add_argument("--output", required=True)
     return parser.parse_args()
 
@@ -45,6 +47,7 @@ def main() -> None:
     diagnostics_dir.mkdir(parents=True, exist_ok=True)
     real = load_reviews(args.real_reviews, args.timestamp_col)
     synthetic = load_reviews(args.synthetic_reviews, args.timestamp_col)
+    sample_metadata = load_json_optional(args.sample_metadata)
     metrics = evaluate_nontext_attrs(
         real,
         synthetic,
@@ -53,9 +56,17 @@ def main() -> None:
         timestamp_col=args.timestamp_col,
         cat_cols=args.cat_cols,
         num_cols=args.num_cols,
+        temporal_bucket_level=args.temporal_bucket_level,
         diagnostics_dir=diagnostics_dir,
     )
-    checkpoint_report = checkpoint_bucket_report(args.checkpoint, real, synthetic, args.timestamp_col)
+    checkpoint_report = checkpoint_bucket_report(
+        args.checkpoint,
+        real,
+        synthetic,
+        args.timestamp_col,
+        sample_metadata,
+        args.temporal_bucket_level,
+    )
     if checkpoint_report:
         write_json(diagnostics_dir / "temporal_bucket_consistency.json", checkpoint_report)
     prior_summary = enrich_temporal_prior_diagnostics(diagnostics_dir)
@@ -63,7 +74,7 @@ def main() -> None:
         write_json(diagnostics_dir / "temporal_prior_diagnostics.json", prior_summary)
     report = {
         "metrics": metrics,
-        "sample_metadata": load_json_optional(args.sample_metadata),
+        "sample_metadata": sample_metadata,
         "temporal_bucket_consistency": load_json_optional(diagnostics_dir / "temporal_bucket_consistency.json"),
         "decomposition": load_json_optional(diagnostics_dir / "decomposition_diagnostics.json"),
         "temporal_prior_diagnostics": prior_summary or load_json_optional(diagnostics_dir / "temporal_prior_diagnostics.json"),
@@ -83,6 +94,8 @@ def checkpoint_bucket_report(
     real: pd.DataFrame,
     synthetic: pd.DataFrame,
     timestamp_col: str,
+    sample_metadata: Optional[Dict[str, Any]] = None,
+    evaluator_level: str = "year_month",
 ) -> Optional[Dict[str, Any]]:
     try:
         generator = TemporalNonTextAttributeDiffusionV3.load_checkpoint(checkpoint, device="cpu")
@@ -91,10 +104,17 @@ def checkpoint_bucket_report(
             "diagnostic_status": "checkpoint_load_failed",
             "diagnostic_reason": str(exc),
         }
+    sample_metadata = sample_metadata or {}
+    sampling_level = sample_metadata.get(
+        "temporal_prior_level_used_for_sampling",
+        generator.temporal_prior.temporal_prior_level,
+    )
     return check_temporal_bucket_consistency(
         generator.temporal_prior,
         synthetic[timestamp_col],
         real[timestamp_col],
+        sampling_level=sampling_level,
+        evaluator_level=evaluator_level,
     )
 
 
@@ -114,11 +134,21 @@ def enrich_temporal_prior_diagnostics(diagnostics_dir: Path) -> Dict[str, Any]:
         return summary
     curve["_month_key"] = curve["month"].map(normalize_month_key)
     monthly["_month_key"] = monthly["month"].map(normalize_month_key)
-    curve_format = month_key_format(curve["_month_key"])
-    monthly_format = month_key_format(monthly["_month_key"])
+    curve_format = infer_bucket_format(curve["_month_key"].dropna().astype(str))
+    monthly_format = infer_bucket_format(monthly["_month_key"].dropna().astype(str))
     merged = pd.DataFrame()
     if curve_format == monthly_format:
         merged = curve.merge(monthly, on="_month_key", how="inner", suffixes=("_prior", "_monthly"))
+    diagnostic_status = "ok" if curve_format == monthly_format and len(merged) > 0 else "bucket_mismatch"
+    diagnostic_reason = None
+    if curve_format != monthly_format:
+        diagnostic_reason = (
+            "Temporal prior curve and evaluator monthly table use different month bucket formats. "
+            "Retrain V3 with --temporal-prior-level year_month."
+        )
+    elif len(merged) == 0:
+        diagnostic_status = "no_overlap"
+        diagnostic_reason = "Temporal prior curve and evaluator monthly table have no overlapping buckets."
     summary.update(
         {
             "prior_monthly_avg_rating_std": std_or_none(curve.get("prior_avg_rating")),
@@ -136,11 +166,8 @@ def enrich_temporal_prior_diagnostics(diagnostics_dir: Path) -> Dict[str, Any]:
             "prior_month_examples": sorted(set(curve["_month_key"].dropna().astype(str)))[:5],
             "monthly_table_month_examples": sorted(set(monthly["_month_key"].dropna().astype(str)))[:5],
             "num_months_merged_for_prior_diagnostics": int(len(merged)),
-            "diagnostic_status": "loaded" if curve_format == monthly_format else "bucket_mismatch",
-            "diagnostic_reason": None if curve_format == monthly_format else (
-                "Temporal prior curve and evaluator monthly table use different month bucket formats. "
-                "This usually means the checkpoint was trained before YYYY-MM month buckets were introduced."
-            ),
+            "diagnostic_status": diagnostic_status,
+            "diagnostic_reason": diagnostic_reason,
         }
     )
     return summary
@@ -277,6 +304,10 @@ def normalize_month_key(value: Any) -> Optional[str]:
     text = str(value).strip()
     if not text:
         return None
+    if len(text) == 7 and text[4] == "-":
+        return text
+    if len(text) == 2 and text.isdigit() and 1 <= int(text) <= 12:
+        return text
     try:
         numeric = float(text)
     except ValueError:
@@ -287,36 +318,6 @@ def normalize_month_key(value: Any) -> Optional[str]:
     if pd.notna(parsed):
         return pd.Timestamp(parsed).strftime("%Y-%m")
     return text
-
-
-def month_key_format(values: pd.Series) -> str:
-    keys = set(values.dropna().astype(str))
-    if not keys:
-        return "empty"
-    if all(is_year_month_key(key) for key in keys):
-        return "YYYY-MM"
-    if all(is_legacy_month_key(key) for key in keys):
-        return "legacy-month-number"
-    return "mixed"
-
-
-def is_year_month_key(key: str) -> bool:
-    if len(key) != 7 or key[4] != "-":
-        return False
-    try:
-        month = int(key[5:])
-        int(key[:4])
-    except ValueError:
-        return False
-    return 1 <= month <= 12
-
-
-def is_legacy_month_key(key: str) -> bool:
-    try:
-        month = int(key)
-    except ValueError:
-        return False
-    return str(month) == key and 1 <= month <= 12
 
 
 if __name__ == "__main__":

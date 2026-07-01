@@ -22,9 +22,11 @@ def test_temporal_prior_smoothing_has_no_zeroes_and_differs_by_month():
             "verified": [True] * 20 + [False] * 20,
         }
     )
-    prior = TemporalAttributePrior([1, 5], temporal_prior_level="month").fit(reviews)
+    prior = TemporalAttributePrior([1, 5], temporal_prior_level="year_month").fit(reviews)
     jan = np.asarray(prior.per_bucket_rating_distribution["2020-01"])
     feb = np.asarray(prior.per_bucket_rating_distribution["2020-02"])
+    assert prior.bucket_format == "YYYY-MM"
+    assert prior.num_buckets == 2
     assert np.isclose(jan.sum(), 1.0)
     assert np.isclose(feb.sum(), 1.0)
     assert (jan > 0).all()
