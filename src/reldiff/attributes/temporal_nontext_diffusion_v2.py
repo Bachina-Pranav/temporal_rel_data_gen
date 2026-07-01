@@ -1,12 +1,11 @@
-"""Temporal non-text attribute diffusion conditioned on review event spines."""
+"""Temporal non-text attribute diffusion with generative entity latent effects."""
 
 from __future__ import annotations
 
 import json
 import random
-import warnings
 from collections import Counter
-from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -14,34 +13,43 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
-from tqdm import tqdm
 
-from .nontext_diffusion_model import TemporalFeatureDiffusionModel
+from .entity_effect_priors import load_customer_product_priors
+from .entity_latent_effects import (
+    compute_entity_structural_features,
+    estimate_entity_latent_effects,
+    save_entity_effect_estimate,
+)
+from .nontext_diffusion_model_v2 import TemporalFeatureDiffusionModelV2
 from .nontext_diffusion_schedules import gaussian_sigma, mask_probability
 from .temporal_attribute_sampler import chronological_groups
 from .temporal_causal_features import (
     CAUSAL_CONTINUOUS_FEATURES,
-    CAUSAL_DISCRETE_FEATURES,
     TemporalCausalFeatureBuilder,
     load_block_maps,
-    normalize_verified,
     save_json,
+)
+from .temporal_nontext_diffusion import (
+    TemporalNonTextAttributeDiffusion,
+    TemporalNonTextTrainingResult,
+    canonical_category_key,
+    to_jsonable,
 )
 
 
-GENERATOR_NAME = "temporal_nontext_attr_diffusion"
+GENERATOR_NAME_V2 = "temporal_nontext_attr_diffusion_v2"
+GENERATOR_ALIAS_V2 = "temporal_nontext_attr_diffusion_entity_latents"
+
+ENTITY_LATENT_FEATURES = [
+    "customer_rating_effect",
+    "customer_verified_effect",
+    "product_rating_effect",
+    "product_verified_effect",
+]
 
 
-@dataclass
-class TemporalNonTextTrainingResult:
-    output_dir: Path
-    best_checkpoint: Path
-    latest_checkpoint: Path
-    history: List[Dict[str, float]]
-
-
-class TemporalNonTextAttributeDiffusion:
-    """Generate rating/verified/numerical attributes for a fixed temporal spine."""
+class TemporalNonTextAttributeDiffusionV2(TemporalNonTextAttributeDiffusion):
+    """V2 attribute generator conditioned on sampled entity latent effects."""
 
     def __init__(
         self,
@@ -52,32 +60,22 @@ class TemporalNonTextAttributeDiffusion:
         num_cols: Optional[List[str]] = None,
         seed: int = 42,
     ):
-        self.customer_id_col = customer_id_col
-        self.product_id_col = product_id_col
-        self.timestamp_col = timestamp_col
-        self.cat_cols = list(cat_cols or ["rating", "verified"])
-        self.num_cols = list(num_cols or [])
-        self.seed = int(seed)
-
-        self.category_values: Dict[str, List[Any]] = {}
-        self.category_lookup: Dict[str, Dict[Any, int]] = {}
-        self.feature_builder: Optional[TemporalCausalFeatureBuilder] = None
-        self.feature_mean: Optional[np.ndarray] = None
-        self.feature_std: Optional[np.ndarray] = None
-        self.discrete_feature_maps: Dict[str, Dict[Any, int]] = {}
-        self.numerical_metadata: Dict[str, Dict[str, Any]] = {}
-        self.model: Optional[TemporalFeatureDiffusionModel] = None
-        self.model_config: Dict[str, Any] = {}
-        self.config: Dict[str, Any] = {}
+        super().__init__(
+            customer_id_col=customer_id_col,
+            product_id_col=product_id_col,
+            timestamp_col=timestamp_col,
+            cat_cols=cat_cols,
+            num_cols=num_cols,
+            seed=seed,
+        )
+        self.effect_noise_std = 0.05
+        self.effect_dropout = 0.1
 
     def continuous_feature_names(self) -> List[str]:
-        return list(CAUSAL_CONTINUOUS_FEATURES)
+        return list(CAUSAL_CONTINUOUS_FEATURES) + list(ENTITY_LATENT_FEATURES)
 
-    def discrete_feature_names(self) -> List[str]:
-        return list(CAUSAL_DISCRETE_FEATURES)
-
-    def make_model(self) -> TemporalFeatureDiffusionModel:
-        return TemporalFeatureDiffusionModel(**self.model_config)
+    def make_model(self) -> TemporalFeatureDiffusionModelV2:
+        return TemporalFeatureDiffusionModelV2(**self.model_config)
 
     @classmethod
     def train_from_csv(
@@ -85,6 +83,7 @@ class TemporalNonTextAttributeDiffusion:
         reviews_path: str | Path,
         output_dir: str | Path,
         structure_debug_dir: str | Path | None = None,
+        entity_prior_dir: str | Path | None = None,
         **kwargs: Any,
     ) -> TemporalNonTextTrainingResult:
         reviews = pd.read_csv(reviews_path)
@@ -100,6 +99,7 @@ class TemporalNonTextAttributeDiffusion:
             reviews,
             output_dir=output_dir,
             structure_debug_dir=structure_debug_dir,
+            entity_prior_dir=entity_prior_dir,
             epochs=kwargs.get("epochs", 5),
             batch_size=kwargs.get("batch_size", 256),
             learning_rate=kwargs.get("learning_rate", 1e-3),
@@ -111,13 +111,15 @@ class TemporalNonTextAttributeDiffusion:
             lambda_cat=kwargs.get("lambda_cat", 1.0),
             lambda_num=kwargs.get("lambda_num", 1.0),
             mask_schedule=kwargs.get("mask_schedule", "cosine"),
+            effect_noise_std=kwargs.get("effect_noise_std", 0.05),
+            effect_dropout=kwargs.get("effect_dropout", 0.1),
             device=kwargs.get("device", "cpu"),
         )
 
     @classmethod
     def load_checkpoint(
         cls, checkpoint_path: str | Path, device: str = "cpu"
-    ) -> "TemporalNonTextAttributeDiffusion":
+    ) -> "TemporalNonTextAttributeDiffusionV2":
         checkpoint = torch.load(checkpoint_path, map_location=device)
         config = checkpoint["config"]
         generator = cls(
@@ -139,6 +141,8 @@ class TemporalNonTextAttributeDiffusion:
         generator.discrete_feature_maps = checkpoint["discrete_feature_maps"]
         generator.numerical_metadata = checkpoint["numerical_metadata"]
         generator.model_config = checkpoint["model_config"]
+        generator.effect_noise_std = float(config.get("effect_noise_std", 0.05))
+        generator.effect_dropout = float(config.get("effect_dropout", 0.1))
         generator.model = generator.make_model().to(device)
         generator.model.load_state_dict(checkpoint["model_state_dict"])
         generator.model.eval()
@@ -152,26 +156,40 @@ class TemporalNonTextAttributeDiffusion:
         checkpoint_path: str | Path,
         output_path: str | Path,
         structure_debug_dir: str | Path | None = None,
+        entity_prior_dir: str | Path | None = None,
         **kwargs: Any,
     ) -> pd.DataFrame:
         generator = cls.load_checkpoint(
             checkpoint_path, device=kwargs.get("device", "cpu")
         )
         spine = pd.read_csv(synthetic_spine_path)
+        output_path = Path(output_path)
+        sampled_dir = kwargs.get("sampled_effects_output_dir", output_path.parent)
         output = generator.sample(
             spine,
             structure_debug_dir=structure_debug_dir,
+            entity_prior_dir=entity_prior_dir,
+            sampled_effects_output_dir=sampled_dir,
             seed=kwargs.get("seed", generator.seed),
             num_steps=kwargs.get("num_steps", 50),
             cat_sampling_strategy=kwargs.get("cat_sampling_strategy", "sample"),
             temperature=kwargs.get("temperature", 1.0),
             sampling_time_group=kwargs.get("sampling_time_group", "date"),
             sampling_window_days=kwargs.get("sampling_window_days", 1.0),
+            debug_use_posterior_effects=kwargs.get("debug_use_posterior_effects", False),
             device=kwargs.get("device", "cpu"),
         )
-        output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output.to_csv(output_path, index=False)
+        metadata = generator.synthetic_metadata(
+            output_path=output_path,
+            checkpoint_path=checkpoint_path,
+            entity_prior_dir=entity_prior_dir,
+            seed=kwargs.get("seed", generator.seed),
+        )
+        with output_path.with_name(output_path.stem + "_metadata.json").open("w") as handle:
+            json.dump(to_jsonable(metadata), handle, indent=2)
+            handle.write("\n")
         return output
 
     def train(
@@ -179,6 +197,7 @@ class TemporalNonTextAttributeDiffusion:
         reviews: pd.DataFrame,
         output_dir: str | Path,
         structure_debug_dir: str | Path | None = None,
+        entity_prior_dir: str | Path | None = None,
         epochs: int = 5,
         batch_size: int = 256,
         learning_rate: float = 1e-3,
@@ -190,20 +209,51 @@ class TemporalNonTextAttributeDiffusion:
         lambda_cat: float = 1.0,
         lambda_num: float = 1.0,
         mask_schedule: str = "cosine",
+        effect_noise_std: float = 0.05,
+        effect_dropout: float = 0.1,
         device: str = "cpu",
     ) -> TemporalNonTextTrainingResult:
         self._set_seeds(self.seed)
+        self.effect_noise_std = float(effect_noise_std)
+        self.effect_dropout = float(effect_dropout)
         output_dir = Path(output_dir)
         checkpoint_dir = output_dir / "checkpoints"
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
         reviews = self._preprocess_training_reviews(reviews)
+        self.config["generator"] = GENERATOR_NAME_V2
+        self.config["generator_alias"] = GENERATOR_ALIAS_V2
+        self.config["uses_entity_latents"] = True
+        self.config["entity_prior_dir"] = str(entity_prior_dir) if entity_prior_dir else None
+        self.config["effect_noise_std"] = self.effect_noise_std
+        self.config["effect_dropout"] = self.effect_dropout
+        self.config["uses_real_entity_effect_lookup"] = False
+        self.config["samples_entity_effects_from_prior"] = True
+
         self._fit_categories(reviews)
         self.num_cols = [col for col in self.num_cols if col in reviews.columns]
-        missing_num = [col for col in self.config.get("requested_num_cols", []) if col not in reviews.columns]
+        missing_num = [
+            col for col in self.config.get("requested_num_cols", []) if col not in reviews.columns
+        ]
         for col in missing_num:
+            import warnings
+
             warnings.warn(f"Numerical column {col!r} is absent; skipping.")
         self.config["num_cols"] = list(self.num_cols)
+
+        rating_col = self.cat_cols[0] if self.cat_cols else "rating"
+        verified_col = "verified" if "verified" in self.cat_cols else self.cat_cols[-1]
+        estimate = estimate_entity_latent_effects(
+            reviews,
+            structure_debug_dir=structure_debug_dir,
+            customer_id_col=self.customer_id_col,
+            product_id_col=self.product_id_col,
+            timestamp_col=self.timestamp_col,
+            rating_col=rating_col,
+            verified_col=verified_col,
+        )
+        save_entity_effect_estimate(estimate, output_dir)
+        self.config["global_effect_stats"] = estimate.global_stats
 
         customer_blocks, product_blocks = load_block_maps(
             structure_debug_dir, self.customer_id_col, self.product_id_col
@@ -212,12 +262,20 @@ class TemporalNonTextAttributeDiffusion:
             customer_id_col=self.customer_id_col,
             product_id_col=self.product_id_col,
             timestamp_col=self.timestamp_col,
-            rating_col=self.cat_cols[0] if self.cat_cols else "rating",
-            verified_col="verified" if "verified" in self.cat_cols else self.cat_cols[-1],
+            rating_col=rating_col,
+            verified_col=verified_col,
             customer_blocks=customer_blocks,
             product_blocks=product_blocks,
         )
         features = self.feature_builder.transform_training(reviews)
+        latent_features = training_entity_latent_rows(
+            reviews,
+            estimate.customer_effects,
+            estimate.product_effects,
+            self.customer_id_col,
+            self.product_id_col,
+        )
+        features = pd.concat([features, latent_features], axis=1)
         self._fit_feature_metadata(features)
         encoded = self._encode_dataset(reviews, features)
         train_idx, val_idx = self._split_indices(
@@ -286,25 +344,46 @@ class TemporalNonTextAttributeDiffusion:
             )
 
         self._write_metadata(output_dir)
+        save_json(
+            output_dir / "entity_latent_metadata.json",
+            {
+                "method": GENERATOR_NAME_V2,
+                "uses_entity_latents": True,
+                "effect_feature_names": ENTITY_LATENT_FEATURES,
+                "uses_real_entity_effect_lookup": False,
+                "samples_entity_effects_from_prior": True,
+                "debug_use_posterior_effects_default": False,
+            },
+        )
         return TemporalNonTextTrainingResult(output_dir, best_path, latest_path, history)
 
     def sample(
         self,
         synthetic_spine: pd.DataFrame,
         structure_debug_dir: str | Path | None = None,
+        entity_prior_dir: str | Path | None = None,
+        sampled_effects_output_dir: str | Path | None = None,
         seed: Optional[int] = None,
         num_steps: int = 50,
         cat_sampling_strategy: str = "sample",
         temperature: float = 1.0,
         sampling_time_group: str = "date",
         sampling_window_days: float = 1.0,
+        debug_use_posterior_effects: bool = False,
         device: str = "cpu",
     ) -> pd.DataFrame:
         if self.model is None:
             raise RuntimeError("Model is not loaded.")
         if cat_sampling_strategy not in {"sample", "argmax"}:
             raise ValueError("cat_sampling_strategy must be sample or argmax.")
-        self._set_seeds(self.seed if seed is None else int(seed))
+        if entity_prior_dir is None:
+            entity_prior_dir = self.config.get("entity_prior_dir")
+        if entity_prior_dir is None:
+            raise ValueError("V2 sampling requires --entity-prior-dir.")
+
+        seed = self.seed if seed is None else int(seed)
+        self._set_seeds(seed)
+        rng = np.random.default_rng(seed)
         self.model.to(device)
         self.model.eval()
 
@@ -313,6 +392,24 @@ class TemporalNonTextAttributeDiffusion:
         customer_blocks, product_blocks = load_block_maps(
             structure_debug_dir, self.customer_id_col, self.product_id_col
         )
+        sampled_customer_effects, sampled_product_effects = self._sample_or_load_entity_effects(
+            spine,
+            entity_prior_dir=entity_prior_dir,
+            customer_blocks=customer_blocks,
+            product_blocks=product_blocks,
+            rng=rng,
+            debug_use_posterior_effects=debug_use_posterior_effects,
+        )
+        if sampled_effects_output_dir is not None:
+            sample_dir = Path(sampled_effects_output_dir)
+            sample_dir.mkdir(parents=True, exist_ok=True)
+            sampled_customer_effects.to_csv(
+                sample_dir / "sampled_customer_effects.csv", index=False
+            )
+            sampled_product_effects.to_csv(
+                sample_dir / "sampled_product_effects.csv", index=False
+            )
+
         metadata = self._checkpoint.get("feature_builder_metadata", {})
         builder = TemporalCausalFeatureBuilder(
             customer_id_col=self.customer_id_col,
@@ -335,9 +432,20 @@ class TemporalNonTextAttributeDiffusion:
         generated_groups = []
         with torch.no_grad():
             for _, group in chronological_groups(
-                spine, self.timestamp_col, mode=sampling_time_group, window_days=sampling_window_days
+                spine,
+                self.timestamp_col,
+                mode=sampling_time_group,
+                window_days=sampling_window_days,
             ):
                 features = builder.transform_current_group(group)
+                latent_features = sampling_entity_latent_rows(
+                    group,
+                    sampled_customer_effects,
+                    sampled_product_effects,
+                    self.customer_id_col,
+                    self.product_id_col,
+                )
+                features = pd.concat([features, latent_features], axis=1)
                 encoded_features = self._encode_features_for_sampling(features)
                 batch_size = len(group)
                 cat_tokens = {
@@ -397,109 +505,51 @@ class TemporalNonTextAttributeDiffusion:
 
         output = pd.concat(generated_groups).sort_index()
         columns = [self.customer_id_col, self.product_id_col, self.timestamp_col] + self.cat_cols + self.num_cols
+        self._last_sampling_metadata = {
+            "uses_real_entity_effect_lookup": bool(debug_use_posterior_effects),
+            "diagnostic_upper_bound_only": bool(debug_use_posterior_effects),
+            "entity_latent_source": "posterior_effects_debug"
+            if debug_use_posterior_effects
+            else "sampled_prior",
+            "samples_entity_effects_from_prior": not bool(debug_use_posterior_effects),
+        }
         return output[columns].reset_index(drop=True)
 
-    def _preprocess_training_reviews(self, reviews: pd.DataFrame) -> pd.DataFrame:
-        reviews = reviews.copy()
-        required = [self.customer_id_col, self.product_id_col, self.timestamp_col] + self.cat_cols
-        missing = [col for col in required if col not in reviews.columns]
-        if missing:
-            raise ValueError(f"Training reviews are missing required columns: {missing}")
-        reviews[self.timestamp_col] = pd.to_datetime(reviews[self.timestamp_col], errors="coerce")
-        reviews = reviews.dropna(subset=required).sort_values(
-            self.timestamp_col, kind="mergesort"
-        ).reset_index(drop=True)
-        self.config = {
-            "generator": GENERATOR_NAME,
-            "customer_id_col": self.customer_id_col,
-            "product_id_col": self.product_id_col,
-            "timestamp_col": self.timestamp_col,
-            "cat_cols": self.cat_cols,
-            "num_cols": self.num_cols,
-            "requested_num_cols": list(self.num_cols),
-            "seed": self.seed,
-        }
-        return reviews
-
-    def _fit_categories(self, reviews: pd.DataFrame) -> None:
-        self.category_values = {}
-        self.category_lookup = {}
-        for col in self.cat_cols:
-            values = sorted(reviews[col].dropna().unique().tolist(), key=category_sort_key)
-            self.category_values[col] = values
-            self.category_lookup[col] = {
-                canonical_category_key(value): idx for idx, value in enumerate(values)
-            }
-
-    def _fit_feature_metadata(self, features: pd.DataFrame) -> None:
-        continuous = features[self.continuous_feature_names()].to_numpy(dtype=np.float32)
-        self.feature_mean = continuous.mean(axis=0)
-        self.feature_std = continuous.std(axis=0)
-        self.feature_std[self.feature_std < 1e-6] = 1.0
-        self.discrete_feature_maps = {}
-        for col in self.discrete_feature_names():
-            values = sorted(features[col].dropna().unique().tolist())
-            self.discrete_feature_maps[col] = {value: i + 1 for i, value in enumerate(values)}
-
-    def _encode_dataset(self, reviews: pd.DataFrame, features: pd.DataFrame) -> Dict[str, Any]:
-        cat_targets = {
-            col: np.asarray(
-                [self.category_lookup[col][canonical_category_key(value)] for value in reviews[col]],
-                dtype=np.int64,
+    def _sample_or_load_entity_effects(
+        self,
+        spine: pd.DataFrame,
+        entity_prior_dir: str | Path,
+        customer_blocks: Dict[Any, int],
+        product_blocks: Dict[Any, int],
+        rng: np.random.Generator,
+        debug_use_posterior_effects: bool,
+    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        if debug_use_posterior_effects:
+            return load_posterior_effects_for_debug(
+                entity_prior_dir,
+                self.customer_id_col,
+                self.product_id_col,
             )
-            for col in self.cat_cols
-        }
-        numerical = self._fit_transform_numerical(reviews)
-        encoded_features = self._encode_features_for_sampling(features)
-        return {
-            "cat_targets": cat_targets,
-            "numerical": numerical,
-            **encoded_features,
-        }
-
-    def _fit_transform_numerical(self, reviews: pd.DataFrame) -> np.ndarray:
-        if not self.num_cols:
-            return np.zeros((len(reviews), 0), dtype=np.float32)
-        arrays = []
-        self.numerical_metadata = {}
-        for col in self.num_cols:
-            values = pd.to_numeric(reviews[col], errors="coerce").fillna(0.0).to_numpy(dtype=float)
-            use_log1p = bool(np.nanmin(values) >= 0 and any(token in col.lower() for token in ("vote", "count", "helpful")))
-            transformed = np.log1p(values) if use_log1p else values
-            mean = float(np.mean(transformed))
-            std = float(np.std(transformed))
-            if std < 1e-6:
-                std = 1.0
-            self.numerical_metadata[col] = {
-                "mean": mean,
-                "std": std,
-                "log1p": use_log1p,
-            }
-            arrays.append(((transformed - mean) / std).astype(np.float32))
-        return np.stack(arrays, axis=1).astype(np.float32)
-
-    def _encode_features_for_sampling(self, features: pd.DataFrame) -> Dict[str, Any]:
-        continuous = features[self.continuous_feature_names()].to_numpy(dtype=np.float32)
-        continuous = (continuous - self.feature_mean) / self.feature_std
-        discrete = {
-            col: np.asarray(
-                [self.discrete_feature_maps[col].get(value, 0) for value in features[col]],
-                dtype=np.int64,
-            )
-            for col in self.discrete_feature_names()
-        }
-        return {"continuous": continuous.astype(np.float32), "discrete": discrete}
-
-    def _split_indices(
-        self, reviews: pd.DataFrame, validation_fraction: float, random_split: bool
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        indices = np.arange(len(reviews), dtype=int)
-        if random_split:
-            rng = np.random.default_rng(self.seed)
-            rng.shuffle(indices)
-        val_size = int(round(len(indices) * float(validation_fraction)))
-        val_size = max(1, val_size) if len(indices) > 4 else 0
-        return indices[:-val_size] if val_size else indices, indices[-val_size:] if val_size else np.asarray([], dtype=int)
+        customer_prior, product_prior = load_customer_product_priors(entity_prior_dir)
+        customer_struct = compute_entity_structural_features(
+            spine,
+            entity_col=self.customer_id_col,
+            timestamp_col=self.timestamp_col,
+            block_map=customer_blocks,
+            block_col="customer_block",
+            id_output_col=self.customer_id_col,
+        )
+        product_struct = compute_entity_structural_features(
+            spine,
+            entity_col=self.product_id_col,
+            timestamp_col=self.timestamp_col,
+            block_map=product_blocks,
+            block_col="product_block",
+            id_output_col=self.product_id_col,
+        )
+        customer_sample = customer_prior.sample(customer_struct, rng=rng).effects
+        product_sample = product_prior.sample(product_struct, rng=rng).effects
+        return customer_sample, product_sample
 
     def _run_epoch(
         self,
@@ -525,6 +575,8 @@ class TemporalNonTextAttributeDiffusion:
             if len(batch_idx) == 0:
                 continue
             tensors = self._batch_tensors(encoded, batch_idx, device)
+            if train:
+                tensors["continuous"] = self._corrupt_effect_features(tensors["continuous"])
             t = torch.rand(len(batch_idx), device=device)
             p_mask = mask_probability(t, mask_schedule)
             cat_tokens = {}
@@ -573,108 +625,164 @@ class TemporalNonTextAttributeDiffusion:
             count += len(batch_idx)
         return {key: float(value / max(count, 1)) for key, value in totals.items()}
 
-    def _batch_tensors(
-        self, encoded: Dict[str, Any], indices: np.ndarray, device: str
+    def _corrupt_effect_features(self, continuous: torch.Tensor) -> torch.Tensor:
+        if not ENTITY_LATENT_FEATURES:
+            return continuous
+        effect_start = len(CAUSAL_CONTINUOUS_FEATURES)
+        output = continuous.clone()
+        effects = output[:, effect_start : effect_start + len(ENTITY_LATENT_FEATURES)]
+        if self.effect_noise_std > 0:
+            effects = effects + torch.randn_like(effects) * float(self.effect_noise_std)
+        if self.effect_dropout > 0:
+            keep = (
+                torch.rand((effects.shape[0], 1), device=effects.device)
+                >= float(self.effect_dropout)
+            ).float()
+            effects = effects * keep
+        output[:, effect_start : effect_start + len(ENTITY_LATENT_FEATURES)] = effects
+        return output
+
+    def synthetic_metadata(
+        self,
+        output_path: str | Path,
+        checkpoint_path: str | Path,
+        entity_prior_dir: str | Path | None,
+        seed: int,
     ) -> Dict[str, Any]:
+        sampling = getattr(self, "_last_sampling_metadata", {})
         return {
-            "continuous": torch.tensor(
-                encoded["continuous"][indices], dtype=torch.float32, device=device
-            ),
-            "discrete": {
-                col: torch.tensor(values[indices], dtype=torch.long, device=device)
-                for col, values in encoded["discrete"].items()
-            },
-            "cat_targets": {
-                col: torch.tensor(values[indices], dtype=torch.long, device=device)
-                for col, values in encoded["cat_targets"].items()
-            },
-            "numerical": torch.tensor(
-                encoded["numerical"][indices], dtype=torch.float32, device=device
-            ),
+            "method": GENERATOR_NAME_V2,
+            "uses_entity_latents": True,
+            "entity_latent_source": sampling.get("entity_latent_source", "sampled_prior"),
+            "uses_real_entity_effect_lookup": sampling.get("uses_real_entity_effect_lookup", False),
+            "samples_entity_effects_from_prior": sampling.get("samples_entity_effects_from_prior", True),
+            "diagnostic_upper_bound_only": sampling.get("diagnostic_upper_bound_only", False),
+            "structure_source": "ct_2k_sbm_temporal_kde_stubs",
+            "checkpoint": str(checkpoint_path),
+            "entity_prior_dir": str(entity_prior_dir) if entity_prior_dir else None,
+            "output": str(output_path),
+            "seed": int(seed),
+            "timestamp": datetime.utcnow().isoformat() + "Z",
         }
 
-    def _decode_numerical(self, values: np.ndarray) -> np.ndarray:
-        decoded = []
-        for i, col in enumerate(self.num_cols):
-            metadata = self.numerical_metadata[col]
-            transformed = values[:, i] * metadata["std"] + metadata["mean"]
-            if metadata.get("log1p"):
-                transformed = np.expm1(transformed)
-            decoded.append(transformed)
-        return np.stack(decoded, axis=1) if decoded else np.zeros((len(values), 0))
 
-    def _save_checkpoint(self, path: Path, history: List[Dict[str, float]]) -> None:
-        checkpoint = {
-            "config": self.config,
-            "category_values": self.category_values,
-            "feature_mean": self.feature_mean,
-            "feature_std": self.feature_std,
-            "discrete_feature_maps": self.discrete_feature_maps,
-            "numerical_metadata": self.numerical_metadata,
-            "model_config": self.model_config,
-            "model_state_dict": self.model.state_dict(),
-            "feature_builder_metadata": self.feature_builder.to_metadata()
-            if self.feature_builder is not None
-            else {},
-            "history": history,
+def training_entity_latent_rows(
+    reviews: pd.DataFrame,
+    customer_effects: pd.DataFrame,
+    product_effects: pd.DataFrame,
+    customer_id_col: str,
+    product_id_col: str,
+) -> pd.DataFrame:
+    customer = customer_effects[
+        [customer_id_col, "rating_effect", "verified_effect"]
+    ].rename(
+        columns={
+            "rating_effect": "customer_rating_effect",
+            "verified_effect": "customer_verified_effect",
         }
-        torch.save(checkpoint, path)
-
-    def _write_metadata(self, output_dir: Path) -> None:
-        save_json(output_dir / "config.json", to_jsonable(self.config))
-        save_json(
-            output_dir / "category_mappings.json",
-            to_jsonable({"category_values": self.category_values}),
-        )
-        save_json(
-            output_dir / "numerical_transform_metadata.json",
-            to_jsonable(self.numerical_metadata),
-        )
-        save_json(
-            output_dir / "feature_normalization.json",
-            to_jsonable(
-                {
-                    "continuous_feature_names": self.continuous_feature_names(),
-                    "discrete_feature_names": self.discrete_feature_names(),
-                    "mean": self.feature_mean.tolist(),
-                    "std": self.feature_std.tolist(),
-                    "discrete_feature_maps": self.discrete_feature_maps,
-                }
-            ),
-        )
-
-    def _set_seeds(self, seed: int) -> None:
-        random.seed(int(seed))
-        np.random.seed(int(seed))
-        torch.manual_seed(int(seed))
+    )
+    product = product_effects[
+        [product_id_col, "rating_effect", "verified_effect"]
+    ].rename(
+        columns={
+            "rating_effect": "product_rating_effect",
+            "verified_effect": "product_verified_effect",
+        }
+    )
+    merged = (
+        reviews[[customer_id_col, product_id_col]]
+        .merge(customer, on=customer_id_col, how="left")
+        .merge(product, on=product_id_col, how="left")
+    )
+    return merged[ENTITY_LATENT_FEATURES].fillna(0.0).reset_index(drop=True)
 
 
-def category_sort_key(value: Any) -> Tuple[str, str]:
-    try:
-        return ("0", f"{float(value):020.8f}")
-    except Exception:
-        return ("1", str(value))
+def sampling_entity_latent_rows(
+    group: pd.DataFrame,
+    sampled_customer_effects: pd.DataFrame,
+    sampled_product_effects: pd.DataFrame,
+    customer_id_col: str,
+    product_id_col: str,
+) -> pd.DataFrame:
+    customer = sampled_customer_effects[
+        [customer_id_col, "sampled_rating_effect", "sampled_verified_effect"]
+    ].rename(
+        columns={
+            "sampled_rating_effect": "customer_rating_effect",
+            "sampled_verified_effect": "customer_verified_effect",
+        }
+    )
+    product = sampled_product_effects[
+        [product_id_col, "sampled_rating_effect", "sampled_verified_effect"]
+    ].rename(
+        columns={
+            "sampled_rating_effect": "product_rating_effect",
+            "sampled_verified_effect": "product_verified_effect",
+        }
+    )
+    merged = (
+        group[[customer_id_col, product_id_col]]
+        .merge(customer, on=customer_id_col, how="left")
+        .merge(product, on=product_id_col, how="left")
+    )
+    return merged[ENTITY_LATENT_FEATURES].fillna(0.0).set_index(group.index)
 
 
-def canonical_category_key(value: Any) -> str:
-    if isinstance(value, (np.integer, int)):
-        return str(int(value))
-    if isinstance(value, (np.floating, float)) and float(value).is_integer():
-        return str(int(value))
-    return str(value)
-
-
-def to_jsonable(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {str(key): to_jsonable(subvalue) for key, subvalue in value.items()}
-    if isinstance(value, list):
-        return [to_jsonable(item) for item in value]
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-    if isinstance(value, (np.integer,)):
-        return int(value)
-    if isinstance(value, (np.floating,)):
-        return float(value)
-    if isinstance(value, (pd.Timestamp,)):
-        return str(value)
-    return value
+def load_posterior_effects_for_debug(
+    entity_prior_dir: str | Path,
+    customer_id_col: str,
+    product_id_col: str,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    root = Path(entity_prior_dir)
+    nested = root / "entity_effects"
+    if nested.exists():
+        root = nested
+    customer = pd.read_csv(root / "customer_effects.csv")
+    product = pd.read_csv(root / "product_effects.csv")
+    customer = customer.rename(
+        columns={
+            "customer_block": "block",
+            "rating_effect": "sampled_rating_effect",
+            "verified_effect": "sampled_verified_effect",
+        }
+    )
+    product = product.rename(
+        columns={
+            "product_block": "block",
+            "rating_effect": "sampled_rating_effect",
+            "verified_effect": "sampled_verified_effect",
+        }
+    )
+    for frame, id_col in ((customer, customer_id_col), (product, product_id_col)):
+        if "degree_bin" not in frame.columns:
+            frame["degree_bin"] = "posterior"
+        frame["prior_cell_used"] = "posterior_effect_upper_bound"
+        for col in ["degree", "block", "sampled_rating_effect", "sampled_verified_effect"]:
+            if col not in frame.columns:
+                frame[col] = 0
+        if id_col not in frame.columns:
+            raise ValueError(f"Posterior effect debug file missing {id_col!r}.")
+    return (
+        customer[
+            [
+                customer_id_col,
+                "block",
+                "degree",
+                "degree_bin",
+                "sampled_rating_effect",
+                "sampled_verified_effect",
+                "prior_cell_used",
+            ]
+        ],
+        product[
+            [
+                product_id_col,
+                "block",
+                "degree",
+                "degree_bin",
+                "sampled_rating_effect",
+                "sampled_verified_effect",
+                "prior_cell_used",
+            ]
+        ],
+    )

@@ -85,7 +85,15 @@ def evaluate_nontext_attrs(
     customer_blocks: Optional[Dict[Any, int]] = None,
     product_blocks: Optional[Dict[Any, int]] = None,
 ) -> Dict[str, Any]:
-    metrics: Dict[str, Any] = {"categorical": {}, "temporal": {}, "relational": {}, "block": {}, "numerical": {}, "c2st": {}}
+    metrics: Dict[str, Any] = {
+        "categorical": {},
+        "temporal": {},
+        "relational": {},
+        "block": {},
+        "entity_distribution": {},
+        "numerical": {},
+        "c2st": {},
+    }
     for col in cat_cols:
         if col not in real.columns or col not in synthetic.columns:
             continue
@@ -106,6 +114,16 @@ def evaluate_nontext_attrs(
         metrics["relational"]["rating_vs_product_degree_correlation_synthetic"] = rating_vs_degree_corr(synthetic, product_col, rating_col)
         metrics["relational"]["rating_vs_customer_degree_correlation_real"] = rating_vs_degree_corr(real, customer_col, rating_col)
         metrics["relational"]["rating_vs_customer_degree_correlation_synthetic"] = rating_vs_degree_corr(synthetic, customer_col, rating_col)
+        metrics["entity_distribution"].update(
+            entity_average_distribution_metrics(
+                real,
+                synthetic,
+                product_col,
+                customer_col,
+                rating_col,
+                prefix="avg_rating",
+            )
+        )
     if verified_col in real.columns and verified_col in synthetic.columns:
         real_v = normalize_binary(real[verified_col])
         syn_v = normalize_binary(synthetic[verified_col])
@@ -114,6 +132,16 @@ def evaluate_nontext_attrs(
         metrics["temporal"]["daily_verified_rate_correlation"] = grouped_series_corr(real, synthetic, timestamp_col, real_v, syn_v, "D", min_periods=7)
         metrics["relational"]["product_verified_rate_correlation"] = entity_series_corr(real, synthetic, product_col, real_v, syn_v)
         metrics["relational"]["customer_verified_rate_correlation"] = entity_series_corr(real, synthetic, customer_col, real_v, syn_v)
+        metrics["entity_distribution"].update(
+            entity_average_distribution_metrics(
+                real.assign(_verified_value=real_v),
+                synthetic.assign(_verified_value=syn_v),
+                product_col,
+                customer_col,
+                "_verified_value",
+                prefix="verified_rate",
+            )
+        )
 
     if customer_blocks is not None and product_blocks is not None:
         metrics["block"].update(block_metrics(real, synthetic, customer_col, product_col, rating_col, verified_col, customer_blocks, product_blocks))
@@ -206,6 +234,44 @@ def trajectory_corr_top_entities(real, synthetic, entity_col, timestamp_col, val
 def rating_vs_degree_corr(df, entity_col, rating_col):
     grouped = df.groupby(entity_col).agg(degree=(rating_col, "size"), rating=(rating_col, "mean"))
     return corr(grouped["degree"].to_numpy(dtype=float), grouped["rating"].to_numpy(dtype=float))
+
+
+def entity_average_distribution_metrics(
+    real: pd.DataFrame,
+    synthetic: pd.DataFrame,
+    product_col: str,
+    customer_col: str,
+    value_col: str,
+    prefix: str,
+) -> Dict[str, Optional[float]]:
+    product_real = real.groupby(product_col)[value_col].mean().to_numpy(dtype=float)
+    product_syn = synthetic.groupby(product_col)[value_col].mean().to_numpy(dtype=float)
+    customer_real = real.groupby(customer_col)[value_col].mean().to_numpy(dtype=float)
+    customer_syn = synthetic.groupby(customer_col)[value_col].mean().to_numpy(dtype=float)
+    return {
+        f"real_product_{prefix}_variance": variance_or_none(product_real),
+        f"synthetic_product_{prefix}_variance": variance_or_none(product_syn),
+        f"real_customer_{prefix}_variance": variance_or_none(customer_real),
+        f"synthetic_customer_{prefix}_variance": variance_or_none(customer_syn),
+        f"product_{prefix}_variance_ratio": variance_ratio(product_syn, product_real),
+        f"customer_{prefix}_variance_ratio": variance_ratio(customer_syn, customer_real),
+        f"product_{prefix}_distribution_ks": empirical_ks(product_real, product_syn),
+        f"customer_{prefix}_distribution_ks": empirical_ks(customer_real, customer_syn),
+    }
+
+
+def variance_or_none(values: np.ndarray) -> Optional[float]:
+    if len(values) == 0:
+        return None
+    return float(np.var(values))
+
+
+def variance_ratio(numerator: np.ndarray, denominator: np.ndarray) -> Optional[float]:
+    denom = variance_or_none(denominator)
+    num = variance_or_none(numerator)
+    if denom is None or num is None or abs(denom) < 1e-12:
+        return None
+    return float(num / denom)
 
 
 def normalize_binary(values: pd.Series) -> pd.Series:

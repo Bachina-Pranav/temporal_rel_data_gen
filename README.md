@@ -333,6 +333,93 @@ python src/scripts/evaluate_temporal_nontext_attrs.py \
   --output outputs/amazon-toy/nontext_attr_metrics.json
 ```
 
+## TemporalNonTextAttributeDiffusionV2
+
+`TemporalNonTextAttributeDiffusionV2` adds generative entity latent effects for
+non-text review attributes. V1 conditions on causal histories and structure; V2
+also learns a prior over persistent customer/product tendencies from real data,
+conditioned on structural-only features such as degree bins and SBM block. At
+sampling time it samples new customer/product effects from that prior and uses
+them to condition the diffusion model.
+
+This is designed to create product/customer heterogeneity without copying real
+product or customer average ratings, verified rates, or empirical label
+distributions by ID. Same-ID product/customer correlations are still reported,
+but distributional entity-level metrics are the main generative diagnostics
+because sampled effects are new.
+
+Train entity-effect priors:
+
+```bash
+python src/scripts/train_entity_effect_priors.py \
+  --real-reviews data/original/rel-amazon-toy/review.csv \
+  --structure-debug-dir outputs/amazon-toy/ct_2k_sbm_temporal_kde_stubs/debug \
+  --customer-id-col customer_id \
+  --product-id-col product_id \
+  --timestamp-col review_time \
+  --rating-col rating \
+  --verified-col verified \
+  --output-dir outputs/amazon-toy/entity_effect_priors \
+  --seed 42
+```
+
+Train V2:
+
+```bash
+python src/scripts/train_temporal_nontext_attr_diffusion_v2.py \
+  --real-reviews data/original/rel-amazon-toy/review.csv \
+  --structure-debug-dir outputs/amazon-toy/ct_2k_sbm_temporal_kde_stubs/debug \
+  --entity-prior-dir outputs/amazon-toy/entity_effect_priors \
+  --customer-id-col customer_id \
+  --product-id-col product_id \
+  --timestamp-col review_time \
+  --cat-cols rating verified \
+  --output-dir outputs/amazon-toy/temporal_nontext_attr_diffusion_v2 \
+  --temporal-split \
+  --seed 42
+```
+
+Sample V2:
+
+```bash
+python src/scripts/sample_temporal_nontext_attr_diffusion_v2.py \
+  --synthetic-spine outputs/amazon-toy/ct_2k_sbm_temporal_kde_stubs/synthetic_review.csv \
+  --structure-debug-dir outputs/amazon-toy/ct_2k_sbm_temporal_kde_stubs/debug \
+  --entity-prior-dir outputs/amazon-toy/entity_effect_priors \
+  --checkpoint outputs/amazon-toy/temporal_nontext_attr_diffusion_v2/checkpoints/best.pt \
+  --output outputs/amazon-toy/synthetic_review_nontext_v2.csv \
+  --customer-id-col customer_id \
+  --product-id-col product_id \
+  --timestamp-col review_time \
+  --seed 42
+```
+
+The sampler writes `sampled_customer_effects.csv`,
+`sampled_product_effects.csv`, and a metadata JSON next to the output. The
+metadata should report `uses_real_entity_effect_lookup: false` and
+`samples_entity_effects_from_prior: true`. `--debug-use-posterior-effects` is a
+diagnostic upper bound only, not a generative result.
+
+Evaluate V2:
+
+```bash
+python src/scripts/evaluate_temporal_nontext_attrs.py \
+  --real-reviews data/original/rel-amazon-toy/review.csv \
+  --synthetic-reviews outputs/amazon-toy/synthetic_review_nontext_v2.csv \
+  --structure-debug-dir outputs/amazon-toy/ct_2k_sbm_temporal_kde_stubs/debug \
+  --cat-cols rating verified \
+  --output outputs/amazon-toy/nontext_attr_metrics_v2.json
+```
+
+Compare models:
+
+```bash
+python src/scripts/compare_nontext_attr_models.py \
+  --metrics v1=outputs/amazon-toy/nontext_attr_metrics.json \
+            v2=outputs/amazon-toy/nontext_attr_metrics_v2.json \
+  --output outputs/amazon-toy/nontext_attr_model_comparison.csv
+```
+
 Evaluate the full synthetic review table:
 
 ```bash
