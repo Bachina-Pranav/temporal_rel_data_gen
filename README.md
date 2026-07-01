@@ -171,6 +171,30 @@ python src/scripts/diagnose_temporal_sbm_blocks.py \
   --output outputs/amazon-toy/ct_2k_sbm_temporal_stubs/debug/block_diagnostics.json
 ```
 
+Inspect the graph-tool nested SBM hierarchy and extraction levels:
+
+```bash
+python src/scripts/inspect_sbm_hierarchy.py \
+  --reviews data/original/rel-amazon-toy/review.csv \
+  --customer-id-col customer_id \
+  --product-id-col product_id \
+  --timestamp-col review_time \
+  --output-dir outputs/amazon-toy/sbm_hierarchy_inspection \
+  --seed 42
+```
+
+Audit all structural method outputs under one root:
+
+```bash
+python src/scripts/audit_all_structure_methods.py \
+  --real-reviews data/original/rel-amazon-toy/review.csv \
+  --outputs-root outputs/amazon-toy \
+  --customer-id-col customer_id \
+  --product-id-col product_id \
+  --timestamp-col review_time \
+  --output outputs/amazon-toy/structure_method_audit.json
+```
+
 ## TemporalLatentTextAttributeDiffusion
 
 `TemporalLatentTextAttributeDiffusion` is an attribute generator conditioned on

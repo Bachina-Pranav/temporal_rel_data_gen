@@ -193,6 +193,7 @@ def fit_type_constrained_sbm_blocks(
     customer_col: str,
     product_col: str,
     seed: int,
+    block_level: Any = "current",
 ) -> SBMBlockResult:
     """Fit the same graph-tool nested degree-corrected SBM family RelDiff uses.
 
@@ -254,24 +255,44 @@ def fit_type_constrained_sbm_blocks(
             graph, state_args={"deg_corr": True, "clabel": graph.vp["block"]}
         )
         print("Finished SBM fitting.")
-        bottom_state = state.levels[0]
-        block_array = bottom_state.b.a
+        if block_level == "current":
+            extracted_level = 0
+            bottom_state = state.levels[extracted_level]
+            block_array = bottom_state.b.a
 
-        customer_raw = []
-        product_raw = []
-        for customer_id in tqdm(
-            customer_ids, desc="Reading customer block assignments", unit="customer"
-        ):
-            vertex = vertex_map[("customer", customer_id)]
-            customer_raw.append((customer_id, int(block_array[int(vertex)])))
-        for product_id in tqdm(
-            product_ids, desc="Reading product block assignments", unit="product"
-        ):
-            vertex = vertex_map[("product", product_id)]
-            product_raw.append((product_id, int(block_array[int(vertex)])))
+            customer_raw = []
+            product_raw = []
+            for customer_id in tqdm(
+                customer_ids, desc="Reading customer block assignments", unit="customer"
+            ):
+                vertex = vertex_map[("customer", customer_id)]
+                customer_raw.append((customer_id, int(block_array[int(vertex)])))
+            for product_id in tqdm(
+                product_ids, desc="Reading product block assignments", unit="product"
+            ):
+                vertex = vertex_map[("product", product_id)]
+                product_raw.append((product_id, int(block_array[int(vertex)])))
 
-        customer_blocks, num_customer_blocks = compact_labels(customer_raw)
-        product_blocks, num_product_blocks = compact_labels(product_raw)
+            customer_blocks, num_customer_blocks = compact_labels(customer_raw)
+            product_blocks, num_product_blocks = compact_labels(product_raw)
+        else:
+            from .sbm_hierarchy import (
+                inspect_state_levels,
+                raw_assignments_for_level,
+                select_block_level,
+                split_raw_assignments,
+            )
+
+            level_summaries, _ = inspect_state_levels(
+                state, vertex_map, customer_ids, product_ids
+            )
+            extracted_level, _ = select_block_level(level_summaries, block_level)
+            raw = raw_assignments_for_level(
+                state, vertex_map, customer_ids, product_ids, extracted_level
+            )
+            customer_blocks, product_blocks = split_raw_assignments(raw)
+            num_customer_blocks = len(set(customer_blocks.values()))
+            num_product_blocks = len(set(product_blocks.values()))
         try:
             description_length = float(state.entropy())
         except Exception:

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -89,6 +90,8 @@ def evaluate_temporal_stubs(
             timestamp_col,
             min_count=block_pair_min_count,
         )
+        for warning in block_diagnostics.get("block_diagnostic_warnings", []):
+            warnings.warn(warning)
     else:
         block_diagnostics = missing_block_diagnostics(warn=warn_missing_blocks)
     results["additional"].update(block_diagnostics)
