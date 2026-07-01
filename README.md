@@ -279,6 +279,60 @@ python src/scripts/sample_temporal_attr_diffusion.py \
   --seed 42
 ```
 
+## TemporalNonTextAttributeDiffusion
+
+`TemporalNonTextAttributeDiffusion` generates non-text review attributes
+conditioned on a fixed/generated temporal review spine:
+
+```text
+customer_id, product_id, review_time -> rating, verified, optional numerical columns
+```
+
+It does not regenerate structure, and it intentionally excludes text fields
+such as `summary` and `review_text`. The v1 model uses masked categorical
+diffusion for `rating`/`verified`, optional Gaussian diffusion for numerical
+columns such as `helpful_vote`, learned SBM/time embeddings, and explicit
+causal temporal aggregate features so target rows never see their own or future
+attributes.
+
+Example pipeline:
+
+```bash
+python src/scripts/generate_ct_2k_sbm_temporal_kde_stubs.py \
+  --real-reviews data/original/rel-amazon-toy/review.csv \
+  --output-dir outputs/amazon-toy/ct_2k_sbm_temporal_kde_stubs \
+  --sbm-block-level bottom \
+  --timestamp-model auto \
+  --seed 42
+```
+
+```bash
+python src/scripts/train_temporal_nontext_attr_diffusion.py \
+  --real-reviews data/original/rel-amazon-toy/review.csv \
+  --structure-debug-dir outputs/amazon-toy/ct_2k_sbm_temporal_kde_stubs/debug \
+  --cat-cols rating verified \
+  --output-dir outputs/amazon-toy/temporal_nontext_attr_diffusion \
+  --temporal-split \
+  --seed 42
+```
+
+```bash
+python src/scripts/sample_temporal_nontext_attr_diffusion.py \
+  --synthetic-spine outputs/amazon-toy/ct_2k_sbm_temporal_kde_stubs/synthetic_review.csv \
+  --structure-debug-dir outputs/amazon-toy/ct_2k_sbm_temporal_kde_stubs/debug \
+  --checkpoint outputs/amazon-toy/temporal_nontext_attr_diffusion/checkpoints/best.pt \
+  --output outputs/amazon-toy/synthetic_review_nontext.csv \
+  --seed 42
+```
+
+```bash
+python src/scripts/evaluate_temporal_nontext_attrs.py \
+  --real-reviews data/original/rel-amazon-toy/review.csv \
+  --synthetic-reviews outputs/amazon-toy/synthetic_review_nontext.csv \
+  --cat-cols rating verified \
+  --output outputs/amazon-toy/nontext_attr_metrics.json
+```
+
 Evaluate the full synthetic review table:
 
 ```bash
