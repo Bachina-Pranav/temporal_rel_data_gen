@@ -13,8 +13,9 @@ degree-corrected endpoint distributions.
 from __future__ import annotations
 
 import json
+import warnings
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -38,6 +39,10 @@ class SBMBlockResult:
     num_product_blocks: int
     used_existing_reldiff_sbm: bool
     description_length: float | None = None
+    sbm_block_level_requested: Any = "auto"
+    sbm_block_level_resolved: int | None = None
+    sbm_block_level_recommended: int | None = None
+    sbm_level_warnings: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -193,7 +198,7 @@ def fit_type_constrained_sbm_blocks(
     customer_col: str,
     product_col: str,
     seed: int,
-    block_level: Any = "current",
+    block_level: Any = "auto",
 ) -> SBMBlockResult:
     """Fit the same graph-tool nested degree-corrected SBM family RelDiff uses.
 
@@ -207,7 +212,7 @@ def fit_type_constrained_sbm_blocks(
     try:
         import graph_tool.all as gt
     except ImportError:
-        return type_only_blocks(customer_ids, product_ids)
+        return type_only_blocks(customer_ids, product_ids, block_level)
 
     try:
         print(
@@ -248,51 +253,61 @@ def fit_type_constrained_sbm_blocks(
             )
 
         if graph.num_edges() == 0:
-            return type_only_blocks(customer_ids, product_ids)
+            return type_only_blocks(customer_ids, product_ids, block_level)
 
         print("Minimizing nested degree-corrected SBM description length...")
         state = gt.minimize_nested_blockmodel_dl(
             graph, state_args={"deg_corr": True, "clabel": graph.vp["block"]}
         )
         print("Finished SBM fitting.")
-        if block_level == "current":
-            extracted_level = 0
-            bottom_state = state.levels[extracted_level]
-            block_array = bottom_state.b.a
+        from .sbm_hierarchy import (
+            inspect_state_levels,
+            raw_assignments_for_level,
+            select_block_level,
+            split_raw_assignments,
+        )
 
-            customer_raw = []
-            product_raw = []
-            for customer_id in tqdm(
-                customer_ids, desc="Reading customer block assignments", unit="customer"
+        level_summaries, _ = inspect_state_levels(
+            state, vertex_map, customer_ids, product_ids
+        )
+        extracted_level, selection_warnings = select_block_level(
+            level_summaries, block_level
+        )
+        recommended_level, recommendation_warnings = select_block_level(
+            level_summaries, "auto"
+        )
+        raw = raw_assignments_for_level(
+            state, vertex_map, customer_ids, product_ids, extracted_level
+        )
+        customer_blocks, product_blocks = split_raw_assignments(raw)
+        num_customer_blocks = len(set(customer_blocks.values()))
+        num_product_blocks = len(set(product_blocks.values()))
+
+        warnings_list = list(selection_warnings) + list(recommendation_warnings)
+        selected_row = level_summaries[level_summaries["level"] == extracted_level]
+        recommended_row = level_summaries[level_summaries["level"] == recommended_level]
+        if not selected_row.empty and not recommended_row.empty:
+            selected_row = selected_row.iloc[0]
+            recommended_row = recommended_row.iloc[0]
+            if (
+                int(selected_row["num_customer_blocks"]) == 1
+                and int(selected_row["num_product_blocks"]) == 1
+                and (
+                    int(recommended_row["num_customer_blocks"]) > 1
+                    or int(recommended_row["num_product_blocks"]) > 1
+                )
             ):
-                vertex = vertex_map[("customer", customer_id)]
-                customer_raw.append((customer_id, int(block_array[int(vertex)])))
-            for product_id in tqdm(
-                product_ids, desc="Reading product block assignments", unit="product"
-            ):
-                vertex = vertex_map[("product", product_id)]
-                product_raw.append((product_id, int(block_array[int(vertex)])))
-
-            customer_blocks, num_customer_blocks = compact_labels(customer_raw)
-            product_blocks, num_product_blocks = compact_labels(product_raw)
-        else:
-            from .sbm_hierarchy import (
-                inspect_state_levels,
-                raw_assignments_for_level,
-                select_block_level,
-                split_raw_assignments,
-            )
-
-            level_summaries, _ = inspect_state_levels(
-                state, vertex_map, customer_ids, product_ids
-            )
-            extracted_level, _ = select_block_level(level_summaries, block_level)
-            raw = raw_assignments_for_level(
-                state, vertex_map, customer_ids, product_ids, extracted_level
-            )
-            customer_blocks, product_blocks = split_raw_assignments(raw)
-            num_customer_blocks = len(set(customer_blocks.values()))
-            num_product_blocks = len(set(product_blocks.values()))
+                warnings_list.append(
+                    "Selected SBM level gives 1 customer block and 1 product block, "
+                    f"but auto recommends nontrivial level {recommended_level}."
+                )
+            row_warnings = selected_row.get("warnings", [])
+            if isinstance(row_warnings, list):
+                warnings_list.extend(row_warnings)
+        if warnings_list:
+            for warning in warnings_list:
+                print(f"SBM hierarchy warning: {warning}")
+                warnings.warn(warning, RuntimeWarning)
         try:
             description_length = float(state.entropy())
         except Exception:
@@ -305,13 +320,19 @@ def fit_type_constrained_sbm_blocks(
             num_product_blocks=num_product_blocks,
             used_existing_reldiff_sbm=True,
             description_length=description_length,
+            sbm_block_level_requested=block_level,
+            sbm_block_level_resolved=int(extracted_level),
+            sbm_block_level_recommended=int(recommended_level),
+            sbm_level_warnings=warnings_list,
         )
     except Exception as exc:
         print(f"RelDiff graph-tool SBM fitting failed; using type-only blocks: {exc}")
-        return type_only_blocks(customer_ids, product_ids)
+        return type_only_blocks(customer_ids, product_ids, block_level)
 
 
-def type_only_blocks(customer_ids: list[Any], product_ids: list[Any]) -> SBMBlockResult:
+def type_only_blocks(
+    customer_ids: list[Any], product_ids: list[Any], block_level: Any = "auto"
+) -> SBMBlockResult:
     return SBMBlockResult(
         customer_blocks={customer_id: 0 for customer_id in customer_ids},
         product_blocks={product_id: 0 for product_id in product_ids},
@@ -319,6 +340,12 @@ def type_only_blocks(customer_ids: list[Any], product_ids: list[Any]) -> SBMBloc
         num_product_blocks=1 if product_ids else 0,
         used_existing_reldiff_sbm=False,
         description_length=None,
+        sbm_block_level_requested=block_level,
+        sbm_block_level_resolved=None,
+        sbm_block_level_recommended=None,
+        sbm_level_warnings=[
+            "graph-tool SBM unavailable or failed; using type-only fallback blocks."
+        ],
     )
 
 
@@ -334,6 +361,7 @@ class ContinuousTimeTemporalSBMGenerator:
         product_id_col: str = "product_id",
         timestamp_col: str = "review_time",
         seed: int = 42,
+        sbm_block_level: Any = "auto",
     ):
         self.customers = customers.copy()
         self.products = products.copy()
@@ -342,6 +370,7 @@ class ContinuousTimeTemporalSBMGenerator:
         self.product_id_col = product_id_col
         self.timestamp_col = timestamp_col
         self.seed = seed
+        self.sbm_block_level = sbm_block_level
         self.rng = np.random.default_rng(seed)
 
         self.reviews = self._preprocess_reviews()
@@ -441,6 +470,7 @@ class ContinuousTimeTemporalSBMGenerator:
             customer_col=self.customer_id_col,
             product_col=self.product_id_col,
             seed=self.seed,
+            block_level=self.sbm_block_level,
         )
         self._build_event_collections()
         return self
@@ -727,6 +757,18 @@ class ContinuousTimeTemporalSBMGenerator:
             (pd.to_datetime(synthetic[self.timestamp_col]) - self.min_time).dt.total_seconds()
             / max(self.time_span.total_seconds(), 1.0)
         ).to_numpy(dtype=float)
+        from .block_diagnostics import compute_all_block_diagnostics
+
+        block_diagnostics = compute_all_block_diagnostics(
+            self.reviews,
+            synthetic,
+            self.sbm_result.customer_blocks,
+            self.sbm_result.product_blocks,
+            self.customer_id_col,
+            self.product_id_col,
+            self.timestamp_col,
+            min_count=5,
+        )
 
         summary = {
             "generator": GENERATOR_NAME,
@@ -739,6 +781,16 @@ class ContinuousTimeTemporalSBMGenerator:
             "num_customer_blocks": int(self.sbm_result.num_customer_blocks),
             "num_product_blocks": int(self.sbm_result.num_product_blocks),
             "num_nonzero_block_pairs": int(len(self.block_pair_event_count)),
+            "num_nonzero_block_pairs_real": int(
+                block_diagnostics["num_nonzero_block_pairs_real"]
+            ),
+            "num_nonzero_block_pairs_synthetic": int(
+                block_diagnostics["num_nonzero_block_pairs_synthetic"]
+            ),
+            "sbm_block_level_requested": self.sbm_result.sbm_block_level_requested,
+            "sbm_block_level_resolved": self.sbm_result.sbm_block_level_resolved,
+            "sbm_block_level_recommended": self.sbm_result.sbm_block_level_recommended,
+            "sbm_level_warnings": self.sbm_result.sbm_level_warnings,
             "used_existing_reldiff_sbm": self.sbm_result.used_existing_reldiff_sbm,
             "sbm_description_length": self.sbm_result.description_length,
             "global_timestamp_bandwidth": self.global_events.bandwidth,
@@ -749,13 +801,15 @@ class ContinuousTimeTemporalSBMGenerator:
             "synthetic_duplicate_pair_rate": duplicate_pair_rate(
                 synthetic, self.customer_id_col, self.product_id_col
             ),
+            **block_diagnostics,
         }
         self._write_json(debug_dir / "temporal_sbm_summary.json", summary)
 
         self.write_sbm_summary(debug_dir / "sbm_summary.json")
         self.write_block_pair_debug(debug_dir, target_counts)
         self.write_block_debug(debug_dir)
-        self.write_assignment_debug(debug_dir)
+        self.write_assignment_debug(debug_dir, synthetic)
+        self.write_canonical_block_pair_counts(debug_dir, synthetic)
 
         per_pair_ks = []
         for block_pair, real_count in tqdm(
@@ -801,6 +855,10 @@ class ContinuousTimeTemporalSBMGenerator:
             "total_blocks": int(
                 self.sbm_result.num_customer_blocks + self.sbm_result.num_product_blocks
             ),
+            "sbm_block_level_requested": self.sbm_result.sbm_block_level_requested,
+            "sbm_block_level_resolved": self.sbm_result.sbm_block_level_resolved,
+            "sbm_block_level_recommended": self.sbm_result.sbm_block_level_recommended,
+            "sbm_level_warnings": self.sbm_result.sbm_level_warnings,
             "description_length": self.sbm_result.description_length,
             "seed": self.seed,
         }
@@ -867,20 +925,49 @@ class ContinuousTimeTemporalSBMGenerator:
             debug_dir / "temporal_sbm_product_blocks.csv", index=False
         )
 
-    def write_assignment_debug(self, debug_dir: Path) -> None:
+    def write_assignment_debug(
+        self, debug_dir: Path, synthetic: pd.DataFrame | None = None
+    ) -> None:
         assert self.sbm_result is not None
-        pd.DataFrame(
-            [
-                {self.customer_id_col: customer_id, "customer_block": block}
-                for customer_id, block in self.sbm_result.customer_blocks.items()
-            ]
-        ).to_csv(debug_dir / "temporal_sbm_customer_assignments.csv", index=False)
-        pd.DataFrame(
-            [
-                {self.product_id_col: product_id, "product_block": block}
-                for product_id, block in self.sbm_result.product_blocks.items()
-            ]
-        ).to_csv(debug_dir / "temporal_sbm_product_assignments.csv", index=False)
+        from .block_diagnostics import block_assignment_frame
+
+        customer_blocks = block_assignment_frame(
+            self.sbm_result.customer_blocks,
+            self.customer_id_col,
+            "customer_block",
+            self.reviews,
+            synthetic,
+        )
+        product_blocks = block_assignment_frame(
+            self.sbm_result.product_blocks,
+            self.product_id_col,
+            "product_block",
+            self.reviews,
+            synthetic,
+        )
+        customer_blocks.to_csv(debug_dir / "customer_blocks.csv", index=False)
+        product_blocks.to_csv(debug_dir / "product_blocks.csv", index=False)
+        customer_blocks[[self.customer_id_col, "customer_block"]].to_csv(
+            debug_dir / "temporal_sbm_customer_assignments.csv", index=False
+        )
+        product_blocks[[self.product_id_col, "product_block"]].to_csv(
+            debug_dir / "temporal_sbm_product_assignments.csv", index=False
+        )
+
+    def write_canonical_block_pair_counts(
+        self, debug_dir: Path, synthetic: pd.DataFrame
+    ) -> None:
+        assert self.sbm_result is not None
+        from .block_diagnostics import block_pair_counts_frame
+
+        block_pair_counts_frame(
+            self.reviews,
+            synthetic,
+            self.sbm_result.customer_blocks,
+            self.sbm_result.product_blocks,
+            self.customer_id_col,
+            self.product_id_col,
+        ).to_csv(debug_dir / "block_pair_counts.csv", index=False)
 
     @staticmethod
     def _write_json(path: Path, data: dict[str, Any]) -> None:

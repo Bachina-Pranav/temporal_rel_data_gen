@@ -109,6 +109,7 @@ class ContinuousTime2KSBMPlusGenerator(ContinuousTimeTemporalSBMGenerator):
         seed: int = 42,
         stub_pairing: str = "time_sorted",
         pair_multiplicity_mode: str = "none",
+        sbm_block_level: Any = "auto",
     ):
         if stub_pairing not in {"random", "time_sorted"}:
             raise ValueError("stub_pairing must be 'random' or 'time_sorted'.")
@@ -126,6 +127,7 @@ class ContinuousTime2KSBMPlusGenerator(ContinuousTimeTemporalSBMGenerator):
             product_id_col=product_id_col,
             timestamp_col=timestamp_col,
             seed=seed,
+            sbm_block_level=sbm_block_level,
         )
         self.granularity_model = TimestampGranularityModel.fit(
             self.reviews[self.timestamp_col]
@@ -422,6 +424,18 @@ class ContinuousTime2KSBMPlusGenerator(ContinuousTimeTemporalSBMGenerator):
 
         annotated_real = self._annotated_reviews()
         annotated_synthetic = self._annotate_synthetic(synthetic)
+        from .block_diagnostics import compute_all_block_diagnostics
+
+        block_diagnostics = compute_all_block_diagnostics(
+            self.reviews,
+            synthetic,
+            self.sbm_result.customer_blocks,
+            self.sbm_result.product_blocks,
+            self.customer_id_col,
+            self.product_id_col,
+            self.timestamp_col,
+            min_count=5,
+        )
 
         summary = {
             "generator": GENERATOR_NAME,
@@ -436,14 +450,27 @@ class ContinuousTime2KSBMPlusGenerator(ContinuousTimeTemporalSBMGenerator):
             "num_customer_blocks": int(self.sbm_result.num_customer_blocks),
             "num_product_blocks": int(self.sbm_result.num_product_blocks),
             "num_nonzero_block_pairs": int(len(self.block_pair_event_count)),
+            "num_nonzero_block_pairs_real": int(
+                block_diagnostics["num_nonzero_block_pairs_real"]
+            ),
+            "num_nonzero_block_pairs_synthetic": int(
+                block_diagnostics["num_nonzero_block_pairs_synthetic"]
+            ),
+            "sbm_block_level_requested": self.sbm_result.sbm_block_level_requested,
+            "sbm_block_level_resolved": self.sbm_result.sbm_block_level_resolved,
+            "sbm_block_level_recommended": self.sbm_result.sbm_block_level_recommended,
+            "sbm_level_warnings": self.sbm_result.sbm_level_warnings,
             "stub_pairing": self.stub_pairing,
             "pair_multiplicity_mode": self.pair_multiplicity_mode,
             "global_timestamp_bandwidth": self.global_events.bandwidth,
             "seed": self.seed,
             **self.granularity_model.to_debug_dict(),
+            **block_diagnostics,
         }
         self._write_json(debug_dir / "ct_2k_sbm_plus_summary.json", summary)
         self.write_sbm_summary(debug_dir / "sbm_summary.json")
+        self.write_assignment_debug(debug_dir, synthetic)
+        self.write_canonical_block_pair_counts(debug_dir, synthetic)
         self._write_block_pair_debug(debug_dir, annotated_real, annotated_synthetic, target_counts)
         self._write_degree_checks(debug_dir, synthetic)
         self._write_timestamp_diagnostics(debug_dir, real_times, synthetic_times, real_x, synthetic_x)

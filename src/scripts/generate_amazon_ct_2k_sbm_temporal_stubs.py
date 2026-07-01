@@ -32,6 +32,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--debug-dir", default=None)
     parser.add_argument(
+        "--sbm-block-level",
+        default="auto",
+        help="SBM hierarchy level to use: auto, bottom, top, current, or an integer.",
+    )
+    parser.add_argument(
         "--stub-pairing",
         choices=["random", "temporal_sorted", "temporal_window_shuffle"],
         default="temporal_window_shuffle",
@@ -79,6 +84,7 @@ def main() -> None:
         temporal_window_size=args.temporal_window_size,
         avoid_real_edge_prob=args.avoid_real_edge_prob,
         pair_multiplicity_mode=args.pair_multiplicity_mode,
+        sbm_block_level=args.sbm_block_level,
     )
     generator.fit()
     synthetic = generator.generate(

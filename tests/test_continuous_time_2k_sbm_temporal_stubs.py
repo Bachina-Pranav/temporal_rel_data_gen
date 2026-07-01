@@ -134,6 +134,9 @@ def test_temporal_stubs_preserves_degrees_block_pairs_and_timestamps(tmp_path):
     assert empirical_ks_statistic(real_x, synthetic_x) == pytest.approx(0.0)
 
     expected_debug_files = [
+        "customer_blocks.csv",
+        "product_blocks.csv",
+        "block_pair_counts.csv",
         "ct_2k_sbm_temporal_stubs_summary.json",
         "ct_2k_sbm_temporal_stubs_block_pairs.csv",
         "ct_2k_sbm_temporal_stubs_customer_degree_check.csv",
@@ -148,6 +151,10 @@ def test_temporal_stubs_preserves_degrees_block_pairs_and_timestamps(tmp_path):
         summary = json.load(handle)
     assert summary["generator"] == "ct_2k_sbm_temporal_stubs"
     assert summary["timestamp_granularity_mode"] == "date_only"
+    assert summary["sbm_block_level_requested"] == "auto"
+    assert "sbm_block_level_resolved" in summary
+    assert "num_nonzero_block_pairs_real" in summary
+    assert "num_nonzero_block_pairs_synthetic" in summary
 
 
 def test_temporal_stubs_evaluation_metrics_json():

@@ -68,6 +68,7 @@ class ContinuousTime2KSBMTemporalStubsGenerator(ContinuousTimeTemporalSBMGenerat
         temporal_window_size: int | None = None,
         avoid_real_edge_prob: float = 0.95,
         pair_multiplicity_mode: str = "none",
+        sbm_block_level: Any = "auto",
     ):
         if stub_pairing not in {
             "random",
@@ -106,6 +107,7 @@ class ContinuousTime2KSBMTemporalStubsGenerator(ContinuousTimeTemporalSBMGenerat
             product_id_col=product_id_col,
             timestamp_col=timestamp_col,
             seed=seed,
+            sbm_block_level=sbm_block_level,
         )
         self.granularity_model = TimestampGranularityModel.fit(
             self.reviews[self.timestamp_col]
@@ -429,6 +431,16 @@ class ContinuousTime2KSBMTemporalStubsGenerator(ContinuousTimeTemporalSBMGenerat
             "num_customer_blocks": int(self.sbm_result.num_customer_blocks),
             "num_product_blocks": int(self.sbm_result.num_product_blocks),
             "num_nonzero_block_pairs": int(len(self.block_pair_event_count)),
+            "num_nonzero_block_pairs_real": int(
+                block_diagnostics["num_nonzero_block_pairs_real"]
+            ),
+            "num_nonzero_block_pairs_synthetic": int(
+                block_diagnostics["num_nonzero_block_pairs_synthetic"]
+            ),
+            "sbm_block_level_requested": self.sbm_result.sbm_block_level_requested,
+            "sbm_block_level_resolved": self.sbm_result.sbm_block_level_resolved,
+            "sbm_block_level_recommended": self.sbm_result.sbm_block_level_recommended,
+            "sbm_level_warnings": self.sbm_result.sbm_level_warnings,
             "sbm_backend": "graph_tool"
             if self.sbm_result.used_existing_reldiff_sbm
             else "type_only_fallback",

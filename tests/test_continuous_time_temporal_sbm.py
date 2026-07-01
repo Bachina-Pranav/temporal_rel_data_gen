@@ -79,6 +79,13 @@ def test_continuous_time_temporal_sbm_generator_outputs_event_spine(tmp_path):
     assert summary["generator"] == "continuous_time_temporal_sbm"
     assert summary["num_real_reviews"] == len(reviews)
     assert summary["num_synthetic_reviews"] == len(reviews)
+    assert summary["sbm_block_level_requested"] == "auto"
+    assert "sbm_block_level_resolved" in summary
+    assert "num_nonzero_block_pairs_real" in summary
+    assert "num_nonzero_block_pairs_synthetic" in summary
+
+    for filename in ("customer_blocks.csv", "product_blocks.csv", "block_pair_counts.csv"):
+        assert (debug_dir / filename).exists()
 
     block_pairs = pd.read_csv(debug_dir / "temporal_sbm_block_pairs.csv")
     assert (

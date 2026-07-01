@@ -120,6 +120,9 @@ def test_ct_2k_sbm_plus_preserves_stubs_and_midnight_timestamps(tmp_path):
     )
 
     expected_debug_files = [
+        "customer_blocks.csv",
+        "product_blocks.csv",
+        "block_pair_counts.csv",
         "ct_2k_sbm_plus_summary.json",
         "ct_2k_sbm_plus_block_pairs.csv",
         "ct_2k_sbm_plus_customer_degree_check.csv",
@@ -134,6 +137,10 @@ def test_ct_2k_sbm_plus_preserves_stubs_and_midnight_timestamps(tmp_path):
         summary = json.load(handle)
     assert summary["generator"] == "ct_2k_sbm_plus"
     assert summary["timestamp_granularity_mode"] == "date_only"
+    assert summary["sbm_block_level_requested"] == "auto"
+    assert "sbm_block_level_resolved" in summary
+    assert "num_nonzero_block_pairs_real" in summary
+    assert "num_nonzero_block_pairs_synthetic" in summary
 
 
 def test_ct_2k_sbm_plus_evaluation_metrics_json():
