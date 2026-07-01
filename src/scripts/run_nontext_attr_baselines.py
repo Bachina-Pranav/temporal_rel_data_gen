@@ -33,6 +33,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timestamp-col", default="review_time")
     parser.add_argument("--cat-cols", nargs="+", default=["rating", "verified"])
     parser.add_argument("--num-cols", nargs="*", default=[])
+    parser.add_argument("--structure-debug-dir", default=None)
+    parser.add_argument("--v1-checkpoint", default=None)
+    parser.add_argument("--v2-checkpoint", default=None)
+    parser.add_argument("--entity-prior-dir", default=None)
+    parser.add_argument("--num-diffusion-steps", type=int, default=50)
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 
@@ -62,6 +67,7 @@ def main() -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         synthetic.to_csv(path, index=False)
         print(f"Wrote {path}")
+    run_model_baselines(args, output_dir)
 
 
 def run_baseline(
@@ -118,6 +124,48 @@ def sample_column(values: pd.Series, rng: np.random.Generator):
     if len(values) == 0:
         return None
     return values[int(rng.integers(0, len(values)))]
+
+
+def run_model_baselines(args, output_dir: Path) -> None:
+    if args.v1_checkpoint:
+        from reldiff.attributes import TemporalNonTextAttributeDiffusion
+
+        path = output_dir / "causal_feature_mlp_no_entity_latents" / "synthetic_review.csv"
+        TemporalNonTextAttributeDiffusion.sample_from_checkpoint(
+            synthetic_spine_path=args.synthetic_spine,
+            checkpoint_path=args.v1_checkpoint,
+            output_path=path,
+            structure_debug_dir=args.structure_debug_dir,
+            seed=args.seed,
+            num_steps=args.num_diffusion_steps,
+        )
+        print(f"Wrote {path}")
+    if args.v2_checkpoint and args.entity_prior_dir:
+        from reldiff.attributes import TemporalNonTextAttributeDiffusionV2
+
+        path = output_dir / "sampled_entity_latent_diffusion" / "synthetic_review.csv"
+        TemporalNonTextAttributeDiffusionV2.sample_from_checkpoint(
+            synthetic_spine_path=args.synthetic_spine,
+            checkpoint_path=args.v2_checkpoint,
+            output_path=path,
+            structure_debug_dir=args.structure_debug_dir,
+            entity_prior_dir=args.entity_prior_dir,
+            seed=args.seed,
+            num_steps=args.num_diffusion_steps,
+        )
+        print(f"Wrote {path}")
+        ub_path = output_dir / "posterior_effect_upper_bound" / "synthetic_review.csv"
+        TemporalNonTextAttributeDiffusionV2.sample_from_checkpoint(
+            synthetic_spine_path=args.synthetic_spine,
+            checkpoint_path=args.v2_checkpoint,
+            output_path=ub_path,
+            structure_debug_dir=args.structure_debug_dir,
+            entity_prior_dir=args.entity_prior_dir,
+            seed=args.seed,
+            num_steps=args.num_diffusion_steps,
+            debug_use_posterior_effects=True,
+        )
+        print(f"Wrote {ub_path} (diagnostic upper bound)")
 
 
 if __name__ == "__main__":
