@@ -13,6 +13,11 @@ from .temporal_nontext_diffusion_v2 import (
     GENERATOR_NAME_V2,
     TemporalNonTextAttributeDiffusionV2,
 )
+from .temporal_nontext_diffusion_v3 import (
+    GENERATOR_ALIAS_V3,
+    GENERATOR_NAME_V3,
+    TemporalNonTextAttributeDiffusionV3,
+)
 from .temporal_neighbor_sampler import TemporalReviewNeighborSampler
 from .text_latents import NearestNeighborTextDecoder, TextLatentEncoder
 
@@ -22,9 +27,12 @@ __all__ = [
     "TemporalLatentTextAttributeDiffusion",
     "TemporalNonTextAttributeDiffusion",
     "TemporalNonTextAttributeDiffusionV2",
+    "TemporalNonTextAttributeDiffusionV3",
     "TemporalNonTextTrainingResult",
     "TemporalReviewNeighborSampler",
     "TextLatentEncoder",
     "GENERATOR_ALIAS_V2",
+    "GENERATOR_ALIAS_V3",
     "GENERATOR_NAME_V2",
+    "GENERATOR_NAME_V3",
 ]

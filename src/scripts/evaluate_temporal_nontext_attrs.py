@@ -106,6 +106,9 @@ def evaluate_nontext_attrs(
         metrics["temporal"]["rating_by_month_correlation"] = grouped_rate_corr(real, synthetic, timestamp_col, rating_col, "M")
         metrics["temporal"]["monthly_average_rating_correlation"] = grouped_rate_corr(real, synthetic, timestamp_col, rating_col, "M")
         metrics["temporal"]["daily_average_rating_correlation"] = grouped_rate_corr(real, synthetic, timestamp_col, rating_col, "D", min_periods=7)
+        metrics["temporal"]["monthly_rating_distribution_js_mean"] = grouped_distribution_js(
+            real, synthetic, timestamp_col, rating_col, "M"
+        )
         metrics["relational"]["product_average_rating_correlation"] = entity_mean_corr(real, synthetic, product_col, rating_col)
         metrics["relational"]["customer_average_rating_correlation"] = entity_mean_corr(real, synthetic, customer_col, rating_col)
         metrics["relational"]["product_rating_trajectory_correlation_top_products"] = trajectory_corr_top_entities(real, synthetic, product_col, timestamp_col, rating_col)
@@ -130,6 +133,9 @@ def evaluate_nontext_attrs(
         metrics["temporal"]["verified_by_month_correlation"] = grouped_series_corr(real, synthetic, timestamp_col, real_v, syn_v, "M")
         metrics["temporal"]["monthly_verified_rate_correlation"] = grouped_series_corr(real, synthetic, timestamp_col, real_v, syn_v, "M")
         metrics["temporal"]["daily_verified_rate_correlation"] = grouped_series_corr(real, synthetic, timestamp_col, real_v, syn_v, "D", min_periods=7)
+        metrics["temporal"]["monthly_verified_rate_mae"] = grouped_series_mae(
+            real, synthetic, timestamp_col, real_v, syn_v, "M"
+        )
         metrics["relational"]["product_verified_rate_correlation"] = entity_series_corr(real, synthetic, product_col, real_v, syn_v)
         metrics["relational"]["customer_verified_rate_correlation"] = entity_series_corr(real, synthetic, customer_col, real_v, syn_v)
         metrics["entity_distribution"].update(
@@ -149,6 +155,7 @@ def evaluate_nontext_attrs(
     for col in num_cols:
         metrics["numerical"][col] = numerical_metrics(real, synthetic, customer_col, product_col, timestamp_col, col)
     metrics["c2st"]["c2st_accuracy"] = c2st_accuracy(real, synthetic, customer_col, product_col, timestamp_col, cat_cols, num_cols)
+    metrics["decomposition"] = decomposition_diagnostics(synthetic)
     return metrics
 
 
@@ -203,6 +210,31 @@ def grouped_series_corr(real, synthetic, timestamp_col, real_values, syn_values,
     if len(index) < min_periods:
         return None
     return corr(real_s.loc[index].to_numpy(), syn_s.loc[index].to_numpy())
+
+
+def grouped_series_mae(real, synthetic, timestamp_col, real_values, syn_values, freq, min_periods=2):
+    real_s = pd.DataFrame({timestamp_col: real[timestamp_col], "value": real_values}).set_index(timestamp_col)["value"].resample(freq).mean()
+    syn_s = pd.DataFrame({timestamp_col: synthetic[timestamp_col], "value": syn_values}).set_index(timestamp_col)["value"].resample(freq).mean()
+    index = real_s.index.intersection(syn_s.index)
+    if len(index) < min_periods:
+        return None
+    return float(np.mean(np.abs(real_s.loc[index].to_numpy() - syn_s.loc[index].to_numpy())))
+
+
+def grouped_distribution_js(real, synthetic, timestamp_col, value_col, freq, min_periods=2):
+    real_groups = real.set_index(timestamp_col).groupby(pd.Grouper(freq=freq))
+    syn_groups = synthetic.set_index(timestamp_col).groupby(pd.Grouper(freq=freq))
+    values = []
+    for key, real_group in real_groups:
+        if key not in syn_groups.groups:
+            continue
+        syn_group = syn_groups.get_group(key)
+        if len(real_group) == 0 or len(syn_group) == 0:
+            continue
+        values.append(js_divergence(real_group[value_col], syn_group[value_col]))
+    if len(values) < min_periods:
+        return None
+    return float(np.mean(values))
 
 
 def entity_mean_corr(real, synthetic, entity_col, value_col):
@@ -369,6 +401,45 @@ def featurize_for_c2st(df, columns, timestamp_col):
             frame[col] = pd.Categorical(df[col].astype(str)).codes
     frame["month"] = pd.to_datetime(df[timestamp_col]).dt.month
     return frame
+
+
+def decomposition_diagnostics(synthetic: pd.DataFrame) -> Dict[str, Optional[float]]:
+    result = {
+        "average_norm_base_rating_logits": None,
+        "average_norm_residual_rating_logits": None,
+        "residual_to_base_norm_ratio": None,
+        "temporal_calibration_average_correction_norm": None,
+        "sampled_product_effect_variance": None,
+        "sampled_customer_effect_variance": None,
+    }
+    if "base_rating_logit_norm" in synthetic.columns:
+        result["average_norm_base_rating_logits"] = float(
+            pd.to_numeric(synthetic["base_rating_logit_norm"], errors="coerce").mean()
+        )
+    if "residual_rating_logit_norm" in synthetic.columns:
+        result["average_norm_residual_rating_logits"] = float(
+            pd.to_numeric(synthetic["residual_rating_logit_norm"], errors="coerce").mean()
+        )
+    if result["average_norm_base_rating_logits"] and result["average_norm_residual_rating_logits"] is not None:
+        result["residual_to_base_norm_ratio"] = float(
+            result["average_norm_residual_rating_logits"]
+            / max(result["average_norm_base_rating_logits"], 1e-12)
+        )
+    if "temporal_calibration_correction_norm" in synthetic.columns:
+        result["temporal_calibration_average_correction_norm"] = float(
+            pd.to_numeric(synthetic["temporal_calibration_correction_norm"], errors="coerce").mean()
+        )
+    product_cols = [col for col in synthetic.columns if col.startswith("sampled_product_rating_effect_")]
+    customer_cols = [col for col in synthetic.columns if col.startswith("sampled_customer_rating_effect_")]
+    if product_cols:
+        result["sampled_product_effect_variance"] = float(
+            synthetic[product_cols].to_numpy(dtype=float).var()
+        )
+    if customer_cols:
+        result["sampled_customer_effect_variance"] = float(
+            synthetic[customer_cols].to_numpy(dtype=float).var()
+        )
+    return result
 
 
 def flatten(data: Dict[str, Any], prefix: str = "") -> Dict[str, Any]:

@@ -420,6 +420,80 @@ python src/scripts/compare_nontext_attr_models.py \
   --output outputs/amazon-toy/nontext_attr_model_comparison.csv
 ```
 
+## TemporalNonTextAttributeDiffusionV3
+
+`TemporalNonTextAttributeDiffusionV3` combines V1-style temporal calibration
+with V2-style generative entity heterogeneity. It decomposes attribute logits as:
+
+```text
+temporal prior
++ block / block-pair prior
++ sampled product latent effect
++ sampled customer latent effect
++ residual diffusion correction
+```
+
+The entity effects are still sampled from a learned prior, so V3 does not copy
+real product/customer average ratings or verified rates by ID. Same-ID
+product/customer correlations are secondary for this setting; entity-level KS
+metrics and variance ratios are the primary generative diagnostics. The
+posterior-effect mode is diagnostic upper bound only.
+
+Train V3:
+
+```bash
+python src/scripts/train_temporal_nontext_attr_diffusion_v3.py \
+  --real-reviews data/original/rel-amazon-toy/review.csv \
+  --structure-debug-dir outputs/amazon-toy/ct_2k_sbm_temporal_kde_stubs/debug \
+  --customer-id-col customer_id \
+  --product-id-col product_id \
+  --timestamp-col review_time \
+  --cat-cols rating verified \
+  --output-dir outputs/amazon-toy/temporal_nontext_attr_diffusion_v3 \
+  --temporal-split \
+  --entity-effect-prior logistic_normal \
+  --temporal-prior-level month \
+  --use-temporal-calibration \
+  --seed 42
+```
+
+Sample V3:
+
+```bash
+python src/scripts/sample_temporal_nontext_attr_diffusion_v3.py \
+  --synthetic-spine outputs/amazon-toy/ct_2k_sbm_temporal_kde_stubs/synthetic_review.csv \
+  --structure-debug-dir outputs/amazon-toy/ct_2k_sbm_temporal_kde_stubs/debug \
+  --checkpoint outputs/amazon-toy/temporal_nontext_attr_diffusion_v3/checkpoints/best.pt \
+  --output outputs/amazon-toy/synthetic_review_nontext_v3.csv \
+  --customer-id-col customer_id \
+  --product-id-col product_id \
+  --timestamp-col review_time \
+  --use-temporal-calibration \
+  --temporal-calibration-strength 0.75 \
+  --seed 42
+```
+
+Evaluate V3:
+
+```bash
+python src/scripts/evaluate_temporal_nontext_attrs.py \
+  --real-reviews data/original/rel-amazon-toy/review.csv \
+  --synthetic-reviews outputs/amazon-toy/synthetic_review_nontext_v3.csv \
+  --structure-debug-dir outputs/amazon-toy/ct_2k_sbm_temporal_kde_stubs/debug \
+  --cat-cols rating verified \
+  --output outputs/amazon-toy/nontext_attr_metrics_v3.json
+```
+
+Compare versions:
+
+```bash
+python src/scripts/compare_nontext_attr_versions.py \
+  --metrics v1=outputs/amazon-toy/nontext_attr_metrics.json \
+            v2=outputs/amazon-toy/nontext_attr_metrics_v2.json \
+            v3=outputs/amazon-toy/nontext_attr_metrics_v3.json \
+  --output outputs/amazon-toy/nontext_attr_version_comparison.csv
+```
+
 Evaluate the full synthetic review table:
 
 ```bash
