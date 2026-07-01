@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import torch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -16,6 +17,7 @@ sys.path.insert(0, str(ROOT / "src" / "scripts"))
 from evaluate_temporal_nontext_attrs import evaluate_nontext_attrs, load_reviews  # noqa: E402
 from reldiff.attributes import TemporalNonTextAttributeDiffusionV3  # noqa: E402
 from reldiff.attributes.block_attribute_priors import BlockAttributePrior  # noqa: E402
+from reldiff.attributes.temporal_nontext_diffusion_v3 import sample_logits  # noqa: E402
 from reldiff.attributes.temporal_priors import TemporalAttributePrior  # noqa: E402
 
 
@@ -68,6 +70,19 @@ def test_base_logits_decomposition():
     expected = np.log(np.asarray([[0.25, 0.75]])) + 2.0 * np.asarray([[0.1, -0.1]]) + 3.0 * np.asarray([[0.03, 0.04]]) + 4.0 * np.asarray([[0.01, 0.02]])
     assert np.allclose(rating, expected, atol=1e-6)
     assert verified.shape == (1, 2)
+
+
+def test_v3_sample_logits_sanitizes_nonfinite_logits():
+    logits = torch.tensor(
+        [
+            [float("nan"), float("inf")],
+            [float("-inf"), float("-inf")],
+            [1_000_000.0, -1_000_000.0],
+        ]
+    )
+    sampled = sample_logits(logits, "sample")
+    assert sampled.shape == (3,)
+    assert torch.all((sampled >= 0) & (sampled < 2))
 
 
 def test_v3_train_sample_and_evaluate(tmp_path):

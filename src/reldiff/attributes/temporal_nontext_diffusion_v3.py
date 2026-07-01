@@ -27,6 +27,8 @@ from .temporal_calibration import (
     calibrate_logits_torch,
     calibration_group_stats_torch,
     js_divergence_probs,
+    safe_softmax_probs_torch,
+    sanitize_logits_torch,
 )
 from .temporal_buckets import infer_bucket_format
 from .temporal_causal_features import (
@@ -387,8 +389,8 @@ class TemporalNonTextAttributeDiffusionV3(TemporalNonTextAttributeDiffusion):
                 for step_index, step in enumerate(steps):
                     t = torch.full((batch_size,), float(step), device=device)
                     out = self.model(cat_tokens, continuous, discrete, t, base_rating_t, base_verified_t, numerical_noisy=numerical)
-                    rating_logits = out["rating_logits"] / max(float(temperature), 1e-6)
-                    verified_logits = out["verified_logits"] / max(float(temperature), 1e-6)
+                    rating_logits = sanitize_logits_torch(out["rating_logits"] / max(float(temperature), 1e-6))
+                    verified_logits = sanitize_logits_torch(out["verified_logits"] / max(float(temperature), 1e-6))
                     precal_rating_logits = rating_logits
                     precal_verified_logits = verified_logits
                     if use_temporal_calibration:
@@ -414,8 +416,8 @@ class TemporalNonTextAttributeDiffusionV3(TemporalNonTextAttributeDiffusion):
                         final_postcal_rating = rating_logits.detach().cpu().numpy()
                         final_precal_verified = precal_verified_logits.detach().cpu().numpy()
                         final_postcal_verified = verified_logits.detach().cpu().numpy()
-                        final_residual_rating = out["rating_residual_logits"].detach().cpu().numpy()
-                        final_residual_verified = out["verified_residual_logits"].detach().cpu().numpy()
+                        final_residual_rating = sanitize_logits_torch(out["rating_residual_logits"]).detach().cpu().numpy()
+                        final_residual_verified = sanitize_logits_torch(out["verified_residual_logits"]).detach().cpu().numpy()
                     cat_tokens[self.cat_cols[0]] = sample_logits(rating_logits, cat_sampling_strategy)
                     verified_col = "verified" if "verified" in self.cat_cols else self.cat_cols[-1]
                     cat_tokens[verified_col] = sample_logits(verified_logits, cat_sampling_strategy)
@@ -720,9 +722,11 @@ def corrupt_entity_features(continuous, start, width, noise_std, dropout):
 
 
 def sample_logits(logits, strategy):
+    logits = sanitize_logits_torch(logits)
     if strategy == "argmax":
         return torch.argmax(logits, dim=1)
-    return torch.multinomial(torch.softmax(logits, dim=1), num_samples=1).squeeze(1)
+    probs = safe_softmax_probs_torch(logits, dim=1)
+    return torch.multinomial(probs, num_samples=1).squeeze(1)
 
 
 def verified_logits_from_scalar(values: np.ndarray) -> np.ndarray:
