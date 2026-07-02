@@ -44,3 +44,23 @@ def test_temporal_activity_shrinkage_weights_and_probabilities():
     assert p_lo_late > 0
     assert np.isclose(hi_probs.sum(), 1.0)
     assert np.isclose(lo_probs.sum(), 1.0)
+
+
+def test_probabilities_for_block_time_cache_alignment():
+    frame = pd.DataFrame(
+        {
+            "customer_id": ["c0", "c0", "c1", "c2"],
+            "review_time": ["2020-01-01", "2020-01-02", "2020-01-02", "2020-01-03"],
+        }
+    )
+    blocks = {"c0": 0, "c1": 0, "c2": 1}
+    model = TemporalActivityModel.fit_customer_activity(frame, "customer_id", "review_time", blocks)
+
+    ids, probs = model.probabilities_for_block_time(0, "2020-01-02")
+    ids_again, probs_again = model.probabilities_for_block_time(0, "2020-01-02")
+
+    assert list(ids) == ["c0", "c1"]
+    assert len(ids) == len(probs)
+    assert (probs >= 0).all()
+    assert np.allclose(probs, probs_again)
+    assert list(ids_again) == list(ids)

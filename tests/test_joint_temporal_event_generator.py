@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 
@@ -10,7 +11,10 @@ import sys
 
 sys.path.insert(0, str(ROOT / "src"))
 
-from generators.joint_temporal_2k_sbm_event import JointTemporal2KSBMEventGenerator  # noqa: E402
+from generators.joint_temporal_2k_sbm_event import (  # noqa: E402
+    JointTemporal2KSBMEventGenerator,
+    sample_entities_with_quotas,
+)
 
 
 def tiny_events():
@@ -83,4 +87,60 @@ def test_joint_temporal_event_generator_preserves_exact_counts(tmp_path):
     assert bpt_counts(real, cblocks, pblocks).equals(bpt_counts(synthetic, cblocks, pblocks))
     assert metadata["uses_dense_F_u_i_t"] is False
     assert metadata["uses_time_dependent_pairing_score"] is True
+    assert metadata["sampling_mode"] == "fast_time_conditioned"
+    assert metadata["uses_candidate_pool_scoring"] is False
     assert (out_debug / "block_pair_time_counts.csv").exists()
+
+
+def test_fast_sampler_skips_static_affinity_fit_by_default(tmp_path, monkeypatch):
+    real = tiny_events()
+    debug = tmp_path / "debug_in"
+    write_blocks(debug)
+
+    def fail_fit(*args, **kwargs):
+        raise AssertionError("Static affinity should not be fit in default fast mode")
+
+    monkeypatch.setattr("generators.joint_temporal_2k_sbm_event.StaticCustomerProductAffinity.fit", fail_fit)
+    generator = JointTemporal2KSBMEventGenerator(
+        structure_debug_dir=debug,
+        lambda_static=1.0,
+        use_static_affinity=False,
+        sampling_mode="fast_time_conditioned",
+        seed=10,
+    )
+
+    synthetic = generator.fit(real).sample(seed=10)
+
+    assert len(synthetic) == len(real)
+    assert generator.metadata()["uses_static_affinity_in_default_sampler"] is False
+
+
+def test_sample_entities_with_quotas_respects_remaining_degrees():
+    rng = np.random.default_rng(4)
+    entity_ids = np.asarray(["a", "b", "c"], dtype=object)
+    remaining = {"a": 1, "b": 2, "c": 0}
+    probs = np.asarray([0.9, 0.1, 1.0])
+
+    sampled, status = sample_entities_with_quotas(entity_ids, remaining, probs, 3, rng)
+
+    counts = pd.Series(sampled).value_counts().to_dict()
+    assert status["success"] is True
+    assert len(sampled) == 3
+    assert counts.get("a", 0) <= 1
+    assert counts.get("b", 0) <= 2
+    assert counts.get("c", 0) == 0
+
+
+def test_sample_entities_with_quotas_falls_back_to_degree_weights():
+    rng = np.random.default_rng(5)
+    entity_ids = np.asarray(["a", "b"], dtype=object)
+    remaining = {"a": 2, "b": 1}
+    probs = np.zeros(2, dtype=float)
+
+    sampled, status = sample_entities_with_quotas(entity_ids, remaining, probs, 3, rng)
+
+    counts = pd.Series(sampled).value_counts().to_dict()
+    assert status["success"] is True
+    assert len(sampled) == 3
+    assert counts.get("a", 0) <= 2
+    assert counts.get("b", 0) <= 1

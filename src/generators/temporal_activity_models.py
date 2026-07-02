@@ -42,6 +42,8 @@ class TemporalActivityModel:
         self.block_time_probs: Dict[int, np.ndarray] = {}
         self.global_time_probs: np.ndarray = np.asarray([], dtype=float)
         self.weights: Dict[Any, float] = {}
+        self.entities_by_block: Dict[int, List[Any]] = {}
+        self._block_time_cache: Dict[tuple[int, str], tuple[np.ndarray, np.ndarray]] = {}
 
     def fit(
         self,
@@ -78,6 +80,12 @@ class TemporalActivityModel:
             entity: float(deg / (deg + self.alpha_time))
             for entity, deg in self.entity_degree.items()
         }
+        self.entities_by_block = {}
+        for entity, block in self.entity_block.items():
+            self.entities_by_block.setdefault(int(block), []).append(entity)
+        for block in self.entities_by_block:
+            self.entities_by_block[block] = sorted(self.entities_by_block[block])
+        self._block_time_cache = {}
         return self
 
     @classmethod
@@ -127,6 +135,28 @@ class TemporalActivityModel:
 
     def probabilities(self, entity_ids: Iterable[Any], time_bucket: Any) -> np.ndarray:
         return np.asarray([self.probability(entity_id, time_bucket) for entity_id in entity_ids], dtype=float)
+
+    def probabilities_for_block_time(
+        self,
+        block_id: int,
+        time_bucket: Any,
+        entity_ids: Optional[Iterable[Any]] = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return entity IDs and P_entity(t), aligned and cached by block/time."""
+
+        time_key = canonical_one_day(time_bucket)
+        if entity_ids is not None:
+            ids = np.asarray(list(entity_ids), dtype=object)
+            probs = self.probabilities(ids, time_key)
+            return ids, np.nan_to_num(probs, nan=self.eps, posinf=self.eps, neginf=self.eps).clip(min=0.0)
+        key = (int(block_id), time_key)
+        if key not in self._block_time_cache:
+            ids = np.asarray(self.entities_by_block.get(int(block_id), []), dtype=object)
+            probs = self.probabilities(ids, time_key) if len(ids) else np.asarray([], dtype=float)
+            probs = np.nan_to_num(probs, nan=self.eps, posinf=self.eps, neginf=self.eps).clip(min=0.0)
+            self._block_time_cache[key] = (ids, probs)
+        ids, probs = self._block_time_cache[key]
+        return ids, probs
 
     def save_summary(self, path: str | Path) -> None:
         weights = np.asarray(list(self.weights.values()), dtype=float)
