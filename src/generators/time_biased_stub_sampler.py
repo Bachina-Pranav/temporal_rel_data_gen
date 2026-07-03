@@ -100,6 +100,121 @@ def sample_desired_times_for_stubs_mixture_fast(
     return desired
 
 
+def sample_desired_times_for_stubs_local_kernel(
+    stub_entity_idx: Sequence[int],
+    empirical_offsets: np.ndarray,
+    empirical_time_values: np.ndarray,
+    entity_block: np.ndarray,
+    block_time_values: Mapping[int, np.ndarray] | Sequence[np.ndarray],
+    block_time_cdfs: Mapping[int, np.ndarray] | Sequence[np.ndarray],
+    global_time_values: np.ndarray,
+    global_time_cdf: np.ndarray,
+    num_time_codes: int,
+    rng: np.random.Generator,
+    bandwidth_mode: str = "auto_block_iqr",
+    bandwidth_scale: float = 0.25,
+    min_bandwidth: float = 1.0,
+    max_bandwidth: Optional[float] = None,
+    kernel: str = "discrete_laplace",
+    fallback_mode: str = "block",
+    entity_bandwidths: Optional[np.ndarray] = None,
+    block_bandwidths: Optional[Mapping[int, float] | Sequence[float]] = None,
+    global_bandwidth: float = 7.0,
+) -> np.ndarray:
+    """Sample desired time codes near each entity's observed event times.
+
+    This sampler loops over unique entities appearing in the exact stubs. It
+    never constructs dense entity-time probabilities and does not use pandas.
+    """
+
+    del bandwidth_mode, bandwidth_scale, min_bandwidth, max_bandwidth
+    if kernel not in {"discrete_laplace", "discrete_gaussian", "none"}:
+        raise ValueError("kernel must be discrete_laplace, discrete_gaussian, or none")
+    if fallback_mode not in {"block", "global"}:
+        raise ValueError("fallback_mode must be block or global")
+
+    stub_entity_idx = np.asarray(stub_entity_idx, dtype=np.int64)
+    empirical_offsets = np.asarray(empirical_offsets, dtype=np.int64)
+    empirical_time_values = np.asarray(empirical_time_values, dtype=np.int32)
+    entity_block = np.asarray(entity_block, dtype=np.int64)
+    n = int(len(stub_entity_idx))
+    desired = np.empty(n, dtype=np.int32)
+    if n == 0:
+        return desired
+
+    positions = np.arange(n, dtype=np.int64)
+    upper = max(int(num_time_codes) - 1, 0)
+    for entity_idx, entity_positions in grouped_positions(stub_entity_idx, positions):
+        lo = int(empirical_offsets[int(entity_idx)])
+        hi = int(empirical_offsets[int(entity_idx) + 1])
+        if hi > lo:
+            sampled_offsets = rng.integers(lo, hi, size=len(entity_positions))
+            base_times = empirical_time_values[sampled_offsets].astype(np.int32, copy=False)
+            bandwidth = lookup_bandwidth(
+                int(entity_idx),
+                int(entity_block[int(entity_idx)]),
+                entity_bandwidths,
+                block_bandwidths,
+                global_bandwidth,
+            )
+            noise = sample_discrete_noise(len(entity_positions), bandwidth, kernel, rng)
+            desired[entity_positions] = np.clip(base_times.astype(np.int64) + noise.astype(np.int64), 0, upper).astype(np.int32)
+            continue
+
+        if fallback_mode == "block":
+            values, cdf = distribution_for_block(
+                int(entity_block[int(entity_idx)]),
+                block_time_values,
+                block_time_cdfs,
+                global_time_values,
+                global_time_cdf,
+            )
+        else:
+            values, cdf = global_time_values, global_time_cdf
+        desired[entity_positions] = np.clip(sample_from_cdf(values, cdf, len(entity_positions), rng), 0, upper).astype(np.int32)
+
+    return desired
+
+
+def sample_discrete_noise(
+    size: int,
+    bandwidth: float,
+    kernel: str,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    if kernel == "none" or float(bandwidth) <= 0.0:
+        return np.zeros(int(size), dtype=np.int32)
+    if kernel == "discrete_gaussian":
+        noise = rng.normal(loc=0.0, scale=float(bandwidth), size=int(size))
+    else:
+        noise = rng.laplace(loc=0.0, scale=float(bandwidth), size=int(size))
+    return np.rint(noise).astype(np.int32)
+
+
+def lookup_bandwidth(
+    entity_idx: int,
+    block: int,
+    entity_bandwidths: Optional[np.ndarray],
+    block_bandwidths: Optional[Mapping[int, float] | Sequence[float]],
+    global_bandwidth: float,
+) -> float:
+    if entity_bandwidths is not None and 0 <= int(entity_idx) < len(entity_bandwidths):
+        value = float(entity_bandwidths[int(entity_idx)])
+        if np.isfinite(value) and value > 0.0:
+            return value
+    if block_bandwidths is not None:
+        if isinstance(block_bandwidths, Mapping):
+            value = block_bandwidths.get(int(block))
+        else:
+            try:
+                value = block_bandwidths[int(block)]
+            except (IndexError, TypeError):
+                value = None
+        if value is not None and np.isfinite(float(value)) and float(value) > 0.0:
+            return float(value)
+    return float(global_bandwidth)
+
+
 def grouped_positions(keys: np.ndarray, positions: np.ndarray):
     keys = np.asarray(keys, dtype=np.int64)
     positions = np.asarray(positions, dtype=np.int64)

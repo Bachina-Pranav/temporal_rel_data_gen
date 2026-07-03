@@ -37,10 +37,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--temporal-shrinkage-mode",
         choices=["median_degree", "empirical_bayes", "fixed"],
-        default="empirical_bayes",
+        default="median_degree",
+    )
+    parser.add_argument(
+        "--desired-time-sampling-mode",
+        choices=["mixture_shrinkage", "empirical_bayes", "local_kernel", "empirical_exact"],
+        default="local_kernel",
     )
     parser.add_argument("--alpha-time-gate", default="auto")
     parser.add_argument("--block-time-smoothing", type=float, default=5.0)
+    parser.add_argument("--kernel-bandwidth-mode", choices=["auto_block_iqr", "auto_global_iqr", "fixed"], default="auto_block_iqr")
+    parser.add_argument("--kernel-bandwidth-scale", type=float, default=0.25)
+    parser.add_argument("--kernel-min-bandwidth-days", type=float, default=1.0)
+    parser.add_argument("--kernel-max-bandwidth-days", type=float, default=None)
+    parser.add_argument("--kernel-fixed-bandwidth-days", type=float, default=7.0)
+    parser.add_argument("--kernel-type", choices=["discrete_laplace", "discrete_gaussian", "none"], default="discrete_laplace")
     parser.add_argument(
         "--pairing-mode",
         choices=["random", "static_projection", "dynamic_projection", "dynamic_exact_small", "dynamic_exact_penalized"],
@@ -79,8 +90,15 @@ def main() -> None:
         alpha_customer_time=args.alpha_customer_time,
         alpha_product_time=args.alpha_product_time,
         temporal_shrinkage_mode=args.temporal_shrinkage_mode,
+        desired_time_sampling_mode=args.desired_time_sampling_mode,
         alpha_time_gate=args.alpha_time_gate,
         block_time_smoothing=args.block_time_smoothing,
+        kernel_bandwidth_mode=args.kernel_bandwidth_mode,
+        kernel_bandwidth_scale=args.kernel_bandwidth_scale,
+        kernel_min_bandwidth_days=args.kernel_min_bandwidth_days,
+        kernel_max_bandwidth_days=args.kernel_max_bandwidth_days,
+        kernel_fixed_bandwidth_days=args.kernel_fixed_bandwidth_days,
+        kernel_type=args.kernel_type,
         pairing_mode=args.pairing_mode,
         max_exact_affinity_cell_size=args.max_exact_affinity_cell_size,
         large_cell_pairing=args.large_cell_pairing,

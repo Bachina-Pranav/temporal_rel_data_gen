@@ -7,7 +7,10 @@ from typing import Any, Dict, Mapping, Sequence
 
 import numpy as np
 
-from .time_biased_stub_sampler import sample_desired_times_for_stubs_mixture_fast
+from .time_biased_stub_sampler import (
+    sample_desired_times_for_stubs_local_kernel,
+    sample_desired_times_for_stubs_mixture_fast,
+)
 
 
 def assign_stubs_to_slots_by_time(
@@ -21,13 +24,18 @@ def assign_stubs_to_slots_by_time(
     jitter: float = 1e-3,
     log_label: str = "stubs",
     return_entity_indices: bool = False,
+    desired_time_sampling_mode: str = "mixture_shrinkage",
+    local_kernel_state: Dict[str, Any] | None = None,
+    mixture_sampling_state: Dict[str, Any] | None = None,
 ) -> tuple[np.ndarray, Dict[str, Any]]:
     """Assign exact entity stubs to slots through integer time-biased sorting."""
 
     start = time.time()
+    if desired_time_sampling_mode not in {"mixture_shrinkage", "empirical_bayes", "local_kernel", "empirical_exact"}:
+        raise ValueError("unsupported desired_time_sampling_mode")
     slot_blocks = np.asarray(slot_blocks, dtype=np.int64)
     slot_time_codes = np.asarray(slot_time_codes, dtype=np.int32)
-    state = activity_model.get_fast_sampling_state()
+    state = mixture_sampling_state or activity_model.get_fast_sampling_state()
     model_entity_ids = np.asarray(state["entity_ids"], dtype=object)
     entity_to_index = state["entity_to_index"]
     requested_entity_ids = np.asarray(list(entity_ids), dtype=object)
@@ -77,18 +85,42 @@ def assign_stubs_to_slots_by_time(
             continue
 
         sample_start = time.time()
-        desired_codes = sample_desired_times_for_stubs_mixture_fast(
-            stubs,
-            state["entity_mix_weight"],
-            entity_block_arr,
-            state["empirical_offsets"],
-            state["empirical_time_values"],
-            state["block_time_values"],
-            state["block_time_cdfs"],
-            state["global_time_values"],
-            state["global_time_cdf"],
-            rng,
-        )
+        if desired_time_sampling_mode in {"local_kernel", "empirical_exact"}:
+            kernel_state = local_kernel_state or {}
+            desired_codes = sample_desired_times_for_stubs_local_kernel(
+                stubs,
+                state["empirical_offsets"],
+                state["empirical_time_values"],
+                entity_block_arr,
+                state["block_time_values"],
+                state["block_time_cdfs"],
+                state["global_time_values"],
+                state["global_time_cdf"],
+                int(kernel_state.get("num_time_codes", len(activity_model.time_buckets))),
+                rng,
+                bandwidth_mode=kernel_state.get("bandwidth_mode", "auto_block_iqr"),
+                bandwidth_scale=float(kernel_state.get("bandwidth_scale", 0.25)),
+                min_bandwidth=float(kernel_state.get("min_bandwidth", 1.0)),
+                max_bandwidth=kernel_state.get("max_bandwidth"),
+                kernel="none" if desired_time_sampling_mode == "empirical_exact" else kernel_state.get("kernel", "discrete_laplace"),
+                fallback_mode=kernel_state.get("fallback_mode", "block"),
+                entity_bandwidths=kernel_state.get("entity_bandwidths"),
+                block_bandwidths=kernel_state.get("block_bandwidths"),
+                global_bandwidth=float(kernel_state.get("global_bandwidth", 7.0)),
+            )
+        else:
+            desired_codes = sample_desired_times_for_stubs_mixture_fast(
+                stubs,
+                state["entity_mix_weight"],
+                entity_block_arr,
+                state["empirical_offsets"],
+                state["empirical_time_values"],
+                state["block_time_values"],
+                state["block_time_cdfs"],
+                state["global_time_values"],
+                state["global_time_cdf"],
+                rng,
+            )
         sample_seconds = float(time.time() - sample_start)
 
         sort_start = time.time()
@@ -135,6 +167,7 @@ def assign_stubs_to_slots_by_time(
         "assignment_seconds": float(time.time() - start),
         "block_timings": block_summaries,
         "returns_entity_indices": bool(return_entity_indices),
+        "desired_time_sampling_mode": desired_time_sampling_mode,
     }
     if return_entity_indices:
         return assigned_idx, summary

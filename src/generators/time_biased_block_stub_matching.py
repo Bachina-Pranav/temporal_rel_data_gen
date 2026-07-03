@@ -17,6 +17,7 @@ from .fast_temporal_activity import FastTemporalActivityModel, canonical_time_bu
 from .lowrank_time_gated_affinity import LowRankTimeGatedAffinity
 from .stub_dynamic_pairing import reorder_products_within_cells_by_dynamic_affinity
 from .stub_time_assignment import assign_stubs_to_slots_by_time
+from .temporal_kernel_bandwidth import estimate_temporal_kernel_bandwidths
 from .temporal_shrinkage_estimator import DEFAULT_CANDIDATE_ALPHAS, estimate_temporal_shrinkage_alpha
 
 
@@ -27,15 +28,14 @@ METHOD_ALIAS = "temporal_stub_matching_event"
 class TimeBiasedBlockStubMatchingGenerator:
     """Exact degree/block-time temporal event-spine generator.
 
-    TimeBiasedBlockStubMatchingGenerator uses exact degree stubs and exact
-    block-pair-time slots. Entity stubs are assigned to temporal slots by
-    sampling desired times from a smoothed temporal activity distribution.
-    The shrinkage strength is selected automatically by held-out temporal
-    likelihood, avoiding dataset-specific tuning on synthetic evaluation
-    metrics. Within each temporal cell, products are paired to customers
-    using a fixed penalized low-rank dynamic affinity score
-    F_{u,i,t} = (z_u * g_t)^T z_i with anti-duplication and anti-copying
-    penalties.
+    TimeBiasedBlockStubMatchingGenerator exactly matches entity degree stubs
+    to block-pair-time slots. Desired times for entity stubs are sampled using
+    local temporal kernel smoothing around each entity's observed event times,
+    with bandwidths estimated from real inter-event gaps and no synthetic-
+    metric tuning. This preserves entity lifecycle identity while adding
+    stochastic temporal variation. Products are then paired to customers within
+    each temporal cell using a fixed penalized low-rank dynamic affinity score
+    F_{u,i,t} = (z_u * g_t)^T z_i.
     """
 
     def __init__(
@@ -49,9 +49,16 @@ class TimeBiasedBlockStubMatchingGenerator:
         rank: int = 32,
         alpha_customer_time: Any = "auto",
         alpha_product_time: Any = "auto",
-        temporal_shrinkage_mode: str = "empirical_bayes",
+        temporal_shrinkage_mode: str = "median_degree",
+        desired_time_sampling_mode: str = "local_kernel",
         alpha_time_gate: Any = "auto",
         block_time_smoothing: float = 5.0,
+        kernel_bandwidth_mode: str = "auto_block_iqr",
+        kernel_bandwidth_scale: float = 0.25,
+        kernel_min_bandwidth_days: float = 1.0,
+        kernel_max_bandwidth_days: Optional[float] = None,
+        kernel_fixed_bandwidth_days: float = 7.0,
+        kernel_type: str = "discrete_laplace",
         pairing_mode: str = "dynamic_exact_penalized",
         max_exact_affinity_cell_size: int = 128,
         large_cell_pairing: str = "projection_sort",
@@ -67,6 +74,12 @@ class TimeBiasedBlockStubMatchingGenerator:
             raise ValueError("TimeBiasedBlockStubMatchingGenerator currently supports day event buckets only")
         if temporal_shrinkage_mode not in {"median_degree", "empirical_bayes", "fixed"}:
             raise ValueError("temporal_shrinkage_mode must be median_degree, empirical_bayes, or fixed")
+        if desired_time_sampling_mode not in {"mixture_shrinkage", "empirical_bayes", "local_kernel", "empirical_exact"}:
+            raise ValueError("desired_time_sampling_mode must be mixture_shrinkage, empirical_bayes, local_kernel, or empirical_exact")
+        if kernel_bandwidth_mode not in {"auto_block_iqr", "auto_global_iqr", "fixed"}:
+            raise ValueError("kernel_bandwidth_mode must be auto_block_iqr, auto_global_iqr, or fixed")
+        if kernel_type not in {"discrete_laplace", "discrete_gaussian", "none"}:
+            raise ValueError("kernel_type must be discrete_laplace, discrete_gaussian, or none")
         if pairing_mode not in {"random", "static_projection", "dynamic_projection", "dynamic_exact_small", "dynamic_exact_penalized"}:
             raise ValueError("unsupported pairing_mode")
         if large_cell_pairing not in {"projection_sort", "exact_greedy"}:
@@ -81,8 +94,15 @@ class TimeBiasedBlockStubMatchingGenerator:
         self.alpha_customer_time = alpha_customer_time
         self.alpha_product_time = alpha_product_time
         self.temporal_shrinkage_mode = temporal_shrinkage_mode
+        self.desired_time_sampling_mode = desired_time_sampling_mode
         self.alpha_time_gate = alpha_time_gate
         self.block_time_smoothing = float(block_time_smoothing)
+        self.kernel_bandwidth_mode = kernel_bandwidth_mode
+        self.kernel_bandwidth_scale = float(kernel_bandwidth_scale)
+        self.kernel_min_bandwidth_days = float(kernel_min_bandwidth_days)
+        self.kernel_max_bandwidth_days = None if kernel_max_bandwidth_days is None else float(kernel_max_bandwidth_days)
+        self.kernel_fixed_bandwidth_days = float(kernel_fixed_bandwidth_days)
+        self.kernel_type = kernel_type
         self.pairing_mode = pairing_mode
         self.max_exact_affinity_cell_size = int(max_exact_affinity_cell_size)
         self.large_cell_pairing = large_cell_pairing
@@ -130,6 +150,10 @@ class TimeBiasedBlockStubMatchingGenerator:
         self.product_alpha_result: Dict[str, Any] = {}
         self.alpha_customer_time_selected: Optional[float] = None
         self.alpha_product_time_selected: Optional[float] = None
+        self.customer_kernel_bandwidth_result: Dict[str, Any] = {}
+        self.product_kernel_bandwidth_result: Dict[str, Any] = {}
+        self.customer_local_kernel_state: Dict[str, Any] = {}
+        self.product_local_kernel_state: Dict[str, Any] = {}
 
     def fit(self, real_df: pd.DataFrame) -> "TimeBiasedBlockStubMatchingGenerator":
         fit_start = time.time()
@@ -176,6 +200,7 @@ class TimeBiasedBlockStubMatchingGenerator:
             granularity=self.time_granularity,
             entity_kind="product",
         ).fit(frame, self.product_id_col, "_time_bucket", self.product_blocks)
+        self._fit_temporal_kernel_bandwidths()
         self._build_real_overlap_key_sets(frame)
         print("[fit] fitting low-rank time-gated affinity", flush=True)
         self.affinity_model = LowRankTimeGatedAffinity(
@@ -206,6 +231,8 @@ class TimeBiasedBlockStubMatchingGenerator:
             jitter=self.desired_time_jitter,
             log_label="customer-stubs",
             return_entity_indices=True,
+            desired_time_sampling_mode=self.desired_time_sampling_mode,
+            local_kernel_state=self.customer_local_kernel_state,
         )
         print(f"[customer-stubs] done in {self.customer_assignment_summary['assignment_seconds']:.2f}s", flush=True)
         print("[product-stubs] assigning exact product stubs by time-biased sort", flush=True)
@@ -220,6 +247,8 @@ class TimeBiasedBlockStubMatchingGenerator:
             jitter=self.desired_time_jitter,
             log_label="product-stubs",
             return_entity_indices=True,
+            desired_time_sampling_mode=self.desired_time_sampling_mode,
+            local_kernel_state=self.product_local_kernel_state,
         )
         print(f"[product-stubs] done in {self.product_assignment_summary['assignment_seconds']:.2f}s", flush=True)
         self.slot_customer_id = self.customer_activity.entity_ids[self.slot_customer_idx]
@@ -326,6 +355,8 @@ class TimeBiasedBlockStubMatchingGenerator:
         write_json(self.dynamic_pairing_summary, debug / "dynamic_pairing_summary.json")
         write_json(self.customer_alpha_result, debug / "customer_temporal_shrinkage_estimation.json")
         write_json(self.product_alpha_result, debug / "product_temporal_shrinkage_estimation.json")
+        write_json(self._kernel_diagnostics(self.customer_kernel_bandwidth_result), debug / "customer_temporal_kernel_bandwidths.json")
+        write_json(self._kernel_diagnostics(self.product_kernel_bandwidth_result), debug / "product_temporal_kernel_bandwidths.json")
         write_json(self.array_dtype_summary(), debug / "array_dtype_summary.json")
 
     def save_metadata(self, path: str | Path) -> None:
@@ -377,6 +408,16 @@ class TimeBiasedBlockStubMatchingGenerator:
             "no_quota_rejection_sampling": True,
             "no_per_event_candidate_pool_scoring": True,
             "no_cell_level_repair_loops": True,
+            "desired_time_sampling_mode": self.desired_time_sampling_mode,
+            "kernel_type": self.kernel_type,
+            "kernel_bandwidth_mode": self.kernel_bandwidth_mode,
+            "kernel_bandwidth_scale": float(self.kernel_bandwidth_scale),
+            "kernel_min_bandwidth_days": float(self.kernel_min_bandwidth_days),
+            "kernel_max_bandwidth_days": self.kernel_max_bandwidth_days,
+            "kernel_fixed_bandwidth_days": float(self.kernel_fixed_bandwidth_days),
+            "temporal_alpha_used": self.desired_time_sampling_mode in {"mixture_shrinkage", "empirical_bayes"},
+            "empirical_bayes_used": self.desired_time_sampling_mode == "empirical_bayes",
+            "bandwidth_selection_uses_synthetic_metrics": False,
             "temporal_shrinkage_mode": self.temporal_shrinkage_mode,
             "alpha_customer_time_requested": self.alpha_customer_time,
             "alpha_product_time_requested": self.alpha_product_time,
@@ -393,6 +434,12 @@ class TimeBiasedBlockStubMatchingGenerator:
             "product_alpha_num_holdout_events": int(self.product_alpha_result.get("num_holdout_events", 0)),
             "product_alpha_fallback_used": bool(self.product_alpha_result.get("fallback_used", False)),
             "product_alpha_candidate_results": list(self.product_alpha_result.get("candidate_results", [])),
+            "customer_global_bandwidth": self._kernel_global_bandwidth(self.customer_kernel_bandwidth_result),
+            "product_global_bandwidth": self._kernel_global_bandwidth(self.product_kernel_bandwidth_result),
+            "customer_block_bandwidths": self._kernel_block_bandwidths(self.customer_kernel_bandwidth_result),
+            "product_block_bandwidths": self._kernel_block_bandwidths(self.product_kernel_bandwidth_result),
+            "customer_entity_bandwidth_summary": self._kernel_entity_summary(self.customer_kernel_bandwidth_result),
+            "product_entity_bandwidth_summary": self._kernel_entity_summary(self.product_kernel_bandwidth_result),
             "pairing_mode": self.pairing_mode,
             "large_cell_pairing": self.large_cell_pairing,
             "max_exact_affinity_cell_size": int(self.max_exact_affinity_cell_size),
@@ -469,7 +516,15 @@ class TimeBiasedBlockStubMatchingGenerator:
     def _select_temporal_shrinkage_alphas(self, frame: pd.DataFrame) -> None:
         """Choose customer/product alpha without looking at synthetic metrics."""
 
-        if self.temporal_shrinkage_mode == "empirical_bayes":
+        if self.desired_time_sampling_mode in {"local_kernel", "empirical_exact"}:
+            self.alpha_customer_time_selected = 0.0
+            self.alpha_product_time_selected = 0.0
+            objective = f"{self.desired_time_sampling_mode}_alpha_not_used"
+            self.customer_alpha_result = self._manual_alpha_result(0.0, len(self.customer_degrees), objective, False)
+            self.product_alpha_result = self._manual_alpha_result(0.0, len(self.product_degrees), objective, False)
+            return
+
+        if self.desired_time_sampling_mode == "empirical_bayes":
             print("[fit] selecting temporal shrinkage alphas by held-out likelihood", flush=True)
             self.customer_alpha_result = estimate_temporal_shrinkage_alpha(
                 df=frame,
@@ -489,7 +544,7 @@ class TimeBiasedBlockStubMatchingGenerator:
             self.alpha_product_time_selected = float(self.product_alpha_result["best_alpha"])
             return
 
-        if self.temporal_shrinkage_mode == "median_degree":
+        if self.desired_time_sampling_mode == "mixture_shrinkage" and self.temporal_shrinkage_mode != "fixed":
             customer_alpha = resolve_auto_alpha("auto", self.customer_degrees.values())
             product_alpha = resolve_auto_alpha("auto", self.product_degrees.values())
             objective = "median_entity_degree"
@@ -507,6 +562,49 @@ class TimeBiasedBlockStubMatchingGenerator:
         self.customer_alpha_result = self._manual_alpha_result(customer_alpha, len(self.customer_degrees), objective, customer_fallback)
         self.product_alpha_result = self._manual_alpha_result(product_alpha, len(self.product_degrees), objective, product_fallback)
 
+    def _fit_temporal_kernel_bandwidths(self) -> None:
+        if self.customer_activity is None or self.product_activity is None:
+            return
+        if self.desired_time_sampling_mode not in {"local_kernel", "empirical_exact"}:
+            self.customer_kernel_bandwidth_result = {}
+            self.product_kernel_bandwidth_result = {}
+            self.customer_local_kernel_state = {}
+            self.product_local_kernel_state = {}
+            return
+        print("[fit] estimating temporal kernel bandwidths", flush=True)
+        self.customer_kernel_bandwidth_result = self._estimate_kernel_bandwidth_for_activity(self.customer_activity)
+        self.product_kernel_bandwidth_result = self._estimate_kernel_bandwidth_for_activity(self.product_activity)
+        self.customer_local_kernel_state = self._local_kernel_state(self.customer_activity, self.customer_kernel_bandwidth_result)
+        self.product_local_kernel_state = self._local_kernel_state(self.product_activity, self.product_kernel_bandwidth_result)
+
+    def _estimate_kernel_bandwidth_for_activity(self, activity: FastTemporalActivityModel) -> Dict[str, Any]:
+        state = activity.get_fast_sampling_state()
+        return estimate_temporal_kernel_bandwidths(
+            entity_offsets=state["empirical_offsets"],
+            entity_time_values=state["empirical_time_values"],
+            entity_blocks=state["entity_block"],
+            num_blocks=max(len(activity.entities_by_block), int(max(activity.entities_by_block.keys())) + 1 if activity.entities_by_block else 1),
+            default_bandwidth=self.kernel_fixed_bandwidth_days,
+            bandwidth_mode=self.kernel_bandwidth_mode,
+            bandwidth_scale=self.kernel_bandwidth_scale,
+            min_bandwidth=self.kernel_min_bandwidth_days,
+            max_bandwidth=self.kernel_max_bandwidth_days,
+        )
+
+    def _local_kernel_state(self, activity: FastTemporalActivityModel, bandwidth_result: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "num_time_codes": int(len(activity.time_buckets)),
+            "bandwidth_mode": self.kernel_bandwidth_mode,
+            "bandwidth_scale": float(self.kernel_bandwidth_scale),
+            "min_bandwidth": float(self.kernel_min_bandwidth_days),
+            "max_bandwidth": self.kernel_max_bandwidth_days,
+            "kernel": self.kernel_type,
+            "fallback_mode": "block",
+            "entity_bandwidths": bandwidth_result.get("entity_bandwidths"),
+            "block_bandwidths": bandwidth_result.get("block_bandwidths"),
+            "global_bandwidth": float(bandwidth_result.get("global_bandwidth", self.kernel_fixed_bandwidth_days)),
+        }
+
     def _manual_alpha_result(self, alpha: float, num_entities: int, objective: str, fallback_used: bool) -> Dict[str, Any]:
         return {
             "best_alpha": float(alpha),
@@ -521,7 +619,9 @@ class TimeBiasedBlockStubMatchingGenerator:
         }
 
     def _alpha_selection_objective(self) -> str:
-        if self.temporal_shrinkage_mode == "empirical_bayes":
+        if self.desired_time_sampling_mode in {"local_kernel", "empirical_exact"}:
+            return f"{self.desired_time_sampling_mode}_alpha_not_used"
+        if self.desired_time_sampling_mode == "empirical_bayes":
             return "heldout_temporal_log_likelihood"
         if self.temporal_shrinkage_mode == "median_degree":
             return "median_entity_degree"
@@ -537,6 +637,26 @@ class TimeBiasedBlockStubMatchingGenerator:
             and float(self.lambda_real_pair_overlap) == 1.0
             and float(self.lambda_exact_event_overlap) == 3.0
         )
+
+    def _kernel_diagnostics(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        return dict(result.get("diagnostics", {})) if result else {}
+
+    def _kernel_global_bandwidth(self, result: Dict[str, Any]) -> Optional[float]:
+        return None if not result else float(result.get("global_bandwidth", 0.0))
+
+    def _kernel_block_bandwidths(self, result: Dict[str, Any]) -> Dict[str, float]:
+        if not result:
+            return {}
+        diagnostics = result.get("diagnostics", {})
+        values = diagnostics.get("block_bandwidths", {})
+        return {str(key): float(value) for key, value in values.items()}
+
+    def _kernel_entity_summary(self, result: Dict[str, Any]) -> Dict[str, float]:
+        if not result:
+            return {}
+        diagnostics = result.get("diagnostics", {})
+        summary = diagnostics.get("entity_bandwidth_summary", {})
+        return {str(key): float(value) for key, value in summary.items()}
 
     def _build_real_overlap_key_sets(self, frame: pd.DataFrame) -> None:
         if self.customer_activity is None or self.product_activity is None:
