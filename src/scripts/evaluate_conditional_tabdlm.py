@@ -17,7 +17,7 @@ from attribute_generation.conditional_tabdlm.schema import load_config  # noqa: 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate Conditional TABDLM attributes.")
-    parser.add_argument("--config", default="configs/attribute_generation/conditional_tabdlm_rel_amazon_exp1_1.yaml")
+    parser.add_argument("--config", default="configs/attribute_generation/conditional_tabdlm_rel_amazon_exp1_2.yaml")
     parser.add_argument("--real-reviews", default=None)
     parser.add_argument("--synthetic-reviews", default=None)
     parser.add_argument("--condition-cols", nargs="*", default=None)

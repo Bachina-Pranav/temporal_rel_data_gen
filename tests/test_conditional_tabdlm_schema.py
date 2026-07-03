@@ -11,6 +11,8 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from attribute_generation.conditional_tabdlm.schema import (  # noqa: E402
     ConditionalTABDLMSchema,
+    FORBIDDEN_ENGINEERED_FEATURES,
+    load_config,
 )
 
 
@@ -38,3 +40,11 @@ def test_schema_keeps_condition_and_target_roles_separate():
     assert schema.condition_columns == ("customer_id", "product_id", "review_time")
     assert schema.target_columns == ("rating", "verified", "summary")
 
+
+def test_v1_2_config_does_not_require_engineered_features():
+    config = load_config(ROOT / "configs/attribute_generation/conditional_tabdlm_rel_amazon_exp1_2.yaml")
+    serialized_inputs = set(config.schema.condition_columns)
+    serialized_inputs.update(config.schema.target_columns)
+    serialized_inputs.update(config.schema.auxiliary_categorical_targets)
+
+    assert not FORBIDDEN_ENGINEERED_FEATURES.intersection(serialized_inputs)

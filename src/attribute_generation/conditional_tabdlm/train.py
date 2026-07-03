@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader
 
 from .dataset import (
     ConditionalTABDLMDataset,
+    auxiliary_target_values,
     load_category_vocabs,
     load_prepared_tables,
     load_text_tokenizer,
@@ -22,7 +23,7 @@ from .dataset import (
 from .model import ConditionalTABDLM
 from .schema import ConditionalTABDLMConfig
 from .tokenization import CategoryVocab, SimpleTextTokenizer
-from .utils import ensure_dir, save_yaml, set_seed
+from .utils import ensure_dir, save_json, save_yaml, set_seed
 
 
 try:
@@ -106,6 +107,16 @@ def train_from_config(config: ConditionalTABDLMConfig, device: str | None = None
         weight_decay=float(training.get("weight_decay", 0.01)),
     )
     loss_weights = dict(config.raw.get("loss_weights", {}))
+    summary_token_loss_weights = dict(config.raw.get("summary_token_loss_weights", {}))
+    metadata_dir = ensure_dir(output_dir / "metadata")
+    length_class_weights = compute_summary_length_class_weights(
+        train_frame,
+        config,
+        categorical_vocabs,
+        text_tokenizer,
+    )
+    if length_class_weights is not None:
+        save_json(length_class_weights["json"], metadata_dir / "summary_length_bucket_weights.json")
     use_amp = bool(training.get("mixed_precision", True)) and device.startswith("cuda")
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     log_path = output_dir / "train_log.jsonl"
@@ -121,8 +132,41 @@ def train_from_config(config: ConditionalTABDLMConfig, device: str | None = None
     epochs_without_improvement = 0
     best_epoch = 0
     for epoch in range(1, epochs + 1):
-        train_metrics = run_epoch(model, train_loader, optimizer, scaler, device, use_amp, loss_weights)
-        valid_metrics = run_epoch(model, valid_loader, None, scaler, device, use_amp, loss_weights)
+        train_metrics = run_epoch(
+            model,
+            train_loader,
+            optimizer,
+            scaler,
+            device,
+            use_amp,
+            loss_weights,
+            text_tokenizer,
+            summary_token_loss_weights,
+            length_class_weights["tensor"].to(device) if length_class_weights is not None else None,
+        )
+        valid_metrics = run_epoch(
+            model,
+            valid_loader,
+            None,
+            scaler,
+            device,
+            use_amp,
+            loss_weights,
+            text_tokenizer,
+            summary_token_loss_weights,
+            length_class_weights["tensor"].to(device) if length_class_weights is not None else None,
+        )
+        length_calibration = compute_summary_length_calibration(
+            model,
+            valid_loader,
+            config,
+            categorical_vocabs,
+            text_tokenizer,
+            device,
+            use_amp,
+        )
+        if length_calibration is not None:
+            save_json(length_calibration, metadata_dir / "summary_length_calibration.json")
         current_valid = float(valid_metrics["total_loss"])
         improved = current_valid < (best_valid - early_stopping_min_delta)
         row = {
@@ -145,6 +189,8 @@ def train_from_config(config: ConditionalTABDLMConfig, device: str | None = None
             text_tokenizer,
             epoch,
             valid_metrics,
+            length_calibration=length_calibration,
+            summary_length_bucket_weights=length_class_weights["json"] if length_class_weights is not None else None,
         )
         if improved:
             best_valid = current_valid
@@ -158,6 +204,8 @@ def train_from_config(config: ConditionalTABDLMConfig, device: str | None = None
                 text_tokenizer,
                 epoch,
                 valid_metrics,
+                length_calibration=length_calibration,
+                summary_length_bucket_weights=length_class_weights["json"] if length_class_weights is not None else None,
             )
         else:
             epochs_without_improvement += 1
@@ -205,11 +253,14 @@ def run_epoch(
     device: str,
     use_amp: bool,
     loss_weights: dict[str, float] | None = None,
+    text_tokenizer: SimpleTextTokenizer | None = None,
+    summary_token_loss_weights: dict[str, float] | None = None,
+    summary_length_class_weights: torch.Tensor | None = None,
 ) -> dict[str, float]:
     training = optimizer is not None
     model.train(training)
     totals: dict[str, float] = {}
-    counts: dict[str, int] = {}
+    counts: dict[str, float] = {}
     corrects: dict[str, int] = {}
     iterator = loader
     if tqdm is not None:
@@ -227,7 +278,15 @@ def run_epoch(
                 text_attention=batch["text_attention"],
                 diffusion_t=batch["diffusion_t"],
             )
-            loss, component = denoising_loss(logits, batch, model.schema, loss_weights or {})
+            loss, component = denoising_loss(
+                logits,
+                batch,
+                model.schema,
+                loss_weights or {},
+                text_tokenizer=text_tokenizer,
+                summary_token_loss_weights=summary_token_loss_weights or {},
+                summary_length_class_weights=summary_length_class_weights,
+            )
         if training:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -236,17 +295,18 @@ def run_epoch(
             scaler.update()
         for key, stats in component.items():
             totals[key] = totals.get(key, 0.0) + float(stats["loss_sum"])
-            counts[key] = counts.get(key, 0) + int(stats["count"])
+            counts[key] = counts.get(key, 0.0) + float(stats["count"])
             corrects[key] = corrects.get(key, 0) + int(stats.get("correct", 0))
 
     metrics = {}
     total_loss = 0.0
     for key in sorted(totals):
-        count = max(counts.get(key, 0), 1)
+        count = max(float(counts.get(key, 0.0)), 1.0)
         metric_key = component_metric_name(key)
         component_loss = float(totals[key] / count)
         metrics[f"{metric_key}_loss"] = component_loss
-        total_loss += float(component_weight(key, loss_weights or {})) * component_loss
+        if is_main_loss_component(key, model.schema):
+            total_loss += float(component_weight(key, loss_weights or {})) * component_loss
         if key in model.schema.model_categorical_targets:
             metrics[f"{metric_key}_accuracy"] = float(corrects.get(key, 0) / count)
     metrics["total_loss"] = float(total_loss)
@@ -258,8 +318,19 @@ def denoising_loss(
     batch: dict[str, Any],
     schema,
     loss_weights: dict[str, float] | None = None,
+    text_tokenizer: SimpleTextTokenizer | None = None,
+    summary_token_loss_weights: dict[str, float] | None = None,
+    summary_length_class_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, dict[str, float | int]]]:
-    return _denoising_loss_impl(logits, batch, schema, loss_weights or {})
+    return _denoising_loss_impl(
+        logits,
+        batch,
+        schema,
+        loss_weights or {},
+        text_tokenizer=text_tokenizer,
+        summary_token_loss_weights=summary_token_loss_weights or {},
+        summary_length_class_weights=summary_length_class_weights,
+    )
 
 
 def _denoising_loss_impl(
@@ -267,6 +338,9 @@ def _denoising_loss_impl(
     batch: dict[str, Any],
     schema,
     loss_weights: dict[str, float],
+    text_tokenizer: SimpleTextTokenizer | None = None,
+    summary_token_loss_weights: dict[str, float] | None = None,
+    summary_length_class_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, dict[str, float | int]]]:
     losses: list[torch.Tensor] = []
     component: dict[str, dict[str, float | int]] = {}
@@ -277,7 +351,14 @@ def _denoising_loss_impl(
         count = int(mask.sum().detach().cpu())
         if count == 0:
             continue
-        loss_sum = F.cross_entropy(logits["categorical"][column], labels, ignore_index=-100, reduction="sum")
+        class_weights = summary_length_class_weights if column == "summary_length_bucket" else None
+        loss_sum = F.cross_entropy(
+            logits["categorical"][column],
+            labels,
+            ignore_index=-100,
+            reduction="sum",
+            weight=class_weights,
+        )
         mean_loss = loss_sum / max(count, 1)
         losses.append(float(component_weight(column, loss_weights)) * mean_loss)
         pred = logits["categorical"][column].argmax(dim=-1)
@@ -289,15 +370,27 @@ def _denoising_loss_impl(
         count = int((labels != -100).sum().detach().cpu())
         if count == 0:
             continue
-        loss_sum = F.cross_entropy(
-            logits["text"][column].reshape(-1, logits["text"][column].shape[-1]),
-            labels.reshape(-1),
-            ignore_index=-100,
-            reduction="sum",
-        )
-        mean_loss = loss_sum / max(count, 1)
+        if text_tokenizer is not None:
+            loss_sum, denom, subcomponents = weighted_summary_token_loss(
+                logits["text"][column],
+                labels,
+                text_tokenizer,
+                summary_token_loss_weights or {},
+            )
+            count = int(max(float(denom.detach().cpu()), 1.0))
+            for subkey, stats in subcomponents.items():
+                component[f"{column}_{subkey}_component"] = stats
+        else:
+            loss_sum = F.cross_entropy(
+                logits["text"][column].reshape(-1, logits["text"][column].shape[-1]),
+                labels.reshape(-1),
+                ignore_index=-100,
+                reduction="sum",
+            )
+            denom = torch.tensor(float(count), device=loss_sum.device)
+        mean_loss = loss_sum / denom.clamp_min(1.0)
         losses.append(float(component_weight(column, loss_weights)) * mean_loss)
-        component[column] = {"loss_sum": float(loss_sum.detach().cpu()), "count": count}
+        component[column] = {"loss_sum": float(loss_sum.detach().cpu()), "count": float(max(float(denom.detach().cpu()), 1.0))}
 
     if not losses:
         zero = batch["foreign_key_ids"].float().sum() * 0.0
@@ -306,12 +399,212 @@ def _denoising_loss_impl(
 
 
 def component_metric_name(column: str) -> str:
-    return "summary_length" if column == "summary_length_bucket" else str(column)
+    if column == "summary_length_bucket":
+        return "summary_length"
+    for suffix in ["_pad_component", "_eos_component", "_content_component"]:
+        if str(column).endswith(suffix):
+            return str(column)
+    return str(column)
 
 
 def component_weight(column: str, loss_weights: dict[str, float]) -> float:
     key = component_metric_name(column)
     return float(loss_weights.get(key, loss_weights.get(column, 1.0)))
+
+
+def is_main_loss_component(column: str, schema) -> bool:
+    return column in set(schema.model_categorical_targets + schema.text_targets)
+
+
+def summary_token_weights(
+    labels: torch.Tensor,
+    tokenizer: SimpleTextTokenizer,
+    weights_config: dict[str, float] | None = None,
+) -> torch.Tensor:
+    weights_config = weights_config or {}
+    weights = torch.ones_like(labels, dtype=torch.float32)
+    weights[labels == -100] = 0.0
+    weights[labels == tokenizer.pad_id] = float(weights_config.get("pad", 0.15))
+    weights[labels == tokenizer.eos_id] = float(weights_config.get("eos", 2.0))
+    weights[labels == tokenizer.bos_id] = float(weights_config.get("bos", 0.0))
+    weights[labels == tokenizer.unk_id] = float(weights_config.get("unk", 1.0))
+    special = {
+        tokenizer.pad_id,
+        tokenizer.eos_id,
+        tokenizer.bos_id,
+        tokenizer.mask_id,
+        tokenizer.unk_id,
+        -100,
+    }
+    content_mask = torch.ones_like(labels, dtype=torch.bool)
+    for token_id in special:
+        content_mask &= labels != int(token_id)
+    weights[content_mask] = float(weights_config.get("content", 1.0))
+    return weights
+
+
+def weighted_summary_token_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    tokenizer: SimpleTextTokenizer,
+    weights_config: dict[str, float] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, dict[str, float | int]]]:
+    ce = F.cross_entropy(
+        logits.reshape(-1, logits.shape[-1]),
+        labels.reshape(-1),
+        ignore_index=-100,
+        reduction="none",
+    ).view_as(labels)
+    weights = summary_token_weights(labels, tokenizer, weights_config)
+    loss_sum = (ce * weights).sum()
+    denom = weights.sum().clamp_min(1.0)
+    subcomponents: dict[str, dict[str, float | int]] = {}
+    masks = {
+        "pad": labels == tokenizer.pad_id,
+        "eos": labels == tokenizer.eos_id,
+        "content": (labels != -100)
+        & (labels != tokenizer.pad_id)
+        & (labels != tokenizer.eos_id)
+        & (labels != tokenizer.bos_id)
+        & (labels != tokenizer.mask_id),
+    }
+    for name, mask in masks.items():
+        weighted = ce[mask] * weights[mask]
+        subcomponents[name] = {
+            "loss_sum": float(weighted.sum().detach().cpu()),
+            "count": int(mask.sum().detach().cpu()),
+        }
+    return loss_sum, denom, subcomponents
+
+
+def compute_summary_length_class_weights(
+    train_frame: pd.DataFrame,
+    config: ConditionalTABDLMConfig,
+    categorical_vocabs: dict[str, CategoryVocab],
+    tokenizer: SimpleTextTokenizer,
+) -> dict[str, Any] | None:
+    if "summary_length_bucket" not in config.schema.auxiliary_categorical_targets:
+        return None
+    length_cfg = config.raw.get("summary_length_loss", {})
+    if not bool(length_cfg.get("class_balanced", False)):
+        return None
+    vocab = categorical_vocabs["summary_length_bucket"]
+    values = auxiliary_target_values(train_frame, config.schema, tokenizer, "summary_length_bucket")
+    ids = np.asarray([vocab.encode(value) for value in values], dtype=np.int64)
+    counts = np.bincount(ids, minlength=vocab.size).astype(float)
+    total = max(float(counts.sum()), 1.0)
+    freqs = counts / total
+    power = float(length_cfg.get("class_weight_power", 0.5))
+    raw = np.zeros_like(freqs)
+    nonzero = freqs > 0
+    raw[nonzero] = np.power(1.0 / freqs[nonzero], power)
+    if raw[nonzero].size:
+        raw[nonzero] = raw[nonzero] / raw[nonzero].mean()
+    raw[~nonzero] = float(length_cfg.get("max_class_weight", 5.0))
+    weights = np.clip(
+        raw,
+        float(length_cfg.get("min_class_weight", 0.5)),
+        float(length_cfg.get("max_class_weight", 5.0)),
+    )
+    id_to_token = vocab.id_to_token
+    payload = {
+        "class_balanced": True,
+        "class_weight_power": power,
+        "min_class_weight": float(length_cfg.get("min_class_weight", 0.5)),
+        "max_class_weight": float(length_cfg.get("max_class_weight", 5.0)),
+        "counts": {id_to_token[idx]: int(counts[idx]) for idx in range(vocab.size)},
+        "frequencies": {id_to_token[idx]: float(freqs[idx]) for idx in range(vocab.size)},
+        "weights": {id_to_token[idx]: float(weights[idx]) for idx in range(vocab.size)},
+    }
+    return {
+        "tensor": torch.tensor(weights, dtype=torch.float32),
+        "json": payload,
+    }
+
+
+@torch.no_grad()
+def compute_summary_length_calibration(
+    model: ConditionalTABDLM,
+    loader: DataLoader,
+    config: ConditionalTABDLMConfig,
+    categorical_vocabs: dict[str, CategoryVocab],
+    tokenizer: SimpleTextTokenizer,
+    device: str,
+    use_amp: bool,
+) -> dict[str, Any] | None:
+    if "summary_length_bucket" not in config.schema.model_categorical_targets:
+        return None
+    length_cfg = config.raw.get("summary_length", {})
+    if not bool(length_cfg.get("calibrate_length_bucket_sampling", False)):
+        return None
+    length_idx = config.schema.model_categorical_targets.index("summary_length_bucket")
+    vocab = categorical_vocabs["summary_length_bucket"]
+    real_counts = torch.zeros(vocab.size, dtype=torch.float64, device=device)
+    model_probs = torch.zeros(vocab.size, dtype=torch.float64, device=device)
+    total = 0
+    was_training = model.training
+    model.eval()
+    for batch in loader:
+        batch = move_batch_to_device(batch, device)
+        cat_input = initial_masked_categorical_inputs(batch["categorical_clean_ids"], config.schema, categorical_vocabs)
+        text_input, text_attention = initial_masked_text_inputs(batch["text_clean_ids"], config.schema, tokenizer)
+        with torch.cuda.amp.autocast(enabled=use_amp):
+            logits = model(
+                foreign_key_ids=batch["foreign_key_ids"],
+                datetime_values=batch["datetime_values"],
+                categorical_input_ids=cat_input,
+                text_input_ids=text_input,
+                text_attention=text_attention,
+                diffusion_t=torch.ones(batch["foreign_key_ids"].shape[0], dtype=torch.float32, device=device),
+            )
+        labels = batch["categorical_clean_ids"][:, length_idx]
+        real_counts += torch.bincount(labels, minlength=vocab.size).to(device=device, dtype=torch.float64)
+        model_probs += torch.softmax(logits["categorical"]["summary_length_bucket"].float(), dim=-1).sum(dim=0).to(torch.float64)
+        total += int(labels.numel())
+    if was_training:
+        model.train()
+    if total <= 0:
+        return None
+    eps = float(length_cfg.get("calibration_epsilon", 1e-6))
+    real_dist = (real_counts / max(float(real_counts.sum().item()), 1.0)).detach().cpu().numpy()
+    model_dist = (model_probs / max(float(total), 1.0)).detach().cpu().numpy()
+    ratio = real_dist / np.clip(model_dist, eps, None)
+    strength = float(length_cfg.get("calibration_strength", 1.0))
+    id_to_token = vocab.id_to_token
+    return {
+        "real_valid_bucket_distribution": {id_to_token[idx]: float(real_dist[idx]) for idx in range(vocab.size)},
+        "model_valid_bucket_distribution": {id_to_token[idx]: float(model_dist[idx]) for idx in range(vocab.size)},
+        "calibration_ratio": {id_to_token[idx]: float(ratio[idx]) for idx in range(vocab.size)},
+        "calibration_strength": strength,
+        "calibration_epsilon": eps,
+    }
+
+
+def initial_masked_categorical_inputs(
+    clean_ids: torch.Tensor,
+    schema,
+    categorical_vocabs: dict[str, CategoryVocab],
+) -> torch.Tensor:
+    masked = clean_ids.clone()
+    for idx, column in enumerate(schema.model_categorical_targets):
+        masked[:, idx] = categorical_vocabs[column].mask_id
+    return masked
+
+
+def initial_masked_text_inputs(
+    clean_text_ids: dict[str, torch.Tensor],
+    schema,
+    tokenizer: SimpleTextTokenizer,
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    text_input: dict[str, torch.Tensor] = {}
+    text_attention: dict[str, torch.Tensor] = {}
+    for column in schema.text_targets:
+        clean = clean_text_ids[column]
+        values = torch.full_like(clean, tokenizer.mask_id)
+        values[:, 0] = tokenizer.bos_id
+        text_input[column] = values
+        text_attention[column] = torch.ones_like(clean, dtype=torch.long)
+    return text_input, text_attention
 
 
 def save_checkpoint(
@@ -322,6 +615,8 @@ def save_checkpoint(
     text_tokenizer: SimpleTextTokenizer,
     epoch: int,
     valid_metrics: dict[str, float],
+    length_calibration: dict[str, Any] | None = None,
+    summary_length_bucket_weights: dict[str, Any] | None = None,
 ) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -335,6 +630,8 @@ def save_checkpoint(
             "tokenizer_metadata": text_tokenizer.to_dict(),
             "epoch": int(epoch),
             "valid_metrics": valid_metrics,
+            "summary_length_calibration": length_calibration,
+            "summary_length_bucket_weights": summary_length_bucket_weights,
         },
         path,
     )

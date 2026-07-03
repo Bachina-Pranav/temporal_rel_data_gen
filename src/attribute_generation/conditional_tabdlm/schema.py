@@ -34,7 +34,7 @@ class ConditionalTABDLMSchema:
     summary_length_buckets: dict[str, tuple[int, int]] = field(default_factory=dict)
     summary_length_enabled: bool = False
     use_length_bucket_in_sampling: bool = False
-    force_eos_after_sampled_length: bool = False
+    force_eos_after_sampled_length: bool | str = False
     force_pad_after_eos: bool = False
 
     @property
@@ -130,7 +130,7 @@ class ConditionalTABDLMSchema:
             summary_length_buckets=parsed_buckets,
             summary_length_enabled=bool(summary_length_cfg.get("enabled", False)),
             use_length_bucket_in_sampling=bool(summary_length_cfg.get("use_length_bucket_in_sampling", False)),
-            force_eos_after_sampled_length=bool(summary_length_cfg.get("force_eos_after_sampled_length", False)),
+            force_eos_after_sampled_length=summary_length_cfg.get("force_eos_after_sampled_length", False),
             force_pad_after_eos=bool(summary_length_cfg.get("force_pad_after_eos", False)),
         )
         schema.validate()

@@ -282,8 +282,13 @@ def collate_and_mask(
         "foreign_key_ids": foreign_key_ids,
         "datetime_values": datetime_values,
         "categorical_input_ids": categorical_input,
+        "categorical_clean_ids": categorical_clean,
         "categorical_labels": categorical_labels,
         "text_input_ids": text_input,
+        "text_clean_ids": {
+            column: torch.stack([sample["text_ids"][column] for sample in samples], dim=0)
+            for column in schema.text_targets
+        },
         "text_labels": text_labels,
         "text_attention": text_attention,
         "diffusion_t": timesteps,

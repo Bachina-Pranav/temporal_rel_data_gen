@@ -190,6 +190,11 @@ def summary_length_diagnostics(
         "generated_to_max_length_rate": float((syn_len >= max_content).mean()) if len(syn_len) else None,
     }
     diagnostics.update(debug_eos_diagnostics(debug_examples_path))
+    if debug_examples_path is not None:
+        summary_metrics_path = Path(debug_examples_path).parent / "summary_length_decoding_metrics.json"
+        if summary_metrics_path.exists():
+            with summary_metrics_path.open() as handle:
+                diagnostics.update(json.load(handle))
     return diagnostics
 
 
@@ -506,6 +511,12 @@ def longest_common_subsequence(left: list[str], right: list[str]) -> int:
 
 def write_report(metrics: dict[str, Any], path: str | Path) -> None:
     lines = ["# Conditional TABDLM Evaluation", ""]
+    warnings = evaluation_warnings(metrics)
+    if warnings:
+        lines.append("## Warnings")
+        for warning in warnings:
+            lines.append(f"- {warning}")
+        lines.append("")
     for section, values in metrics.items():
         lines.append(f"## {section}")
         if isinstance(values, dict):
@@ -524,3 +535,23 @@ def write_report(metrics: dict[str, Any], path: str | Path) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines))
+
+
+def evaluation_warnings(metrics: dict[str, Any]) -> list[str]:
+    warnings_out: list[str] = []
+    privacy = metrics.get("text_privacy", {})
+    text = metrics.get("text", {})
+    length = metrics.get("length_diagnostics", {})
+    exact_overlap = privacy.get("exact_summary_train_overlap_rate")
+    unique_rate = text.get("unique_summary_rate")
+    mean_length = length.get("summary_length_mean_synthetic")
+    length_ks = length.get("summary_length_ks")
+    if exact_overlap is not None and exact_overlap > 0.2:
+        warnings_out.append(f"exact_summary_train_overlap_rate is high: {exact_overlap:.4g} > 0.2")
+    if unique_rate is not None and unique_rate < 0.5:
+        warnings_out.append(f"unique_summary_rate is low: {unique_rate:.4g} < 0.5")
+    if mean_length is not None and not (3.0 <= mean_length <= 6.0):
+        warnings_out.append(f"summary_length_mean_synthetic is outside [3.0, 6.0]: {mean_length:.4g}")
+    if length_ks is not None and length_ks > 0.35:
+        warnings_out.append(f"summary_length_ks is high: {length_ks:.4g} > 0.35")
+    return warnings_out

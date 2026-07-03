@@ -28,6 +28,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--debug-write-aux-targets", action="store_true")
+    parser.add_argument("--disable-length-calibration", action="store_true")
     return parser.parse_args()
 
 
@@ -48,6 +49,7 @@ def main() -> None:
         seed=args.seed,
         synthetic_spine_path=args.synthetic_spine,
         debug_write_aux_targets=args.debug_write_aux_targets,
+        disable_length_calibration=args.disable_length_calibration,
     )
 
 
