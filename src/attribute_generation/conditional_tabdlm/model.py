@@ -45,6 +45,8 @@ class ConditionalTABDLM(nn.Module):
         num_heads: int = 6,
         dropout: float = 0.1,
         condition_dim: int = 256,
+        use_graph_context: bool = False,
+        graph_context_dim: int = 256,
     ):
         super().__init__()
         self.schema = schema
@@ -56,6 +58,8 @@ class ConditionalTABDLM(nn.Module):
         self.num_heads = int(num_heads)
         self.dropout = float(dropout)
         self.condition_dim = int(condition_dim)
+        self.use_graph_context = bool(use_graph_context)
+        self.graph_context_dim = int(graph_context_dim)
         self.text_vocab_size = int(text_tokenizer.vocab_size)
         self.text_pad_id = int(text_tokenizer.pad_id)
         self.categorical_vocab_sizes = {
@@ -73,9 +77,17 @@ class ConditionalTABDLM(nn.Module):
             [nn.Linear(self.datetime_embedding_dim, self.condition_dim) for _ in schema.datetime_columns]
         )
         self.condition_column_embedding = nn.Embedding(
-            max(1, len(schema.condition_columns)), self.condition_dim
+            max(1, len(schema.condition_columns) + int(self.use_graph_context)), self.condition_dim
         )
-        self.condition_type_embedding = nn.Embedding(2, self.condition_dim)
+        self.condition_type_embedding = nn.Embedding(3, self.condition_dim)
+        if self.use_graph_context:
+            self.graph_context_projector = nn.Sequential(
+                nn.Linear(self.graph_context_dim, self.condition_dim),
+                nn.GELU(),
+                nn.LayerNorm(self.condition_dim),
+            )
+        else:
+            self.graph_context_projector = None
         self.condition_norm = nn.LayerNorm(self.condition_dim)
         self.condition_to_hidden = nn.Sequential(
             nn.Linear(self.condition_dim, self.hidden_dim),
@@ -133,6 +145,7 @@ class ConditionalTABDLM(nn.Module):
         self,
         foreign_key_ids: torch.Tensor,
         datetime_values: torch.Tensor,
+        graph_context: torch.Tensor | None = None,
     ) -> torch.Tensor:
         condition_tokens: list[torch.Tensor] = []
         token_index = 0
@@ -147,6 +160,17 @@ class ConditionalTABDLM(nn.Module):
             token = token + self.condition_column_embedding.weight[token_index] + self.condition_type_embedding.weight[1]
             condition_tokens.append(token)
             token_index += 1
+        if self.use_graph_context:
+            if graph_context is None:
+                graph_context = torch.zeros(
+                    foreign_key_ids.shape[0],
+                    self.graph_context_dim,
+                    dtype=torch.float32,
+                    device=foreign_key_ids.device,
+                )
+            token = self.graph_context_projector(graph_context.float())  # type: ignore[operator]
+            token = token + self.condition_column_embedding.weight[token_index] + self.condition_type_embedding.weight[2]
+            condition_tokens.append(token)
         stacked = torch.stack(condition_tokens, dim=1)
         return self.condition_to_hidden(self.condition_norm(stacked.mean(dim=1)))
 
@@ -158,12 +182,13 @@ class ConditionalTABDLM(nn.Module):
         text_input_ids: dict[str, torch.Tensor],
         text_attention: dict[str, torch.Tensor] | None = None,
         diffusion_t: torch.Tensor | None = None,
+        graph_context: torch.Tensor | None = None,
     ) -> dict[str, Any]:
         batch_size = foreign_key_ids.shape[0]
         device = foreign_key_ids.device
         if diffusion_t is None:
             diffusion_t = torch.ones(batch_size, dtype=torch.float32, device=device)
-        condition = self.encode_conditions(foreign_key_ids, datetime_values)
+        condition = self.encode_conditions(foreign_key_ids, datetime_values, graph_context=graph_context)
         time_bias = self.diffusion_time(diffusion_t.float().view(-1, 1))
         shared_bias = (condition + time_bias).unsqueeze(1)
 
@@ -222,6 +247,16 @@ class ConditionalTABDLM(nn.Module):
             "num_heads": self.num_heads,
             "dropout": self.dropout,
             "condition_dim": self.condition_dim,
+            "use_graph_context": self.use_graph_context,
+            "graph_context_dim": self.graph_context_dim,
             "text_vocab_size": self.text_vocab_size,
             "categorical_vocab_sizes": dict(self.categorical_vocab_sizes),
         }
+
+
+class GraphConditionedConditionalTABDLM(ConditionalTABDLM):
+    """Conditional TABDLM with an explicit graph context condition path."""
+
+    def __init__(self, *args: Any, **kwargs: Any):
+        kwargs["use_graph_context"] = True
+        super().__init__(*args, **kwargs)

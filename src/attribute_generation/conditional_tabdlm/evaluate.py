@@ -11,6 +11,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from .graph_schema import graph_conditioning_enabled, graph_metadata
 from .schema import ConditionalTABDLMConfig
 from .tokenization import normalize_text, summary_length_bucket_name
 from .utils import (
@@ -42,6 +43,24 @@ def evaluate_from_config(
     synthetic = pd.read_csv(synthetic_reviews_path)
     debug_examples_path = synthetic_reviews_path.parent / "debug" / "generated_examples.jsonl"
     metrics = evaluate_frames(real, synthetic, config, debug_examples_path=debug_examples_path)
+    sample_metadata_path = synthetic_reviews_path.parent / "sample_metadata.json"
+    if sample_metadata_path.exists():
+        with sample_metadata_path.open() as handle:
+            sample_metadata = json.load(handle)
+        if "graph_conditioning" not in metrics:
+            metrics["graph_conditioning"] = {}
+        for key in [
+            "uses_graph_context",
+            "graph_conditioning_mode",
+            "temporal_filter_enabled",
+            "temporal_filter_mode",
+            "graph_uses_future_events",
+            "graph_uses_target_attributes",
+            "real_graph_used_at_sampling",
+            "synthetic_graph_history_source",
+        ]:
+            if key in sample_metadata:
+                metrics["graph_conditioning"][key] = sample_metadata[key]
     save_json(metrics, output_path)
     write_report(metrics, output_dir / "eval_report.md")
     print(f"Wrote {output_path}")
@@ -78,6 +97,8 @@ def evaluate_frames(
         "text_consistency": {},
         "conditional_fidelity": {},
     }
+    if graph_conditioning_enabled(config.raw):
+        metrics["graph_conditioning"] = graph_metadata(config.raw, real_graph_used_at_sampling=False)
     if rating_col:
         metrics["marginal_categorical"].update(categorical_distribution_metrics(real, synthetic, rating_col, numeric=True))
     if verified_col:

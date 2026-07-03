@@ -10,10 +10,13 @@ from typing import Any
 import pandas as pd
 import torch
 
+from .graph_dataset import build_temporal_history_index, write_temporal_graph_metadata
+from .graph_encoder import TemporalStructureOnlyGraphEncoder
+from .graph_schema import graph_conditioning_enabled, graph_metadata
 from .model import ConditionalTABDLM
 from .schema import ConditionalTABDLMConfig, ConditionalTABDLMSchema
 from .tokenization import CategoryVocab, SimpleTextTokenizer, sample_length_from_bucket, stable_hash_bucket
-from .train import build_model, resolve_device
+from .train import build_graph_encoder, build_model, resolve_device
 from .utils import ensure_dir, jsonable, set_seed
 
 
@@ -48,12 +51,30 @@ def sample_from_config(
     device = resolve_device(device or str(sampling.get("device", "auto")))
 
     set_seed(seed)
-    model, ckpt_config, vocabs, tokenizer = load_model_checkpoint(checkpoint_path, device)
+    model, ckpt_config, vocabs, tokenizer, graph_encoder = load_model_checkpoint(
+        checkpoint_path,
+        device,
+        include_graph=True,
+    )
     spine_path = Path(synthetic_spine_path) if synthetic_spine_path else config.synthetic_spine_path
     spine = pd.read_csv(spine_path)
     validate_spine(spine, ckpt_config.schema)
     if num_rows not in (None, "all"):
         spine = spine.head(int(num_rows)).copy()
+    spine = spine.reset_index(drop=True)
+    graph_history_index = None
+    if graph_encoder is not None or graph_conditioning_enabled(ckpt_config.raw):
+        graph_encoder = graph_encoder or build_graph_encoder(ckpt_config).to(device)
+        graph_encoder.eval()
+        graph_history_index = build_temporal_history_index(spine, ckpt_config, seed=seed)
+        write_temporal_graph_metadata(
+            spine,
+            ckpt_config,
+            output_path.parent / "graph",
+            source="synthetic_spine",
+            seed=seed,
+            real_graph_used_at_sampling=False,
+        )
     attrs = sample_attributes(
         model,
         ckpt_config.schema,
@@ -67,6 +88,8 @@ def sample_from_config(
         device=device,
         seed=seed,
         disable_length_calibration=disable_length_calibration,
+        graph_encoder=graph_encoder,
+        graph_history_index=graph_history_index,
     )
     output = spine.loc[:, list(ckpt_config.schema.condition_columns)].copy()
     for column in ckpt_config.schema.categorical_targets:
@@ -94,6 +117,14 @@ def sample_from_config(
         "force_pad_after_eos": bool(ckpt_config.schema.force_pad_after_eos),
         "length_calibration_disabled": bool(disable_length_calibration),
     }
+    if graph_encoder is not None:
+        metadata.update(graph_metadata(ckpt_config.raw, real_graph_used_at_sampling=False))
+        metadata.update(
+            {
+                "synthetic_graph_history_source": "synthetic_spine",
+                "graph_history_rows": int(len(spine)),
+            }
+        )
     with (output_path.parent / "sample_metadata.json").open("w") as handle:
         json.dump(metadata, handle, indent=2, sort_keys=True)
         handle.write("\n")
@@ -105,7 +136,11 @@ def sample_from_config(
 def load_model_checkpoint(
     checkpoint_path: str | Path,
     device: str = "cpu",
-) -> tuple[ConditionalTABDLM, ConditionalTABDLMConfig, dict[str, CategoryVocab], SimpleTextTokenizer]:
+    include_graph: bool = False,
+) -> (
+    tuple[ConditionalTABDLM, ConditionalTABDLMConfig, dict[str, CategoryVocab], SimpleTextTokenizer]
+    | tuple[ConditionalTABDLM, ConditionalTABDLMConfig, dict[str, CategoryVocab], SimpleTextTokenizer, TemporalStructureOnlyGraphEncoder | None]
+):
     checkpoint = torch.load(checkpoint_path, map_location=device)
     raw_config = checkpoint["raw_config"]
     if checkpoint.get("summary_length_calibration") is not None:
@@ -121,6 +156,15 @@ def load_model_checkpoint(
     model = build_model(config, vocabs, tokenizer).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
+    graph_encoder = None
+    if include_graph and graph_conditioning_enabled(raw_config):
+        graph_encoder = build_graph_encoder(config).to(device)
+        state = checkpoint.get("graph_encoder_state_dict")
+        if state is not None:
+            graph_encoder.load_state_dict(state)
+        graph_encoder.eval()
+    if include_graph:
+        return model, config, vocabs, tokenizer, graph_encoder
     return model, config, vocabs, tokenizer
 
 
@@ -138,6 +182,8 @@ def sample_attributes(
     device: str,
     seed: int = 42,
     disable_length_calibration: bool = False,
+    graph_encoder: TemporalStructureOnlyGraphEncoder | None = None,
+    graph_history_index: Any | None = None,
 ) -> dict[str, list[str]]:
     id_cfg = config.raw.get("id_encoding", {})
     diffusion = config.raw.get("diffusion", {})
@@ -158,6 +204,14 @@ def sample_attributes(
     for start in iterator:
         batch_frame = spine.iloc[start : start + int(batch_size)]
         foreign_key_ids, datetime_values = encode_conditions(batch_frame, schema, num_hash_buckets, device)
+        graph_context = None
+        if graph_encoder is not None:
+            if graph_history_index is None:
+                raise ValueError("graph_history_index is required when graph_encoder is enabled")
+            row_indices = list(range(start, start + len(batch_frame)))
+            graph_context = graph_encoder(
+                graph_history_index.build_batch(row_indices, device=device, deterministic=True)
+            )
         cat_input = torch.empty((len(batch_frame), len(schema.model_categorical_targets)), dtype=torch.long, device=device)
         for idx, column in enumerate(schema.model_categorical_targets):
             cat_input[:, idx] = categorical_vocabs[column].mask_id
@@ -184,6 +238,7 @@ def sample_attributes(
                 text_input_ids=text_input,
                 text_attention=text_attention,
                 diffusion_t=t,
+                graph_context=graph_context,
             )
             reveal_prob = 1.0 if step == 1 else 1.0 / float(step)
             for idx, column in enumerate(schema.model_categorical_targets):
@@ -225,6 +280,7 @@ def sample_attributes(
             text_input_ids=text_input,
             text_attention=text_attention,
             diffusion_t=final_t,
+            graph_context=graph_context,
         )
         length_debug_rows = enforce_summary_length_constraints(
             schema=schema,
