@@ -9,6 +9,7 @@ data/original/rel-amazon-toy by default.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 from pathlib import Path
 from typing import Any
@@ -144,6 +145,20 @@ def print_row_counts(title: str, counts: dict[str, int]) -> None:
     for table_name, count in counts.items():
         print(f"{table_name}: {count:,}")
     print(f"total: {sum(counts.values()):,}")
+
+
+def write_csv(df: pd.DataFrame, path: Path) -> None:
+    print(f"Writing {path} ({len(df):,} rows)")
+    df.to_csv(
+        path,
+        index=False,
+        quoting=csv.QUOTE_MINIMAL,
+        quotechar='"',
+        doublequote=True,
+        escapechar="\\",
+        lineterminator="\n",
+        chunksize=100_000,
+    )
 
 
 def build_relationships(db: Any, table_names: set[str]) -> list[dict[str, str]]:
@@ -308,7 +323,7 @@ def main() -> None:
     }
 
     for table_name, df in toy_tables.items():
-        df.to_csv(output_dir / f"{table_name}.csv", index=False)
+        write_csv(df, output_dir / f"{table_name}.csv")
 
     relationships = build_relationships(db, set(selected_table_names))
     primary_keys = {
