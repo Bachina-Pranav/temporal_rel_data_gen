@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import warnings
+import json
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +12,7 @@ import numpy as np
 import pandas as pd
 
 from .schema import ConditionalTABDLMConfig
-from .tokenization import normalize_text
+from .tokenization import normalize_text, summary_length_bucket_name
 from .utils import (
     distribution_l1,
     ensure_dir,
@@ -26,17 +27,24 @@ def evaluate_from_config(
     config: ConditionalTABDLMConfig,
     synthetic_reviews_path: str | Path | None = None,
     real_reviews_path: str | Path | None = None,
+    output_path: str | Path | None = None,
     output_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     synthetic_reviews_path = Path(synthetic_reviews_path or config.output_dir / "synthetic_review_attrs.csv")
     real_reviews_path = Path(real_reviews_path or config.train_data_path)
-    output_dir = ensure_dir(output_dir or config.output_dir / "evaluation")
+    if output_path is not None:
+        output_path = Path(output_path)
+        output_dir = ensure_dir(output_path.parent)
+    else:
+        output_dir = ensure_dir(output_dir or config.output_dir / "evaluation")
+        output_path = output_dir / "eval_metrics.json"
     real = pd.read_csv(real_reviews_path)
     synthetic = pd.read_csv(synthetic_reviews_path)
-    metrics = evaluate_frames(real, synthetic, config)
-    save_json(metrics, output_dir / "eval_metrics.json")
+    debug_examples_path = synthetic_reviews_path.parent / "debug" / "generated_examples.jsonl"
+    metrics = evaluate_frames(real, synthetic, config, debug_examples_path=debug_examples_path)
+    save_json(metrics, output_path)
     write_report(metrics, output_dir / "eval_report.md")
-    print(f"Wrote {output_dir / 'eval_metrics.json'}")
+    print(f"Wrote {output_path}")
     print(f"Wrote {output_dir / 'eval_report.md'}")
     return metrics
 
@@ -45,6 +53,7 @@ def evaluate_frames(
     real: pd.DataFrame,
     synthetic: pd.DataFrame,
     config: ConditionalTABDLMConfig,
+    debug_examples_path: str | Path | None = None,
 ) -> dict[str, Any]:
     schema = config.schema
     real = normalize_for_eval(real, config)
@@ -64,6 +73,7 @@ def evaluate_frames(
         "temporal": {},
         "joint": {},
         "text": {},
+        "length_diagnostics": {},
         "text_privacy": {},
         "text_consistency": {},
         "conditional_fidelity": {},
@@ -89,6 +99,14 @@ def evaluate_frames(
             )
         )
         metrics["text"].update(text_metrics(real[summary_col], synthetic[summary_col]))
+        metrics["length_diagnostics"].update(
+            summary_length_diagnostics(
+                real[summary_col],
+                synthetic[summary_col],
+                config,
+                debug_examples_path=debug_examples_path,
+            )
+        )
         metrics["text_privacy"].update(text_privacy_metrics(real[summary_col], synthetic[summary_col]))
     if rating_col and verified_col:
         metrics["joint"].update(joint_rating_verified_metrics(real, synthetic, rating_col, verified_col))
@@ -135,6 +153,93 @@ def validity_metrics(real: pd.DataFrame, synthetic: pd.DataFrame, schema) -> dic
             out[f"{column}_length_mean_synthetic"] = float(syn_len.mean()) if len(syn_len) else None
             out[f"{column}_length_ks"] = ks_statistic(real_len, syn_len)
     return out
+
+
+def summary_length_diagnostics(
+    real_text: pd.Series,
+    synthetic_text: pd.Series,
+    config: ConditionalTABDLMConfig,
+    debug_examples_path: str | Path | None = None,
+) -> dict[str, Any]:
+    real_len = summary_lengths(real_text)
+    syn_len = summary_lengths(synthetic_text)
+    buckets = config.schema.summary_length_buckets or {
+        "len_0": (0, 0),
+        "len_1_2": (1, 2),
+        "len_3_5": (3, 5),
+        "len_6_10": (6, 10),
+        "len_11_16": (11, 16),
+        "len_17_32": (17, 32),
+    }
+    real_buckets = real_len.map(lambda length: summary_length_bucket_name(int(length), buckets))
+    syn_buckets = syn_len.map(lambda length: summary_length_bucket_name(int(length), buckets))
+    max_tokens = int(config.schema.text_max_lengths.get(config.schema.text_targets[0], 32)) if config.schema.text_targets else 32
+    max_content = max(0, max_tokens - 2)
+    diagnostics = {
+        "summary_length_mean_real": float(real_len.mean()) if len(real_len) else None,
+        "summary_length_mean_synthetic": float(syn_len.mean()) if len(syn_len) else None,
+        "summary_length_median_real": float(real_len.median()) if len(real_len) else None,
+        "summary_length_median_synthetic": float(syn_len.median()) if len(syn_len) else None,
+        "summary_length_p90_real": float(real_len.quantile(0.9)) if len(real_len) else None,
+        "summary_length_p90_synthetic": float(syn_len.quantile(0.9)) if len(syn_len) else None,
+        "summary_length_ks": ks_statistic(real_len, syn_len),
+        "summary_length_bucket_distribution_real": normalized_value_counts(real_buckets),
+        "summary_length_bucket_distribution_synthetic": normalized_value_counts(syn_buckets),
+        "summary_length_bucket_l1": distribution_l1(real_buckets, syn_buckets),
+        "summary_length_bucket_js": js_divergence(real_buckets, syn_buckets),
+        "generated_to_max_length_rate": float((syn_len >= max_content).mean()) if len(syn_len) else None,
+    }
+    diagnostics.update(debug_eos_diagnostics(debug_examples_path))
+    return diagnostics
+
+
+def normalized_value_counts(series: pd.Series) -> dict[str, float]:
+    return {str(key): float(value) for key, value in series.value_counts(normalize=True).sort_index().items()}
+
+
+def debug_eos_diagnostics(debug_examples_path: str | Path | None) -> dict[str, Any]:
+    if debug_examples_path is None or not Path(debug_examples_path).exists():
+        return {
+            "eos_missing_rate": None,
+            "pad_after_eos_violation_rate": None,
+            "mean_eos_position": None,
+            "eos_position_distribution": {},
+        }
+    examples = load_debug_examples(debug_examples_path)
+    if not examples:
+        return {
+            "eos_missing_rate": None,
+            "pad_after_eos_violation_rate": None,
+            "mean_eos_position": None,
+            "eos_position_distribution": {},
+        }
+    eos_positions = [row.get("eos_position") for row in examples]
+    missing = [pos is None for pos in eos_positions]
+    violations = []
+    for row in examples:
+        tokens = row.get("raw_summary_tokens") or []
+        if "[EOS]" not in tokens:
+            violations.append(False)
+            continue
+        eos_idx = tokens.index("[EOS]")
+        violations.append(any(token != "[PAD]" for token in tokens[eos_idx + 1 :]))
+    observed = [int(pos) for pos in eos_positions if pos is not None]
+    return {
+        "eos_missing_rate": float(np.mean(missing)),
+        "pad_after_eos_violation_rate": float(np.mean(violations)),
+        "mean_eos_position": float(np.mean(observed)) if observed else None,
+        "eos_position_distribution": {str(key): float(value) for key, value in pd.Series(observed).value_counts(normalize=True).sort_index().items()},
+    }
+
+
+def load_debug_examples(path: str | Path) -> list[dict[str, Any]]:
+    rows = []
+    with Path(path).open() as handle:
+        for line in handle:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows
 
 
 def categorical_distribution_metrics(real: pd.DataFrame, synthetic: pd.DataFrame, column: str, numeric: bool) -> dict[str, Any]:

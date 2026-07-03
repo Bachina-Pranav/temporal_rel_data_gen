@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import random
 from pathlib import Path
 from typing import Any
 
@@ -11,9 +12,9 @@ import torch
 
 from .model import ConditionalTABDLM
 from .schema import ConditionalTABDLMConfig, ConditionalTABDLMSchema
-from .tokenization import CategoryVocab, SimpleTextTokenizer, stable_hash_bucket
+from .tokenization import CategoryVocab, SimpleTextTokenizer, sample_length_from_bucket, stable_hash_bucket
 from .train import build_model, resolve_device
-from .utils import ensure_dir, set_seed
+from .utils import ensure_dir, jsonable, set_seed
 
 
 try:
@@ -32,6 +33,8 @@ def sample_from_config(
     top_p: float | None = None,
     device: str | None = None,
     seed: int | None = None,
+    synthetic_spine_path: str | Path | None = None,
+    debug_write_aux_targets: bool = False,
 ) -> Path:
     sampling = config.raw.get("sampling", {})
     checkpoint_path = Path(checkpoint_path) if checkpoint_path else config.checkpoint_dir / "best.pt"
@@ -45,7 +48,8 @@ def sample_from_config(
 
     set_seed(seed)
     model, ckpt_config, vocabs, tokenizer = load_model_checkpoint(checkpoint_path, device)
-    spine = pd.read_csv(config.synthetic_spine_path)
+    spine_path = Path(synthetic_spine_path) if synthetic_spine_path else config.synthetic_spine_path
+    spine = pd.read_csv(spine_path)
     validate_spine(spine, ckpt_config.schema)
     if num_rows not in (None, "all"):
         spine = spine.head(int(num_rows)).copy()
@@ -60,17 +64,21 @@ def sample_from_config(
         temperature=temperature,
         top_p=top_p,
         device=device,
+        seed=seed,
     )
     output = spine.loc[:, list(ckpt_config.schema.condition_columns)].copy()
     for column in ckpt_config.schema.categorical_targets:
         output[column] = attrs[column]
+    if debug_write_aux_targets:
+        for column in ckpt_config.schema.auxiliary_categorical_targets:
+            output[column] = attrs[column]
     for column in ckpt_config.schema.text_targets:
         output[column] = attrs[column]
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output.to_csv(output_path, index=False)
     metadata = {
         "checkpoint_path": str(checkpoint_path),
-        "synthetic_spine_path": str(config.synthetic_spine_path),
+        "synthetic_spine_path": str(spine_path),
         "output_path": str(output_path),
         "num_rows": int(len(output)),
         "batch_size": batch_size,
@@ -78,10 +86,15 @@ def sample_from_config(
         "top_p": top_p,
         "seed": seed,
         "target_columns": list(ckpt_config.schema.target_columns),
+        "auxiliary_categorical_targets": list(ckpt_config.schema.auxiliary_categorical_targets),
+        "uses_summary_length_bucket": bool(ckpt_config.schema.summary_length_enabled),
+        "force_eos_after_sampled_length": bool(ckpt_config.schema.force_eos_after_sampled_length),
+        "force_pad_after_eos": bool(ckpt_config.schema.force_pad_after_eos),
     }
     with (output_path.parent / "sample_metadata.json").open("w") as handle:
         json.dump(metadata, handle, indent=2, sort_keys=True)
         handle.write("\n")
+    write_debug_outputs(attrs, output_path.parent / "debug")
     print(f"Wrote {output_path}")
     return output_path
 
@@ -117,20 +130,25 @@ def sample_attributes(
     temperature: float,
     top_p: float,
     device: str,
+    seed: int = 42,
 ) -> dict[str, list[str]]:
     id_cfg = config.raw.get("id_encoding", {})
     diffusion = config.raw.get("diffusion", {})
     num_hash_buckets = int(id_cfg.get("num_buckets", 262144))
     timesteps = int(diffusion.get("timesteps", 50))
-    result: dict[str, list[str]] = {column: [] for column in schema.target_columns}
+    rng = random.Random(int(seed))
+    result: dict[str, list[str] | list[dict[str, Any]]] = {
+        column: [] for column in schema.model_categorical_targets + schema.text_targets
+    }
+    debug_examples: list[dict[str, Any]] = []
     iterator = range(0, len(spine), int(batch_size))
     if tqdm is not None:
         iterator = tqdm(iterator, total=(len(spine) + int(batch_size) - 1) // int(batch_size), desc="sample")
     for start in iterator:
         batch_frame = spine.iloc[start : start + int(batch_size)]
         foreign_key_ids, datetime_values = encode_conditions(batch_frame, schema, num_hash_buckets, device)
-        cat_input = torch.empty((len(batch_frame), len(schema.categorical_targets)), dtype=torch.long, device=device)
-        for idx, column in enumerate(schema.categorical_targets):
+        cat_input = torch.empty((len(batch_frame), len(schema.model_categorical_targets)), dtype=torch.long, device=device)
+        for idx, column in enumerate(schema.model_categorical_targets):
             cat_input[:, idx] = categorical_vocabs[column].mask_id
         cat_remaining = torch.ones_like(cat_input, dtype=torch.bool)
 
@@ -140,9 +158,12 @@ def sample_attributes(
         for column in schema.text_targets:
             length = int(schema.text_max_lengths[column])
             text_input[column] = torch.full((len(batch_frame), length), text_tokenizer.mask_id, dtype=torch.long, device=device)
+            text_input[column][:, 0] = text_tokenizer.bos_id
             text_attention[column] = torch.ones((len(batch_frame), length), dtype=torch.long, device=device)
             text_remaining[column] = torch.ones((len(batch_frame), length), dtype=torch.bool, device=device)
+            text_remaining[column][:, 0] = False
 
+        logits: dict[str, Any] | None = None
         for step in range(timesteps, 0, -1):
             t = torch.full((len(batch_frame),), step / max(timesteps, 1), dtype=torch.float32, device=device)
             logits = model(
@@ -154,7 +175,7 @@ def sample_attributes(
                 diffusion_t=t,
             )
             reveal_prob = 1.0 if step == 1 else 1.0 / float(step)
-            for idx, column in enumerate(schema.categorical_targets):
+            for idx, column in enumerate(schema.model_categorical_targets):
                 remaining = cat_remaining[:, idx]
                 if not bool(remaining.any()):
                     continue
@@ -176,13 +197,146 @@ def sample_attributes(
                 text_input[column][reveal] = sampled[reveal]
                 text_remaining[column][reveal] = False
 
-        for idx, column in enumerate(schema.categorical_targets):
+        final_t = torch.zeros((len(batch_frame),), dtype=torch.float32, device=device)
+        logits = model(
+            foreign_key_ids=foreign_key_ids,
+            datetime_values=datetime_values,
+            categorical_input_ids=cat_input,
+            text_input_ids=text_input,
+            text_attention=text_attention,
+            diffusion_t=final_t,
+        )
+        enforce_summary_length_constraints(
+            schema=schema,
+            categorical_vocabs=categorical_vocabs,
+            text_tokenizer=text_tokenizer,
+            cat_input=cat_input,
+            text_input=text_input,
+            text_logits=logits["text"],
+            rng=rng,
+            temperature=temperature,
+            top_p=top_p,
+        )
+
+        decoded_cats: dict[str, list[str]] = {}
+        for idx, column in enumerate(schema.model_categorical_targets):
             decoded = [categorical_vocabs[column].decode(value) for value in cat_input[:, idx].detach().cpu().tolist()]
-            result[column].extend(decoded)
+            decoded_cats[column] = decoded
+            result[column].extend(decoded)  # type: ignore[arg-type]
         for column in schema.text_targets:
             decoded = [text_tokenizer.decode(row) for row in text_input[column].detach().cpu().tolist()]
-            result[column].extend(decoded)
+            result[column].extend(decoded)  # type: ignore[arg-type]
+            for local_idx, (row_index, decoded_summary) in enumerate(zip(batch_frame.index.tolist(), decoded)):
+                if len(debug_examples) >= 200:
+                    break
+                ids = text_input[column][local_idx].detach().cpu().tolist()
+                raw_tokens = [text_tokenizer.inv_vocab.get(int(idx), text_tokenizer.unk_token) for idx in ids]
+                eos_position = next((idx for idx, token_id in enumerate(ids) if int(token_id) == text_tokenizer.eos_id), None)
+                example = {
+                    "customer_id": batch_frame.iloc[local_idx].get(schema.foreign_key_columns[0]),
+                    "product_id": batch_frame.iloc[local_idx].get(schema.foreign_key_columns[1]) if len(schema.foreign_key_columns) > 1 else None,
+                    "review_time": str(batch_frame.iloc[local_idx].get(schema.datetime_columns[0])),
+                    "rating": decoded_cats.get("rating", [None] * len(batch_frame))[local_idx],
+                    "verified": decoded_cats.get("verified", [None] * len(batch_frame))[local_idx],
+                    "summary_length_bucket": decoded_cats.get("summary_length_bucket", [None] * len(batch_frame))[local_idx],
+                    "decoded_summary": decoded_summary,
+                    "raw_summary_tokens": raw_tokens,
+                    "eos_position": eos_position,
+                    "content_length": text_tokenizer.content_length(ids),
+                }
+                debug_examples.append(example)
+    result["_debug_examples"] = debug_examples
     return result
+
+
+def enforce_summary_length_constraints(
+    schema: ConditionalTABDLMSchema,
+    categorical_vocabs: dict[str, CategoryVocab],
+    text_tokenizer: SimpleTextTokenizer,
+    cat_input: torch.Tensor,
+    text_input: dict[str, torch.Tensor],
+    text_logits: dict[str, torch.Tensor],
+    rng: random.Random,
+    temperature: float,
+    top_p: float,
+) -> None:
+    if not schema.text_targets:
+        return
+    length_targets: list[int] | None = None
+    if (
+        schema.summary_length_enabled
+        and schema.use_length_bucket_in_sampling
+        and "summary_length_bucket" in schema.model_categorical_targets
+        and "summary_length_bucket" in categorical_vocabs
+    ):
+        length_idx = schema.model_categorical_targets.index("summary_length_bucket")
+        length_vocab = categorical_vocabs["summary_length_bucket"]
+        bucket_names = [length_vocab.decode(idx) for idx in cat_input[:, length_idx].detach().cpu().tolist()]
+        first_text_col = schema.text_targets[0]
+        max_content = text_tokenizer.max_content_tokens(schema.text_max_lengths[first_text_col])
+        length_targets = [
+            sample_length_from_bucket(name, schema.summary_length_buckets, max_content, rng)
+            for name in bucket_names
+        ]
+
+    for column in schema.text_targets:
+        sequences = text_input[column]
+        logits = text_logits[column]
+        max_len = sequences.shape[1]
+        max_content = text_tokenizer.max_content_tokens(max_len)
+        for row_idx in range(sequences.shape[0]):
+            target_len = length_targets[row_idx] if length_targets is not None else None
+            sequences[row_idx, 0] = text_tokenizer.bos_id
+            if target_len is not None and schema.force_eos_after_sampled_length:
+                target_len = int(max(0, min(target_len, max_content)))
+                eos_pos = min(target_len + 1, max_len - 1)
+                for pos in range(1, eos_pos):
+                    token_id = int(sequences[row_idx, pos].item())
+                    if token_id in text_tokenizer.special_ids:
+                        sequences[row_idx, pos] = sample_content_token(
+                            logits[row_idx, pos],
+                            text_tokenizer,
+                            temperature=temperature,
+                            top_p=top_p,
+                        )
+                sequences[row_idx, eos_pos] = text_tokenizer.eos_id
+                if schema.force_pad_after_eos and eos_pos + 1 < max_len:
+                    sequences[row_idx, eos_pos + 1 :] = text_tokenizer.pad_id
+            elif schema.force_pad_after_eos:
+                ids = sequences[row_idx].detach().cpu().tolist()
+                eos_pos = next((idx for idx, token_id in enumerate(ids) if int(token_id) == text_tokenizer.eos_id), None)
+                if eos_pos is not None and eos_pos + 1 < max_len:
+                    sequences[row_idx, eos_pos + 1 :] = text_tokenizer.pad_id
+
+
+def sample_content_token(
+    logits: torch.Tensor,
+    tokenizer: SimpleTextTokenizer,
+    temperature: float,
+    top_p: float,
+) -> torch.Tensor:
+    filtered = logits.clone()
+    forbidden = list(tokenizer.special_ids)
+    filtered[torch.tensor(forbidden, dtype=torch.long, device=filtered.device)] = -float("inf")
+    if not torch.isfinite(filtered).any():
+        return torch.tensor(tokenizer.content_token_ids[0], dtype=torch.long, device=filtered.device)
+    return sample_logits(filtered.view(1, -1), temperature=temperature, top_p=top_p).squeeze(0)
+
+
+def write_debug_outputs(attrs: dict[str, Any], debug_dir: str | Path) -> None:
+    debug_dir = ensure_dir(debug_dir)
+    examples = attrs.get("_debug_examples", [])
+    examples_path = debug_dir / "generated_examples.jsonl"
+    with examples_path.open("w") as handle:
+        for row in examples:
+            json.dump(jsonable(row), handle, sort_keys=True)
+            handle.write("\n")
+    if "summary_length_bucket" in attrs:
+        counts = pd.Series(attrs["summary_length_bucket"]).value_counts().sort_index()
+        counts.rename_axis("summary_length_bucket").reset_index(name="count").to_csv(
+            debug_dir / "summary_length_histogram.csv",
+            index=False,
+        )
 
 
 def encode_conditions(
@@ -233,4 +387,3 @@ def validate_spine(spine: pd.DataFrame, schema: ConditionalTABDLMSchema) -> None
     missing = [column for column in schema.condition_columns if column not in spine.columns]
     if missing:
         raise ValueError(f"Synthetic spine is missing condition columns: {missing}")
-

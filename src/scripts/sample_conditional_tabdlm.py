@@ -19,6 +19,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Sample Conditional TABDLM attributes.")
     parser.add_argument("--config", default="configs/attribute_generation/conditional_tabdlm_rel_amazon_exp1.yaml")
     parser.add_argument("--checkpoint", default=None)
+    parser.add_argument("--synthetic-spine", default=None)
     parser.add_argument("--output", default=None)
     parser.add_argument("--num-rows", default=None)
     parser.add_argument("--batch-size", type=int, default=None)
@@ -26,6 +27,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-p", type=float, default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--debug-write-aux-targets", action="store_true")
     return parser.parse_args()
 
 
@@ -44,9 +46,10 @@ def main() -> None:
         top_p=args.top_p,
         device=args.device,
         seed=args.seed,
+        synthetic_spine_path=args.synthetic_spine,
+        debug_write_aux_targets=args.debug_write_aux_targets,
     )
 
 
 if __name__ == "__main__":
     main()
-

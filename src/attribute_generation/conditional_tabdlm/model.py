@@ -59,7 +59,7 @@ class ConditionalTABDLM(nn.Module):
         self.text_vocab_size = int(text_tokenizer.vocab_size)
         self.text_pad_id = int(text_tokenizer.pad_id)
         self.categorical_vocab_sizes = {
-            column: categorical_vocabs[column].size for column in schema.categorical_targets
+            column: categorical_vocabs[column].size for column in schema.model_categorical_targets
         }
 
         self.foreign_key_embeddings = nn.ModuleList(
@@ -86,16 +86,16 @@ class ConditionalTABDLM(nn.Module):
         self.categorical_embeddings = nn.ModuleDict(
             {
                 column: nn.Embedding(categorical_vocabs[column].size + 1, self.hidden_dim)
-                for column in schema.categorical_targets
+                for column in schema.model_categorical_targets
             }
         )
         self.text_embeddings = nn.ModuleDict(
             {
-                column: nn.Embedding(self.text_vocab_size, self.hidden_dim, padding_idx=self.text_pad_id)
+                column: nn.Embedding(self.text_vocab_size, self.hidden_dim)
                 for column in schema.text_targets
             }
         )
-        self.target_column_embedding = nn.Embedding(max(1, len(schema.target_columns)), self.hidden_dim)
+        self.target_column_embedding = nn.Embedding(max(1, len(schema.model_target_columns)), self.hidden_dim)
         self.position_embedding = nn.Embedding(self.max_target_positions, self.hidden_dim)
         self.diffusion_time = nn.Sequential(
             nn.Linear(1, self.hidden_dim),
@@ -116,7 +116,7 @@ class ConditionalTABDLM(nn.Module):
         self.categorical_heads = nn.ModuleDict(
             {
                 column: nn.Linear(self.hidden_dim, categorical_vocabs[column].size)
-                for column in schema.categorical_targets
+                for column in schema.model_categorical_targets
             }
         )
         self.text_heads = nn.ModuleDict(
@@ -125,7 +125,7 @@ class ConditionalTABDLM(nn.Module):
 
     @property
     def max_target_positions(self) -> int:
-        return len(self.schema.categorical_targets) + sum(
+        return len(self.schema.model_categorical_targets) + sum(
             int(self.schema.text_max_lengths[column]) for column in self.schema.text_targets
         )
 
@@ -172,7 +172,7 @@ class ConditionalTABDLM(nn.Module):
         output_slices: dict[str, tuple[int, int]] = {}
         pos = 0
         target_col_idx = 0
-        for col_idx, column in enumerate(self.schema.categorical_targets):
+        for col_idx, column in enumerate(self.schema.model_categorical_targets):
             token = self.categorical_embeddings[column](categorical_input_ids[:, col_idx])
             col_emb = self.target_column_embedding.weight[target_col_idx].view(1, 1, -1)
             embeddings.append((token.unsqueeze(1) + col_emb))
@@ -203,7 +203,7 @@ class ConditionalTABDLM(nn.Module):
         encoded = self.output_norm(encoded)
 
         categorical_logits: dict[str, torch.Tensor] = {}
-        for column in self.schema.categorical_targets:
+        for column in self.schema.model_categorical_targets:
             start, _ = output_slices[column]
             categorical_logits[column] = self.categorical_heads[column](encoded[:, start, :])
         text_logits: dict[str, torch.Tensor] = {}
@@ -225,4 +225,3 @@ class ConditionalTABDLM(nn.Module):
             "text_vocab_size": self.text_vocab_size,
             "categorical_vocab_sizes": dict(self.categorical_vocab_sizes),
         }
-

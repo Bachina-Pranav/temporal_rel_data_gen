@@ -70,5 +70,7 @@ def test_collate_never_masks_condition_columns():
     assert "datetime_labels" not in batch
     assert batch["foreign_key_ids"].equal(samples[0]["foreign_key_ids"].new_tensor([s["foreign_key_ids"].tolist() for s in samples]))
     assert (batch["categorical_labels"] != -100).all()
-    assert (batch["text_labels"]["summary"][batch["text_attention"]["summary"].bool()] != -100).all()
-
+    non_bos_positions = batch["text_attention"]["summary"].bool()
+    non_bos_positions[:, 0] = False
+    assert (batch["text_labels"]["summary"][non_bos_positions] != -100).all()
+    assert (batch["text_labels"]["summary"][:, 0] == -100).all()

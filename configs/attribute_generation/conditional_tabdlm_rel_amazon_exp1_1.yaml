@@ -1,0 +1,106 @@
+dataset_name: amazon-toy
+
+paths:
+  train_data_path: data/original/rel-amazon-toy/review.csv
+  synthetic_spine_path: outputs/amazon-toy/time_biased_block_stub_matching_kernel_main/synthetic_review.csv
+  output_dir: outputs/amazon-toy/conditional_tabdlm_exp1_1_summary_length
+
+columns:
+  condition:
+    foreign_keys:
+      - customer_id
+      - product_id
+    datetimes:
+      - review_time
+  target:
+    categorical:
+      - rating
+      - verified
+    numerical: []
+    text:
+      - summary
+
+auxiliary_targets:
+  categorical:
+    - summary_length_bucket
+
+text:
+  max_length:
+    summary: 32
+  special_tokens:
+    add_bos: true
+    add_eos: true
+    add_pad: true
+    include_pad_in_loss: true
+    include_eos_in_loss: true
+
+summary_length:
+  enabled: true
+  use_length_bucket_in_sampling: true
+  force_eos_after_sampled_length: true
+  force_pad_after_eos: true
+  buckets:
+    len_0: [0, 0]
+    len_1_2: [1, 2]
+    len_3_5: [3, 5]
+    len_6_10: [6, 10]
+    len_11_16: [11, 16]
+    len_17_32: [17, 32]
+
+tokenizer:
+  max_vocab_size: 30000
+  min_frequency: 1
+  lowercase: true
+
+id_encoding:
+  type: hash_embedding
+  num_buckets: 262144
+  embedding_dim: 128
+
+datetime_encoding:
+  type: continuous_time_fourier
+  embedding_dim: 64
+
+model:
+  backbone: small_mlm_transformer
+  hidden_dim: 384
+  num_layers: 6
+  num_heads: 6
+  dropout: 0.1
+  condition_dim: 256
+
+diffusion:
+  type: masked_language_diffusion
+  timesteps: 50
+  mask_schedule: linear
+  min_mask_prob: 0.05
+  max_mask_prob: 0.95
+
+training:
+  max_rows: null
+  batch_size: 128
+  epochs: 50
+  early_stopping_patience: 8
+  early_stopping_min_delta: 0.0001
+  lr: 0.0003
+  weight_decay: 0.01
+  seed: 42
+  num_workers: 0
+  dataloader_timeout_seconds: 0
+  mixed_precision: true
+  save_best_by: valid/loss_total
+  device: auto
+
+loss_weights:
+  rating: 2.0
+  verified: 2.0
+  summary_length: 1.0
+  summary: 1.0
+
+sampling:
+  num_rows: 50000
+  batch_size: 128
+  temperature: 0.8
+  top_p: 0.9
+  seed: 42
+  device: auto

@@ -29,7 +29,13 @@ class ConditionalTABDLMSchema:
     categorical_targets: tuple[str, ...]
     numerical_targets: tuple[str, ...] = ()
     text_targets: tuple[str, ...] = ()
+    auxiliary_categorical_targets: tuple[str, ...] = ()
     text_max_lengths: dict[str, int] = field(default_factory=dict)
+    summary_length_buckets: dict[str, tuple[int, int]] = field(default_factory=dict)
+    summary_length_enabled: bool = False
+    use_length_bucket_in_sampling: bool = False
+    force_eos_after_sampled_length: bool = False
+    force_pad_after_eos: bool = False
 
     @property
     def condition_columns(self) -> tuple[str, ...]:
@@ -40,11 +46,19 @@ class ConditionalTABDLMSchema:
         return self.categorical_targets + self.numerical_targets + self.text_targets
 
     @property
+    def model_categorical_targets(self) -> tuple[str, ...]:
+        return self.categorical_targets + self.auxiliary_categorical_targets
+
+    @property
+    def model_target_columns(self) -> tuple[str, ...]:
+        return self.model_categorical_targets + self.numerical_targets + self.text_targets
+
+    @property
     def required_columns(self) -> tuple[str, ...]:
         return self.condition_columns + self.target_columns
 
     def validate(self) -> None:
-        all_columns = list(self.condition_columns) + list(self.target_columns)
+        all_columns = list(self.condition_columns) + list(self.target_columns) + list(self.auxiliary_categorical_targets)
         repeated = sorted({col for col in all_columns if all_columns.count(col) > 1})
         if repeated:
             raise ValueError(f"Columns cannot appear in more than one schema role: {repeated}")
@@ -60,6 +74,11 @@ class ConditionalTABDLMSchema:
         for column in self.text_targets:
             if int(self.text_max_lengths.get(column, 0)) <= 0:
                 raise ValueError(f"Missing positive text_max_length for text target {column!r}")
+        if self.summary_length_enabled:
+            if "summary_length_bucket" not in self.auxiliary_categorical_targets:
+                raise ValueError("summary_length.enabled requires auxiliary categorical target summary_length_bucket")
+            if not self.summary_length_buckets:
+                raise ValueError("summary_length.enabled requires non-empty buckets")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -72,24 +91,47 @@ class ConditionalTABDLMSchema:
                 "numerical": list(self.numerical_targets),
                 "text": list(self.text_targets),
             },
+            "auxiliary_targets": {
+                "categorical": list(self.auxiliary_categorical_targets),
+            },
             "text_max_lengths": dict(self.text_max_lengths),
+            "summary_length": {
+                "enabled": self.summary_length_enabled,
+                "use_length_bucket_in_sampling": self.use_length_bucket_in_sampling,
+                "force_eos_after_sampled_length": self.force_eos_after_sampled_length,
+                "force_pad_after_eos": self.force_pad_after_eos,
+                "buckets": {name: list(bounds) for name, bounds in self.summary_length_buckets.items()},
+            },
             "forbidden_engineered_features": sorted(FORBIDDEN_ENGINEERED_FEATURES),
         }
 
     @classmethod
     def from_config_dict(cls, config: dict[str, Any]) -> "ConditionalTABDLMSchema":
         columns = config.get("columns", {})
-        conditions = columns.get("condition", {})
-        targets = columns.get("target", {})
+        conditions = columns.get("condition", config.get("condition_columns", {}))
+        targets = columns.get("target", config.get("target_columns", {}))
+        auxiliary = config.get("auxiliary_targets", {})
         text_cfg = config.get("text", {})
-        text_max = text_cfg.get("max_length", {})
+        text_max = text_cfg.get("max_length", text_cfg.get("text_max_length", config.get("text_max_length", {})))
+        summary_length_cfg = config.get("summary_length", {})
+        buckets = summary_length_cfg.get("buckets", {})
+        parsed_buckets = {
+            str(name): (int(bounds[0]), int(bounds[1]))
+            for name, bounds in buckets.items()
+        }
         schema = cls(
             foreign_key_columns=tuple(str(col) for col in conditions.get("foreign_keys", [])),
             datetime_columns=tuple(str(col) for col in conditions.get("datetimes", [])),
             categorical_targets=tuple(str(col) for col in targets.get("categorical", [])),
             numerical_targets=tuple(str(col) for col in targets.get("numerical", [])),
             text_targets=tuple(str(col) for col in targets.get("text", [])),
+            auxiliary_categorical_targets=tuple(str(col) for col in auxiliary.get("categorical", [])),
             text_max_lengths={str(k): int(v) for k, v in text_max.items()},
+            summary_length_buckets=parsed_buckets,
+            summary_length_enabled=bool(summary_length_cfg.get("enabled", False)),
+            use_length_bucket_in_sampling=bool(summary_length_cfg.get("use_length_bucket_in_sampling", False)),
+            force_eos_after_sampled_length=bool(summary_length_cfg.get("force_eos_after_sampled_length", False)),
+            force_pad_after_eos=bool(summary_length_cfg.get("force_pad_after_eos", False)),
         )
         schema.validate()
         return schema
@@ -139,4 +181,3 @@ def load_config(path: str | Path) -> ConditionalTABDLMConfig:
     raw = load_yaml(path)
     schema = ConditionalTABDLMSchema.from_config_dict(raw)
     return ConditionalTABDLMConfig(raw=raw, schema=schema, config_path=path)
-

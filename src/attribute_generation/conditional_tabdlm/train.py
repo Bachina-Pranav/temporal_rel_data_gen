@@ -105,6 +105,7 @@ def train_from_config(config: ConditionalTABDLMConfig, device: str | None = None
         lr=float(training.get("learning_rate", training.get("lr", 3e-4))),
         weight_decay=float(training.get("weight_decay", 0.01)),
     )
+    loss_weights = dict(config.raw.get("loss_weights", {}))
     use_amp = bool(training.get("mixed_precision", True)) and device.startswith("cuda")
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     log_path = output_dir / "train_log.jsonl"
@@ -120,8 +121,8 @@ def train_from_config(config: ConditionalTABDLMConfig, device: str | None = None
     epochs_without_improvement = 0
     best_epoch = 0
     for epoch in range(1, epochs + 1):
-        train_metrics = run_epoch(model, train_loader, optimizer, scaler, device, use_amp)
-        valid_metrics = run_epoch(model, valid_loader, None, scaler, device, use_amp)
+        train_metrics = run_epoch(model, train_loader, optimizer, scaler, device, use_amp, loss_weights)
+        valid_metrics = run_epoch(model, valid_loader, None, scaler, device, use_amp, loss_weights)
         current_valid = float(valid_metrics["total_loss"])
         improved = current_valid < (best_valid - early_stopping_min_delta)
         row = {
@@ -203,11 +204,13 @@ def run_epoch(
     scaler: torch.cuda.amp.GradScaler,
     device: str,
     use_amp: bool,
+    loss_weights: dict[str, float] | None = None,
 ) -> dict[str, float]:
     training = optimizer is not None
     model.train(training)
     totals: dict[str, float] = {}
     counts: dict[str, int] = {}
+    corrects: dict[str, int] = {}
     iterator = loader
     if tqdm is not None:
         iterator = tqdm(loader, leave=False, desc="train" if training else "valid")
@@ -224,7 +227,7 @@ def run_epoch(
                 text_attention=batch["text_attention"],
                 diffusion_t=batch["diffusion_t"],
             )
-            loss, component = denoising_loss(logits, batch, model.schema)
+            loss, component = denoising_loss(logits, batch, model.schema, loss_weights or {})
         if training:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -234,16 +237,19 @@ def run_epoch(
         for key, stats in component.items():
             totals[key] = totals.get(key, 0.0) + float(stats["loss_sum"])
             counts[key] = counts.get(key, 0) + int(stats["count"])
+            corrects[key] = corrects.get(key, 0) + int(stats.get("correct", 0))
 
     metrics = {}
-    total_sum = 0.0
-    total_count = 0
+    total_loss = 0.0
     for key in sorted(totals):
         count = max(counts.get(key, 0), 1)
-        metrics[f"{key}_loss"] = float(totals[key] / count)
-        total_sum += totals[key]
-        total_count += counts.get(key, 0)
-    metrics["total_loss"] = float(total_sum / max(total_count, 1))
+        metric_key = component_metric_name(key)
+        component_loss = float(totals[key] / count)
+        metrics[f"{metric_key}_loss"] = component_loss
+        total_loss += float(component_weight(key, loss_weights or {})) * component_loss
+        if key in model.schema.model_categorical_targets:
+            metrics[f"{metric_key}_accuracy"] = float(corrects.get(key, 0) / count)
+    metrics["total_loss"] = float(total_loss)
     return metrics
 
 
@@ -251,18 +257,32 @@ def denoising_loss(
     logits: dict[str, Any],
     batch: dict[str, Any],
     schema,
+    loss_weights: dict[str, float] | None = None,
+) -> tuple[torch.Tensor, dict[str, dict[str, float | int]]]:
+    return _denoising_loss_impl(logits, batch, schema, loss_weights or {})
+
+
+def _denoising_loss_impl(
+    logits: dict[str, Any],
+    batch: dict[str, Any],
+    schema,
+    loss_weights: dict[str, float],
 ) -> tuple[torch.Tensor, dict[str, dict[str, float | int]]]:
     losses: list[torch.Tensor] = []
     component: dict[str, dict[str, float | int]] = {}
     cat_labels = batch["categorical_labels"]
-    for idx, column in enumerate(schema.categorical_targets):
+    for idx, column in enumerate(schema.model_categorical_targets):
         labels = cat_labels[:, idx]
-        count = int((labels != -100).sum().detach().cpu())
+        mask = labels != -100
+        count = int(mask.sum().detach().cpu())
         if count == 0:
             continue
         loss_sum = F.cross_entropy(logits["categorical"][column], labels, ignore_index=-100, reduction="sum")
-        losses.append(loss_sum)
-        component[column] = {"loss_sum": float(loss_sum.detach().cpu()), "count": count}
+        mean_loss = loss_sum / max(count, 1)
+        losses.append(float(component_weight(column, loss_weights)) * mean_loss)
+        pred = logits["categorical"][column].argmax(dim=-1)
+        correct = int((pred[mask] == labels[mask]).sum().detach().cpu())
+        component[column] = {"loss_sum": float(loss_sum.detach().cpu()), "count": count, "correct": correct}
 
     for column in schema.text_targets:
         labels = batch["text_labels"][column]
@@ -275,14 +295,23 @@ def denoising_loss(
             ignore_index=-100,
             reduction="sum",
         )
-        losses.append(loss_sum)
+        mean_loss = loss_sum / max(count, 1)
+        losses.append(float(component_weight(column, loss_weights)) * mean_loss)
         component[column] = {"loss_sum": float(loss_sum.detach().cpu()), "count": count}
 
     if not losses:
         zero = batch["foreign_key_ids"].float().sum() * 0.0
         return zero, {}
-    denom = sum(stats["count"] for stats in component.values())
-    return torch.stack(losses).sum() / max(int(denom), 1), component
+    return torch.stack(losses).sum(), component
+
+
+def component_metric_name(column: str) -> str:
+    return "summary_length" if column == "summary_length_bucket" else str(column)
+
+
+def component_weight(column: str, loss_weights: dict[str, float]) -> float:
+    key = component_metric_name(column)
+    return float(loss_weights.get(key, loss_weights.get(column, 1.0)))
 
 
 def save_checkpoint(

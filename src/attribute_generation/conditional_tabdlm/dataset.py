@@ -12,7 +12,13 @@ import torch
 from torch.utils.data import Dataset
 
 from .schema import ConditionalTABDLMConfig, ConditionalTABDLMSchema
-from .tokenization import CategoryVocab, SimpleTextTokenizer, normalize_text, stable_hash_bucket
+from .tokenization import (
+    CategoryVocab,
+    SimpleTextTokenizer,
+    normalize_text,
+    stable_hash_bucket,
+    summary_length_bucket_name,
+)
 from .utils import ensure_dir, load_json, read_dataframe, save_json, write_dataframe
 
 
@@ -47,13 +53,6 @@ def prepare_rel_amazon_data(config: ConditionalTABDLMConfig) -> PreparedData:
     write_dataframe(test, output_dir / "test.parquet")
 
     save_json(schema.to_dict(), output_dir / "schema.json")
-    vocab_paths: dict[str, Path] = {}
-    for column in schema.categorical_targets:
-        vocab = CategoryVocab.from_values(column, train[column])
-        path = output_dir / f"vocab_{column}.json"
-        save_json(vocab.to_dict(), path)
-        vocab_paths[column] = path
-
     token_cfg = config.raw.get("tokenizer", {})
     max_vocab_size = int(token_cfg.get("max_vocab_size", 30000))
     min_frequency = int(token_cfg.get("min_frequency", 1))
@@ -63,8 +62,20 @@ def prepare_rel_amazon_data(config: ConditionalTABDLMConfig) -> PreparedData:
         for column in schema.text_targets:
             texts.extend(train[column].tolist())
         tokenizer.fit(texts, max_vocab_size=max_vocab_size, min_frequency=min_frequency)
+
+    vocab_paths: dict[str, Path] = {}
+    for column in schema.model_categorical_targets:
+        values = auxiliary_target_values(train, schema, tokenizer, column) if column in schema.auxiliary_categorical_targets else train[column]
+        vocab = CategoryVocab.from_values(column, values)
+        path = output_dir / f"vocab_{column}.json"
+        save_json(vocab.to_dict(), path)
+        vocab_paths[column] = path
     tokenizer_metadata = tokenizer.to_dict()
     tokenizer_metadata["text_max_lengths"] = dict(schema.text_max_lengths)
+    for column in schema.text_targets:
+        max_tokens = int(schema.text_max_lengths[column])
+        tokenizer_metadata[f"{column}_max_tokens"] = max_tokens
+        tokenizer_metadata[f"{column}_max_content_tokens"] = tokenizer.max_content_tokens(max_tokens)
     save_json(tokenizer_metadata, output_dir / "tokenizer_metadata.json")
 
     return PreparedData(
@@ -117,7 +128,7 @@ def load_prepared_tables(config: ConditionalTABDLMConfig) -> tuple[pd.DataFrame,
 
 def load_category_vocabs(config: ConditionalTABDLMConfig) -> dict[str, CategoryVocab]:
     vocabs: dict[str, CategoryVocab] = {}
-    for column in config.schema.categorical_targets:
+    for column in config.schema.model_categorical_targets:
         path = config.data_dir / f"vocab_{column}.json"
         vocabs[column] = CategoryVocab.from_dict(load_json(path))
     return vocabs
@@ -157,10 +168,10 @@ class ConditionalTABDLMDataset(Dataset):
             pd.Timestamp(row[column]).timestamp()
             for column in self.schema.datetime_columns
         ]
-        categorical = [
-            self.categorical_vocabs[column].encode(row[column])
-            for column in self.schema.categorical_targets
-        ]
+        categorical = []
+        for column in self.schema.model_categorical_targets:
+            value = self.auxiliary_value(row, column) if column in self.schema.auxiliary_categorical_targets else row[column]
+            categorical.append(self.categorical_vocabs[column].encode(value))
         text_ids: dict[str, list[int]] = {}
         text_attention: dict[str, list[int]] = {}
         for column in self.schema.text_targets:
@@ -175,6 +186,17 @@ class ConditionalTABDLMDataset(Dataset):
             "text_attention": {column: torch.tensor(att, dtype=torch.long) for column, att in text_attention.items()},
             "row_id": torch.tensor(int(index), dtype=torch.long),
         }
+
+    def auxiliary_value(self, row: pd.Series, column: str) -> str:
+        if column != "summary_length_bucket":
+            raise KeyError(f"Unsupported auxiliary categorical target: {column}")
+        if not self.schema.text_targets:
+            return "len_0"
+        summary_col = self.schema.text_targets[0]
+        max_tokens = self.schema.text_max_lengths[summary_col]
+        ids, _ = self.text_tokenizer.encode(row[summary_col], max_tokens)
+        content_length = self.text_tokenizer.content_length(ids)
+        return summary_length_bucket_name(content_length, self.schema.summary_length_buckets)
 
 
 def make_collate_fn(
@@ -218,7 +240,7 @@ def collate_and_mask(
     categorical_input = categorical_clean.clone()
     categorical_labels = torch.full_like(categorical_clean, -100)
     categorical_mask = torch.rand(categorical_clean.shape) < rates.view(-1, 1)
-    for col_idx, column in enumerate(schema.categorical_targets):
+    for col_idx, column in enumerate(schema.model_categorical_targets):
         categorical_input[categorical_mask[:, col_idx], col_idx] = categorical_vocabs[column].mask_id
         categorical_labels[categorical_mask[:, col_idx], col_idx] = categorical_clean[categorical_mask[:, col_idx], col_idx]
 
@@ -230,6 +252,8 @@ def collate_and_mask(
         clean = torch.stack([sample["text_ids"][column] for sample in samples], dim=0)
         attention = torch.stack([sample["text_attention"][column] for sample in samples], dim=0)
         candidate = attention.bool()
+        if candidate.shape[1] > 0:
+            candidate[:, 0] = False
         mask = (torch.rand(clean.shape) < rates.view(-1, 1)) & candidate
         noisy = clean.clone()
         labels = torch.full_like(clean, -100)
@@ -241,14 +265,15 @@ def collate_and_mask(
         masked_any |= mask.any(dim=1)
 
     for row_idx in torch.where(~masked_any)[0].tolist():
-        if len(schema.categorical_targets) > 0:
-            col_idx = int(torch.randint(0, len(schema.categorical_targets), (1,)).item())
-            column = schema.categorical_targets[col_idx]
+        if len(schema.model_categorical_targets) > 0:
+            col_idx = int(torch.randint(0, len(schema.model_categorical_targets), (1,)).item())
+            column = schema.model_categorical_targets[col_idx]
             categorical_input[row_idx, col_idx] = categorical_vocabs[column].mask_id
             categorical_labels[row_idx, col_idx] = categorical_clean[row_idx, col_idx]
         else:
             column = schema.text_targets[0]
             candidates = torch.where(text_attention[column][row_idx].bool())[0]
+            candidates = candidates[candidates != 0]
             pos = int(candidates[torch.randint(0, len(candidates), (1,)).item()].item())
             text_input[column][row_idx, pos] = text_tokenizer.mask_id
             text_labels[column][row_idx, pos] = torch.stack([sample["text_ids"][column] for sample in samples], dim=0)[row_idx, pos]
@@ -280,3 +305,21 @@ def mask_probability(
         curve = timesteps
     return torch.clamp(min_p + curve * (max_p - min_p), 0.0, 1.0)
 
+
+def auxiliary_target_values(
+    frame: pd.DataFrame,
+    schema: ConditionalTABDLMSchema,
+    tokenizer: SimpleTextTokenizer,
+    column: str,
+) -> list[str]:
+    if column != "summary_length_bucket":
+        raise KeyError(f"Unsupported auxiliary categorical target: {column}")
+    if not schema.text_targets:
+        return ["len_0"] * len(frame)
+    summary_col = schema.text_targets[0]
+    max_tokens = schema.text_max_lengths[summary_col]
+    values = []
+    for text in frame[summary_col]:
+        ids, _ = tokenizer.encode(text, max_tokens)
+        values.append(summary_length_bucket_name(tokenizer.content_length(ids), schema.summary_length_buckets))
+    return values

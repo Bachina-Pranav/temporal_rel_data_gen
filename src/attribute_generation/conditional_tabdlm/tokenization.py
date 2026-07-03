@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import random
 import re
 from dataclasses import dataclass
 from typing import Any, Iterable
@@ -88,6 +89,7 @@ class SimpleTextTokenizer:
     """Small deterministic text tokenizer with token-level truncation."""
 
     pad_token = "[PAD]"
+    bos_token = "[BOS]"
     mask_token = "[MASK]"
     unk_token = "[UNK]"
     eos_token = "[EOS]"
@@ -98,6 +100,7 @@ class SimpleTextTokenizer:
         if vocab is None:
             protected = [
                 self.pad_token,
+                self.bos_token,
                 self.mask_token,
                 self.unk_token,
                 self.eos_token,
@@ -105,6 +108,16 @@ class SimpleTextTokenizer:
             ]
             vocab = {token: idx for idx, token in enumerate(protected)}
         self.vocab = dict(vocab)
+        for token in [
+            self.pad_token,
+            self.bos_token,
+            self.mask_token,
+            self.unk_token,
+            self.eos_token,
+            self.empty_token,
+        ]:
+            if token not in self.vocab:
+                self.vocab[token] = len(self.vocab)
         self.inv_vocab = {idx: token for token, idx in self.vocab.items()}
 
     @property
@@ -114,6 +127,10 @@ class SimpleTextTokenizer:
     @property
     def mask_id(self) -> int:
         return self.vocab[self.mask_token]
+
+    @property
+    def bos_id(self) -> int:
+        return self.vocab[self.bos_token]
 
     @property
     def unk_id(self) -> int:
@@ -162,16 +179,17 @@ class SimpleTextTokenizer:
 
     def encode(self, text: Any, max_length: int) -> tuple[list[int], list[int]]:
         max_length = int(max_length)
-        if max_length <= 0:
-            raise ValueError("max_length must be positive")
-        tokens = self.tokenize(text)[: max(1, max_length - 1)]
-        ids = [self.vocab.get(token, self.unk_id) for token in tokens]
+        if max_length < 2:
+            raise ValueError("max_length must be at least 2 for BOS/EOS")
+        tokens = self.tokenize(text)[: self.max_content_tokens(max_length)]
+        ids = [self.bos_id]
+        ids.extend(self.vocab.get(token, self.unk_id) for token in tokens)
         ids.append(self.eos_id)
         ids = ids[:max_length]
         attention = [1] * len(ids)
         while len(ids) < max_length:
             ids.append(self.pad_id)
-            attention.append(0)
+            attention.append(1)
         return ids, attention
 
     def decode(self, ids: Iterable[int]) -> str:
@@ -180,10 +198,37 @@ class SimpleTextTokenizer:
             token = self.inv_vocab.get(int(idx), self.unk_token)
             if token == self.eos_token:
                 break
-            if token in {self.pad_token, self.mask_token, self.unk_token, self.empty_token}:
+            if token == self.pad_token:
+                break
+            if token in {self.bos_token, self.mask_token, self.unk_token, self.empty_token}:
                 continue
             tokens.append(token)
         return clean_detokenized(tokens)
+
+    def content_length(self, ids: Iterable[int]) -> int:
+        length = 0
+        for idx in ids:
+            idx = int(idx)
+            if idx in {self.bos_id, self.pad_id, self.mask_id}:
+                continue
+            if idx == self.eos_id:
+                break
+            length += 1
+        return int(length)
+
+    def max_content_tokens(self, max_length: int) -> int:
+        return max(0, int(max_length) - 2)
+
+    @property
+    def special_ids(self) -> set[int]:
+        return {self.pad_id, self.bos_id, self.mask_id, self.unk_id, self.eos_id}
+
+    @property
+    def content_token_ids(self) -> list[int]:
+        ids = [idx for token, idx in self.vocab.items() if idx not in self.special_ids and token != self.empty_token]
+        if ids:
+            return sorted(ids)
+        return [self.unk_id]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -192,10 +237,16 @@ class SimpleTextTokenizer:
             "vocab": dict(self.vocab),
             "special_ids": {
                 "pad": self.pad_id,
+                "bos": self.bos_id,
                 "mask": self.mask_id,
                 "unk": self.unk_id,
                 "eos": self.eos_id,
             },
+            "summary_vocab_size": self.vocab_size,
+            "summary_pad_token_id": self.pad_id,
+            "summary_bos_token_id": self.bos_id,
+            "summary_eos_token_id": self.eos_id,
+            "summary_unk_token_id": self.unk_id,
         }
 
     @classmethod
@@ -213,3 +264,37 @@ def clean_detokenized(tokens: list[str]) -> str:
     text = re.sub(r"\s+'", "'", text)
     return re.sub(r"\s+", " ", text).strip()
 
+
+def default_summary_length_buckets() -> dict[str, tuple[int, int]]:
+    return {
+        "len_0": (0, 0),
+        "len_1_2": (1, 2),
+        "len_3_5": (3, 5),
+        "len_6_10": (6, 10),
+        "len_11_16": (11, 16),
+        "len_17_32": (17, 32),
+    }
+
+
+def summary_length_bucket_name(content_length: int, buckets: dict[str, tuple[int, int]] | None = None) -> str:
+    buckets = buckets or default_summary_length_buckets()
+    content_length = int(content_length)
+    for name, (low, high) in buckets.items():
+        if int(low) <= content_length <= int(high):
+            return str(name)
+    return list(buckets)[-1]
+
+
+def sample_length_from_bucket(
+    bucket_name: str,
+    buckets: dict[str, tuple[int, int]],
+    max_content_tokens: int,
+    rng: random.Random | None = None,
+) -> int:
+    rng = rng or random
+    low, high = buckets[str(bucket_name)]
+    low = max(0, int(low))
+    high = min(int(high), int(max_content_tokens))
+    if high < low:
+        high = low
+    return int(rng.randint(low, high))
