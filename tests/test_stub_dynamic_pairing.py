@@ -122,3 +122,38 @@ def test_penalized_pairing_can_avoid_real_exact_event_pair():
     assert reordered.tolist() == ["p1", "p0"]
     assert summary["pairing_mode"] == "dynamic_exact_penalized"
     assert summary["num_penalized_cells"] == 1
+
+
+def test_penalized_pairing_large_cells_use_projection_fallback():
+    customers = np.asarray(["c0", "c1", "c2"], dtype=object)
+    products = np.asarray(["p0", "p1", "p2"], dtype=object)
+    customer_blocks = np.asarray([0, 0, 0])
+    product_blocks = np.asarray([0, 0, 0])
+    time_codes = np.asarray([0, 0, 0])
+    time_gate_codes = np.asarray([0, 0, 0])
+
+    reordered, summary = reorder_products_within_cells_by_dynamic_affinity(
+        customers,
+        products,
+        customer_blocks,
+        product_blocks,
+        time_codes,
+        time_gate_codes,
+        ToyAffinity(),
+        "dynamic_exact_penalized",
+        2,
+        np.random.default_rng(8),
+        code_to_time_gate=["2020-01"],
+        code_to_time_bucket=["2020-01-01"],
+        slot_customer_idx=np.asarray([0, 1, 2]),
+        slot_product_idx=np.asarray([0, 1, 2]),
+        real_pair_keys=set(),
+        real_event_keys=set(),
+        num_products=3,
+        num_time_codes=1,
+    )
+
+    assert Counter(reordered.tolist()) == Counter(products.tolist())
+    assert summary["num_exact_penalized_cells"] == 0
+    assert summary["num_projection_fallback_cells"] == 1
+    assert summary["percent_events_projection_fallback"] == 1.0

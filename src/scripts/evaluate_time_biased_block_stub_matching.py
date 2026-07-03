@@ -38,6 +38,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--skip-dynamic-affinity", action="store_true")
     parser.add_argument("--compute-c2st", action="store_true")
+    parser.add_argument("--c2st-sample-size", type=int, default=200000)
+    parser.add_argument("--c2st-model", choices=["hist_gradient_boosting", "logistic_regression"], default="hist_gradient_boosting")
+    parser.add_argument("--c2st-seed", type=int, default=42)
     parser.add_argument("--output", required=True)
     return parser.parse_args()
 
@@ -54,7 +57,7 @@ def main() -> None:
         customer_col=args.customer_id_col,
         product_col=args.product_id_col,
         timestamp_col=args.timestamp_col,
-        compute_c2st=args.compute_c2st,
+        compute_c2st=False,
         metadata=metadata,
     )
     if not args.skip_dynamic_affinity:
@@ -70,6 +73,24 @@ def main() -> None:
                 args.rank if args.rank is not None else int(metadata_value(metadata, "rank", 32)),
                 args.alpha_time_gate if args.alpha_time_gate is not None else metadata_value(metadata, "alpha_time_gate", "auto"),
                 args.seed,
+            )
+        )
+    if args.compute_c2st:
+        metrics.update(
+            sampled_c2st_metrics(
+                real,
+                synthetic,
+                args.customer_id_col,
+                args.product_id_col,
+                args.timestamp_col,
+                args.structure_debug_dir,
+                args.time_granularity,
+                args.time_gate_granularity or metadata_value(metadata, "time_gate_granularity", "month"),
+                args.rank if args.rank is not None else int(metadata_value(metadata, "rank", 32)),
+                args.alpha_time_gate if args.alpha_time_gate is not None else metadata_value(metadata, "alpha_time_gate", "auto"),
+                args.c2st_sample_size,
+                args.c2st_model,
+                args.c2st_seed,
             )
         )
     write_metrics(metrics, args.output)
@@ -130,6 +151,159 @@ def score_pairs_by_time(
 
 def metadata_value(metadata: Dict[str, Any] | None, key: str, default: Any) -> Any:
     return metadata.get(key, default) if metadata else default
+
+
+def score_pairs_by_time_aligned(
+    affinity: LowRankTimeGatedAffinity,
+    frame: pd.DataFrame,
+    customer_col: str,
+    product_col: str,
+    timestamp_col: str,
+) -> np.ndarray:
+    scores = np.zeros(len(frame), dtype=float)
+    if len(frame) == 0:
+        return scores
+    for time_bucket, group in frame.groupby(timestamp_col, sort=False):
+        scores[group.index.to_numpy(dtype=int)] = affinity.score_pairs(
+            group[customer_col].to_numpy(dtype=object),
+            group[product_col].to_numpy(dtype=object),
+            time_bucket,
+        )
+    return scores
+
+
+def sampled_c2st_metrics(
+    real: pd.DataFrame,
+    synthetic: pd.DataFrame,
+    customer_col: str,
+    product_col: str,
+    timestamp_col: str,
+    structure_debug_dir: str | None,
+    time_granularity: str,
+    time_gate_granularity: str,
+    rank: int,
+    alpha_time_gate: Any,
+    sample_size: int,
+    model_name: str,
+    seed: int,
+) -> Dict[str, Any]:
+    try:
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.metrics import roc_auc_score
+        from sklearn.model_selection import train_test_split
+    except Exception:
+        return {"event_tuple_c2st_accuracy": None, "event_tuple_c2st_auc": None, "c2st_sample_size": 0}
+    try:
+        from sklearn.experimental import enable_hist_gradient_boosting  # noqa: F401
+        from sklearn.ensemble import HistGradientBoostingClassifier
+    except Exception:
+        HistGradientBoostingClassifier = None
+
+    rng = np.random.default_rng(int(seed))
+    n = min(int(sample_size), len(real), len(synthetic))
+    if n < 10:
+        return {"event_tuple_c2st_accuracy": None, "event_tuple_c2st_auc": None, "c2st_sample_size": int(n)}
+    real_sample = real.iloc[rng.choice(len(real), size=n, replace=False)].copy()
+    syn_sample = synthetic.iloc[rng.choice(len(synthetic), size=n, replace=False)].copy()
+    data = pd.concat([real_sample.assign(_label=0), syn_sample.assign(_label=1)], ignore_index=True)
+    real_c = real[[customer_col, product_col, timestamp_col]].copy()
+    real_c[timestamp_col] = canonical_time_bucket(real_c[timestamp_col], time_granularity)
+    data[timestamp_col] = canonical_time_bucket(data[timestamp_col], time_granularity)
+    customer_degree = real_c[customer_col].value_counts()
+    product_degree = real_c[product_col].value_counts()
+    customer_windows = window_frame(real_c, customer_col, timestamp_col)
+    product_windows = window_frame(real_c, product_col, timestamp_col)
+    customer_blocks, product_blocks = load_blocks_for_c2st(structure_debug_dir, customer_col, product_col)
+    affinity = LowRankTimeGatedAffinity(
+        rank=rank,
+        alpha_time_gate=alpha_time_gate,
+        time_gate_granularity=time_gate_granularity,
+        seed=seed,
+    ).fit(real_c, customer_col, product_col, timestamp_col)
+    day_values = pd.to_datetime(data[timestamp_col], errors="coerce").map(lambda value: value.toordinal() if pd.notna(value) else 0)
+    month_values = pd.to_datetime(data[timestamp_col], errors="coerce").dt.to_period("M").astype(str).astype("category").cat.codes
+    features = pd.DataFrame(
+        {
+            "customer_degree": data[customer_col].map(customer_degree).fillna(0).astype(float),
+            "product_degree": data[product_col].map(product_degree).fillna(0).astype(float),
+            "customer_block": data[customer_col].map(customer_blocks).fillna(0).astype(float),
+            "product_block": data[product_col].map(product_blocks).fillna(0).astype(float),
+            "day_index": day_values.astype(float),
+            "month_index": month_values.astype(float),
+            "customer_first_time": data[customer_col].map(customer_windows["first"]).fillna(0).astype(float),
+            "customer_last_time": data[customer_col].map(customer_windows["last"]).fillna(0).astype(float),
+            "product_first_time": data[product_col].map(product_windows["first"]).fillna(0).astype(float),
+            "product_last_time": data[product_col].map(product_windows["last"]).fillna(0).astype(float),
+            "customer_relative_age": relative_age_feature(data, customer_col, timestamp_col, customer_windows),
+            "product_relative_age": relative_age_feature(data, product_col, timestamp_col, product_windows),
+            "dynamic_affinity_score": score_pairs_by_time_aligned(affinity, data, customer_col, product_col, timestamp_col),
+        }
+    )
+    labels = data["_label"].to_numpy()
+    x_train, x_test, y_train, y_test = train_test_split(
+        features.to_numpy(dtype=float),
+        labels,
+        test_size=0.3,
+        random_state=int(seed),
+        stratify=labels,
+    )
+    actual_model = model_name
+    if model_name == "logistic_regression" or HistGradientBoostingClassifier is None:
+        clf = LogisticRegression(max_iter=500, random_state=int(seed))
+        if model_name != "logistic_regression":
+            actual_model = "logistic_regression_fallback"
+    else:
+        clf = HistGradientBoostingClassifier(max_iter=100, max_leaf_nodes=31, random_state=int(seed))
+    clf.fit(x_train, y_train)
+    accuracy = float(clf.score(x_test, y_test))
+    if hasattr(clf, "predict_proba"):
+        scores = clf.predict_proba(x_test)[:, 1]
+    else:
+        scores = clf.decision_function(x_test)
+    try:
+        auc = float(roc_auc_score(y_test, scores))
+    except Exception:
+        auc = None
+    return {
+        "event_tuple_c2st_accuracy": accuracy,
+        "event_tuple_c2st_auc": auc,
+        "c2st_sample_size": int(n),
+        "c2st_model": actual_model,
+    }
+
+
+def load_blocks_for_c2st(structure_debug_dir: str | None, customer_col: str, product_col: str) -> tuple[Dict[Any, int], Dict[Any, int]]:
+    if not structure_debug_dir:
+        return {}, {}
+    root = Path(structure_debug_dir)
+    return load_block_csv(root / "customer_blocks.csv", customer_col, "customer_block"), load_block_csv(root / "product_blocks.csv", product_col, "product_block")
+
+
+def load_block_csv(path: Path, entity_col: str, block_col: str) -> Dict[Any, int]:
+    if not path.exists():
+        return {}
+    frame = pd.read_csv(path)
+    if entity_col not in frame.columns or block_col not in frame.columns:
+        return {}
+    return dict(zip(frame[entity_col], frame[block_col].astype(int)))
+
+
+def window_frame(frame: pd.DataFrame, entity_col: str, timestamp_col: str) -> Dict[str, pd.Series]:
+    days = pd.to_datetime(frame[timestamp_col], errors="coerce").map(lambda value: value.toordinal() if pd.notna(value) else 0)
+    tmp = pd.DataFrame({"entity": frame[entity_col].to_numpy(dtype=object), "day": days.to_numpy(dtype=float)})
+    grouped = tmp.groupby("entity", sort=False)["day"].agg(["min", "max"])
+    return {"first": grouped["min"], "last": grouped["max"]}
+
+
+def relative_age_feature(data: pd.DataFrame, entity_col: str, timestamp_col: str, windows: Dict[str, pd.Series]) -> np.ndarray:
+    first = data[entity_col].map(windows["first"]).to_numpy(dtype=float)
+    last = data[entity_col].map(windows["last"]).to_numpy(dtype=float)
+    day = pd.to_datetime(data[timestamp_col], errors="coerce").map(lambda value: value.toordinal() if pd.notna(value) else 0).to_numpy(dtype=float)
+    output = np.zeros(len(data), dtype=float)
+    valid = np.isfinite(first) & np.isfinite(last)
+    span = np.maximum(last[valid] - first[valid], 1.0)
+    output[valid] = (day[valid] - first[valid]) / span
+    return output
 
 
 if __name__ == "__main__":

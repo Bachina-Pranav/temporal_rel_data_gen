@@ -43,6 +43,7 @@ class TimeBiasedBlockStubMatchingGenerator:
         customer_id_col: str = "customer_id",
         product_id_col: str = "product_id",
         timestamp_col: str = "review_time",
+        dataset: Optional[str] = None,
         structure_debug_dir: Optional[str | Path] = None,
         time_granularity: str = "day",
         time_gate_granularity: str = "month",
@@ -62,7 +63,9 @@ class TimeBiasedBlockStubMatchingGenerator:
         pairing_mode: str = "dynamic_exact_penalized",
         max_exact_affinity_cell_size: int = 128,
         large_cell_pairing: str = "projection_sort",
+        large_cell_local_swap_attempts: int = 2,
         desired_time_jitter: float = 1e-3,
+        verbose_block_logs: bool = False,
         enable_fast_overlap_repair: bool = False,
         overlap_resample_prob: float = 0.0,
         lambda_duplicate_pair: float = 1.0,
@@ -87,6 +90,7 @@ class TimeBiasedBlockStubMatchingGenerator:
         self.customer_id_col = customer_id_col
         self.product_id_col = product_id_col
         self.timestamp_col = timestamp_col
+        self.dataset = dataset
         self.structure_debug_dir = Path(structure_debug_dir) if structure_debug_dir else None
         self.time_granularity = time_granularity
         self.time_gate_granularity = time_gate_granularity
@@ -106,7 +110,9 @@ class TimeBiasedBlockStubMatchingGenerator:
         self.pairing_mode = pairing_mode
         self.max_exact_affinity_cell_size = int(max_exact_affinity_cell_size)
         self.large_cell_pairing = large_cell_pairing
+        self.large_cell_local_swap_attempts = int(large_cell_local_swap_attempts)
         self.desired_time_jitter = float(desired_time_jitter)
+        self.verbose_block_logs = bool(verbose_block_logs)
         self.enable_fast_overlap_repair = bool(enable_fast_overlap_repair)
         self.overlap_resample_prob = float(overlap_resample_prob)
         self.lambda_duplicate_pair = float(lambda_duplicate_pair)
@@ -172,6 +178,11 @@ class TimeBiasedBlockStubMatchingGenerator:
         self.code_to_gate = sorted(frame["_time_gate_bucket"].unique().tolist())
         self.gate_to_code = {gate: idx for idx, gate in enumerate(self.code_to_gate)}
         frame["_time_gate_code"] = frame["_time_gate_bucket"].map(self.gate_to_code).astype(int)
+        print(
+            f"[fit] rows={len(frame):,}, customers={frame[self.customer_id_col].nunique():,}, "
+            f"products={frame[self.product_id_col].nunique():,}, days={len(self.code_to_day):,}",
+            flush=True,
+        )
         self.customer_blocks, self.product_blocks, self.block_warnings = self._load_or_fallback_blocks(frame)
         frame["_customer_block"] = frame[self.customer_id_col].map(self.customer_blocks).fillna(0).astype(int)
         frame["_product_block"] = frame[self.product_id_col].map(self.product_blocks).fillna(0).astype(int)
@@ -219,7 +230,7 @@ class TimeBiasedBlockStubMatchingGenerator:
         sample_start = time.time()
         rng = np.random.default_rng(self.seed if seed is None else int(seed))
         self._build_slots()
-        print("[customer-stubs] assigning exact customer stubs by time-biased sort", flush=True)
+        print(f"[customer-stubs] assigning exact customer stubs by {self.desired_time_sampling_mode}", flush=True)
         self.slot_customer_idx, self.customer_assignment_summary = assign_stubs_to_slots_by_time(
             self.customer_activity.entity_ids,
             self.customer_degrees,
@@ -233,9 +244,10 @@ class TimeBiasedBlockStubMatchingGenerator:
             return_entity_indices=True,
             desired_time_sampling_mode=self.desired_time_sampling_mode,
             local_kernel_state=self.customer_local_kernel_state,
+            verbose_block_logs=self.verbose_block_logs,
         )
         print(f"[customer-stubs] done in {self.customer_assignment_summary['assignment_seconds']:.2f}s", flush=True)
-        print("[product-stubs] assigning exact product stubs by time-biased sort", flush=True)
+        print(f"[product-stubs] assigning exact product stubs by {self.desired_time_sampling_mode}", flush=True)
         self.slot_product_idx, self.product_assignment_summary = assign_stubs_to_slots_by_time(
             self.product_activity.entity_ids,
             self.product_degrees,
@@ -249,11 +261,19 @@ class TimeBiasedBlockStubMatchingGenerator:
             return_entity_indices=True,
             desired_time_sampling_mode=self.desired_time_sampling_mode,
             local_kernel_state=self.product_local_kernel_state,
+            verbose_block_logs=self.verbose_block_logs,
         )
         print(f"[product-stubs] done in {self.product_assignment_summary['assignment_seconds']:.2f}s", flush=True)
         self.slot_customer_id = self.customer_activity.entity_ids[self.slot_customer_idx]
         self.slot_product_id = self.product_activity.entity_ids[self.slot_product_idx]
-        print(f"[pairing] {self.pairing_mode} over {len(self.block_pair_time_counts):,} cells", flush=True)
+        if self.pairing_mode == "dynamic_exact_penalized":
+            print(
+                f"[pairing] dynamic_exact_penalized with projection fallback over "
+                f"{len(self.block_pair_time_counts):,} cells",
+                flush=True,
+            )
+        else:
+            print(f"[pairing] {self.pairing_mode} over {len(self.block_pair_time_counts):,} cells", flush=True)
         self.slot_product_id, self.dynamic_pairing_summary = reorder_products_within_cells_by_dynamic_affinity(
             self.slot_customer_id,
             self.slot_product_id,
@@ -279,7 +299,14 @@ class TimeBiasedBlockStubMatchingGenerator:
             lambda_duplicate_pair=self.lambda_duplicate_pair,
             lambda_real_pair_overlap=self.lambda_real_pair_overlap,
             lambda_exact_event_overlap=self.lambda_exact_event_overlap,
+            large_cell_local_swap_attempts=self.large_cell_local_swap_attempts,
         )
+        if self.pairing_mode == "dynamic_exact_penalized":
+            print(
+                f"[pairing] exact cells={self.dynamic_pairing_summary.get('num_exact_penalized_cells', 0):,}, "
+                f"projection fallback cells={self.dynamic_pairing_summary.get('num_projection_fallback_cells', 0):,}",
+                flush=True,
+            )
         print(f"[pairing] done in {self.dynamic_pairing_summary['dynamic_pairing_seconds']:.2f}s", flush=True)
         synthetic = pd.DataFrame(
             {
@@ -387,6 +414,7 @@ class TimeBiasedBlockStubMatchingGenerator:
         affinity_summary = self.affinity_model.summary() if self.affinity_model is not None else {}
         metadata = {
             "method": METHOD_NAME,
+            "dataset": self.dataset,
             "alias": METHOD_ALIAS,
             "class_name": "TimeBiasedBlockStubMatchingGenerator",
             "generates_joint_events": True,
@@ -443,6 +471,7 @@ class TimeBiasedBlockStubMatchingGenerator:
             "pairing_mode": self.pairing_mode,
             "large_cell_pairing": self.large_cell_pairing,
             "max_exact_affinity_cell_size": int(self.max_exact_affinity_cell_size),
+            "large_cell_local_swap_attempts": int(self.large_cell_local_swap_attempts),
             "lambda_duplicate_pair": float(self.lambda_duplicate_pair),
             "lambda_real_pair_overlap": float(self.lambda_real_pair_overlap),
             "lambda_exact_event_overlap": float(self.lambda_exact_event_overlap),
@@ -454,6 +483,7 @@ class TimeBiasedBlockStubMatchingGenerator:
             "time_granularity": self.time_granularity,
             "time_gate_granularity": self.time_gate_granularity,
             "rank": int(self.rank),
+            "verbose_block_logs": bool(self.verbose_block_logs),
             "alpha_customer_time": float(self.customer_activity.alpha_resolved),
             "alpha_product_time": float(self.product_activity.alpha_resolved),
             "alpha_time_gate": float(affinity_summary.get("alpha_time_gate", 0.0)),
@@ -468,6 +498,14 @@ class TimeBiasedBlockStubMatchingGenerator:
             "lowrank_affinity": affinity_summary,
             "created_at": datetime.utcnow().isoformat() + "Z",
         }
+        for key in [
+            "num_exact_penalized_cells",
+            "num_projection_fallback_cells",
+            "percent_events_exact_penalized",
+            "percent_events_projection_fallback",
+            "largest_cell_size",
+        ]:
+            metadata[key] = self.dynamic_pairing_summary.get(key)
         metadata.update(self.slot_summary)
         metadata.update(self.runtime_metadata)
         return metadata
@@ -723,6 +761,10 @@ class TimeBiasedBlockStubMatchingGenerator:
             f"in {self.slot_summary['slot_build_seconds']:.2f}s",
             flush=True,
         )
+        if self.slot_summary["max_cell_size"] > 50000:
+            print("[slots] WARNING: Very large cells detected. Ensure projection fallback is active.", flush=True)
+        elif self.slot_summary["max_cell_size"] > 5000:
+            print("[slots] WARNING: Large cells detected. Exact pairing will fallback to projection for those cells.", flush=True)
 
     def _verify_exact_constraints(self, synthetic: pd.DataFrame) -> None:
         real = self.real_df

@@ -39,6 +39,7 @@ def reorder_products_within_cells_by_dynamic_affinity(
     lambda_real_pair_overlap: float = 1.0,
     lambda_exact_event_overlap: float = 3.0,
     max_overlap_attempts: int = 5,
+    large_cell_local_swap_attempts: int = 2,
 ) -> tuple[np.ndarray, Dict[str, Any]]:
     """Reorder products inside exact cells while preserving all slot constraints."""
 
@@ -80,6 +81,10 @@ def reorder_products_within_cells_by_dynamic_affinity(
     exact_cells = 0
     projection_cells = 0
     penalized_cells = 0
+    exact_penalized_cells = 0
+    projection_fallback_cells = 0
+    exact_penalized_events = 0
+    projection_fallback_events = 0
     pair_counts: Dict[int, int] = {}
     repair_summary = {"num_repaired_cells": 0, "num_swaps": 0, "overlaps_before": 0, "overlaps_after": 0}
     for start_idx, end_idx in zip(starts, ends):
@@ -90,6 +95,8 @@ def reorder_products_within_cells_by_dynamic_affinity(
         cell_product_idx = product_idx[indices]
         if len(indices) <= 1:
             if pairing_mode == "dynamic_exact_penalized":
+                exact_penalized_cells += int(len(indices) == 1)
+                exact_penalized_events += int(len(indices))
                 update_packed_pair_counts(pair_counts, cell_customer_idx, cell_product_idx, int(num_products))
             continue
         gate_key = gate_lookup(time_gate_code[indices[0]], code_to_time_gate, time_code[indices[0]], code_to_time_bucket)
@@ -114,26 +121,58 @@ def reorder_products_within_cells_by_dynamic_affinity(
                 reordered = reorder_products_by_projection_affinity(cell_customers, cell_products, gate_key, affinity_model, rng, dynamic=True)
                 projection_cells += 1
         elif pairing_mode == "dynamic_exact_penalized":
-            reordered, reordered_idx = reorder_products_by_penalized_exact_greedy_affinity(
-                cell_customers,
-                cell_products,
-                cell_customer_idx,
-                cell_product_idx,
-                gate_key,
-                int(time_code[indices[0]]),
-                affinity_model,
-                rng,
-                pair_counts,
-                int(num_products),
-                int(num_time_codes),
-                real_pair_keys,
-                real_event_keys,
-                lambda_duplicate_pair,
-                lambda_real_pair_overlap,
-                lambda_exact_event_overlap,
-            )
-            penalized_cells += 1
-            exact_cells += 1
+            if len(indices) <= int(max_exact_affinity_cell_size):
+                reordered, reordered_idx = reorder_products_by_penalized_exact_greedy_affinity(
+                    cell_customers,
+                    cell_products,
+                    cell_customer_idx,
+                    cell_product_idx,
+                    gate_key,
+                    int(time_code[indices[0]]),
+                    affinity_model,
+                    rng,
+                    pair_counts,
+                    int(num_products),
+                    int(num_time_codes),
+                    real_pair_keys,
+                    real_event_keys,
+                    lambda_duplicate_pair,
+                    lambda_real_pair_overlap,
+                    lambda_exact_event_overlap,
+                )
+                penalized_cells += 1
+                exact_cells += 1
+                exact_penalized_cells += 1
+                exact_penalized_events += int(len(indices))
+            else:
+                reordered = reorder_products_by_projection_affinity(
+                    cell_customers,
+                    cell_products,
+                    gate_key,
+                    affinity_model,
+                    rng,
+                    dynamic=True,
+                )
+                projection_cells += 1
+                projection_fallback_cells += 1
+                projection_fallback_events += int(len(indices))
+                if real_event_set is not None and int(large_cell_local_swap_attempts) > 0:
+                    time_bucket = code_to_time_bucket[time_code[indices[0]]] if code_to_time_bucket is not None else str(time_code[indices[0]])
+                    reordered, repair = repair_exact_overlaps_within_cell(
+                        cell_customers,
+                        reordered,
+                        time_bucket,
+                        real_event_set,
+                        rng,
+                        max_attempts=int(large_cell_local_swap_attempts),
+                    )
+                    if repair["num_swaps"] > 0:
+                        repair_summary["num_repaired_cells"] += 1
+                    repair_summary["num_swaps"] += int(repair["num_swaps"])
+                    repair_summary["overlaps_before"] += int(repair["overlaps_before"])
+                    repair_summary["overlaps_after"] += int(repair["overlaps_after"])
+                product_lookup = getattr(affinity_model, "product_index", {})
+                reordered_idx = ids_to_indices(reordered, product_lookup)
         else:
             raise ValueError("Unsupported pairing_mode")
         if enable_fast_overlap_repair and real_event_set is not None:
@@ -163,11 +202,18 @@ def reorder_products_within_cells_by_dynamic_affinity(
         "num_cells": int(len(starts)),
         "average_cell_size": float(np.mean(counts)) if len(counts) else 0.0,
         "max_cell_size": int(np.max(counts)) if len(counts) else 0,
+        "largest_cell_size": int(np.max(counts)) if len(counts) else 0,
+        "max_exact_affinity_cell_size": int(max_exact_affinity_cell_size),
         "pairing_mode": pairing_mode,
         "large_cell_pairing": large_cell_pairing,
         "num_exact_small_cells": int(exact_cells),
         "num_projection_cells": int(projection_cells),
         "num_penalized_cells": int(penalized_cells),
+        "num_exact_penalized_cells": int(exact_penalized_cells),
+        "num_projection_fallback_cells": int(projection_fallback_cells),
+        "percent_events_exact_penalized": float(exact_penalized_events / max(len(products), 1)),
+        "percent_events_projection_fallback": float(projection_fallback_events / max(len(products), 1)),
+        "large_cell_local_swap_attempts": int(large_cell_local_swap_attempts),
         "lambda_duplicate_pair": float(lambda_duplicate_pair),
         "lambda_real_pair_overlap": float(lambda_real_pair_overlap),
         "lambda_exact_event_overlap": float(lambda_exact_event_overlap),

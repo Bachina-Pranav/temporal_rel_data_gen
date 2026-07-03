@@ -27,6 +27,7 @@ def assign_stubs_to_slots_by_time(
     desired_time_sampling_mode: str = "mixture_shrinkage",
     local_kernel_state: Dict[str, Any] | None = None,
     mixture_sampling_state: Dict[str, Any] | None = None,
+    verbose_block_logs: bool = False,
 ) -> tuple[np.ndarray, Dict[str, Any]]:
     """Assign exact entity stubs to slots through integer time-biased sorting."""
 
@@ -81,7 +82,8 @@ def assign_stubs_to_slots_by_time(
                 "block_seconds": float(time.time() - block_total_start),
             }
             block_summaries.append(block_summary)
-            print_block_timing(log_label, block_summary)
+            if verbose_block_logs:
+                print_block_timing(log_label, block_summary)
             continue
 
         sample_start = time.time()
@@ -151,7 +153,8 @@ def assign_stubs_to_slots_by_time(
             "block_seconds": float(time.time() - block_total_start),
         }
         block_summaries.append(block_summary)
-        print_block_timing(log_label, block_summary)
+        if verbose_block_logs:
+            print_block_timing(log_label, block_summary)
 
     summary = {
         "num_blocks": int(len(blocks)),
@@ -168,6 +171,7 @@ def assign_stubs_to_slots_by_time(
         "block_timings": block_summaries,
         "returns_entity_indices": bool(return_entity_indices),
         "desired_time_sampling_mode": desired_time_sampling_mode,
+        "verbose_block_logs": bool(verbose_block_logs),
     }
     if return_entity_indices:
         return assigned_idx, summary
