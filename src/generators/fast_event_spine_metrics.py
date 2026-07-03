@@ -26,6 +26,14 @@ RUNTIME_KEYS = [
     "average_cell_size",
     "max_cell_size",
     "percent_large_cells_projection_sort",
+    "slot_build_seconds",
+    "customer_assignment_seconds",
+    "customer_repair_seconds",
+    "product_assignment_seconds",
+    "product_repair_seconds",
+    "assignment_seconds",
+    "repair_seconds",
+    "pairing_seconds",
 ]
 
 
@@ -48,6 +56,7 @@ def evaluate_fast_event_spine(
         timestamp_col=timestamp_col,
         compute_c2st=compute_c2st,
     )
+    metrics.update(degree_exact_match_metrics(real, synthetic, customer_col, product_col))
     metrics["block_pair_count_l1"] = block_pair_count_l1(
         real,
         synthetic,
@@ -61,6 +70,22 @@ def evaluate_fast_event_spine(
             metrics[key] = metadata.get(key)
         metrics["method"] = metadata.get("method")
     return metrics
+
+
+def degree_exact_match_metrics(
+    real: pd.DataFrame,
+    synthetic: pd.DataFrame,
+    customer_col: str,
+    product_col: str,
+) -> Dict[str, bool]:
+    real_customer = real[customer_col].value_counts().sort_index()
+    syn_customer = synthetic[customer_col].value_counts().reindex(real_customer.index, fill_value=0).sort_index()
+    real_product = real[product_col].value_counts().sort_index()
+    syn_product = synthetic[product_col].value_counts().reindex(real_product.index, fill_value=0).sort_index()
+    return {
+        "customer_degree_exact_match": bool(real_customer.equals(syn_customer)),
+        "product_degree_exact_match": bool(real_product.equals(syn_product)),
+    }
 
 
 def block_pair_count_l1(
