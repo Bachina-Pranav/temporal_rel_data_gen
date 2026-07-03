@@ -105,13 +105,24 @@ def train_from_config(config: ConditionalTABDLMConfig, device: str | None = None
     best_path = checkpoint_dir / "best.pt"
     last_path = checkpoint_dir / "last.pt"
     epochs = int(training.get("epochs", 5))
+    early_stopping_patience = int(training.get("early_stopping_patience", 0) or 0)
+    early_stopping_min_delta = float(training.get("early_stopping_min_delta", 0.0) or 0.0)
+    epochs_without_improvement = 0
+    best_epoch = 0
     for epoch in range(1, epochs + 1):
         train_metrics = run_epoch(model, train_loader, optimizer, scaler, device, use_amp)
         valid_metrics = run_epoch(model, valid_loader, None, scaler, device, use_amp)
+        current_valid = float(valid_metrics["total_loss"])
+        improved = current_valid < (best_valid - early_stopping_min_delta)
         row = {
             "epoch": epoch,
             **{f"train_{key}": value for key, value in train_metrics.items()},
             **{f"valid_{key}": value for key, value in valid_metrics.items()},
+            "best_valid_total_loss": min(best_valid, current_valid),
+            "best_epoch": best_epoch if not improved else epoch,
+            "early_stopping_patience": early_stopping_patience,
+            "early_stopping_min_delta": early_stopping_min_delta,
+            "epochs_without_improvement": 0 if improved else epochs_without_improvement + 1,
         }
         append_jsonl(log_path, row)
         print(json.dumps(row, sort_keys=True))
@@ -124,8 +135,10 @@ def train_from_config(config: ConditionalTABDLMConfig, device: str | None = None
             epoch,
             valid_metrics,
         )
-        if valid_metrics["total_loss"] < best_valid:
-            best_valid = float(valid_metrics["total_loss"])
+        if improved:
+            best_valid = current_valid
+            best_epoch = epoch
+            epochs_without_improvement = 0
             save_checkpoint(
                 best_path,
                 model,
@@ -135,6 +148,17 @@ def train_from_config(config: ConditionalTABDLMConfig, device: str | None = None
                 epoch,
                 valid_metrics,
             )
+        else:
+            epochs_without_improvement += 1
+        if early_stopping_patience > 0 and epochs_without_improvement >= early_stopping_patience:
+            print(
+                "Early stopping at "
+                f"epoch={epoch}; best_epoch={best_epoch}; "
+                f"best_valid_total_loss={best_valid:.6g}; "
+                f"patience={early_stopping_patience}; "
+                f"min_delta={early_stopping_min_delta}"
+            )
+            break
     print(f"Wrote best checkpoint to {best_path}")
     return best_path
 
@@ -318,4 +342,3 @@ def append_jsonl(path: str | Path, row: dict[str, Any]) -> None:
     with Path(path).open("a") as handle:
         json.dump(row, handle, sort_keys=True)
         handle.write("\n")
-

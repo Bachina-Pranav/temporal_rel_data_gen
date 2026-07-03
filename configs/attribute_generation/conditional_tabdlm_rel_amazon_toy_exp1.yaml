@@ -54,7 +54,9 @@ diffusion:
 training:
   max_rows: 50000
   batch_size: 128
-  epochs: 5
+  epochs: 100
+  early_stopping_patience: 15
+  early_stopping_min_delta: 0.0001
   learning_rate: 0.0003
   weight_decay: 0.01
   seed: 42

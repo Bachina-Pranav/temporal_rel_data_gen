@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -170,8 +171,8 @@ def monthly_series_metrics(
     value_col: str,
     prefix: str,
 ) -> dict[str, Any]:
-    real_series = real.set_index(timestamp_col)[value_col].resample("M").mean()
-    syn_series = synthetic.set_index(timestamp_col)[value_col].resample("M").mean()
+    real_series = monthly_mean_series(real, timestamp_col, value_col)
+    syn_series = monthly_mean_series(synthetic, timestamp_col, value_col)
     index = real_series.index.union(syn_series.index)
     r = real_series.reindex(index)
     s = syn_series.reindex(index)
@@ -179,6 +180,15 @@ def monthly_series_metrics(
         f"{prefix}_corr": safe_corr(r.to_numpy(dtype=float), s.to_numpy(dtype=float)),
         f"{prefix}_mae": float(np.nanmean(np.abs(r.to_numpy(dtype=float) - s.to_numpy(dtype=float)))) if len(index) else None,
     }
+
+
+def monthly_mean_series(frame: pd.DataFrame, timestamp_col: str, value_col: str) -> pd.Series:
+    monthly = frame[[timestamp_col, value_col]].dropna().copy()
+    if monthly.empty:
+        return pd.Series(dtype=float)
+    monthly["_month"] = pd.to_datetime(monthly[timestamp_col], errors="coerce").dt.to_period("M")
+    monthly = monthly.dropna(subset=["_month"])
+    return monthly.groupby("_month")[value_col].mean()
 
 
 def joint_rating_verified_metrics(real: pd.DataFrame, synthetic: pd.DataFrame, rating_col: str, verified_col: str) -> dict[str, Any]:
@@ -270,6 +280,7 @@ def text_consistency_metrics(
         from sklearn.linear_model import LogisticRegression
         from sklearn.metrics import accuracy_score, roc_auc_score
         from sklearn.pipeline import make_pipeline
+        from sklearn.exceptions import ConvergenceWarning
     except Exception:
         return metrics
     train = real.dropna(subset=[summary_col, rating_col])
@@ -278,9 +289,14 @@ def text_consistency_metrics(
     if train[rating_col].nunique() > 1:
         clf = make_pipeline(
             TfidfVectorizer(max_features=50000, ngram_range=(1, 2)),
-            LogisticRegression(max_iter=300, n_jobs=1),
+            LogisticRegression(max_iter=1000, n_jobs=1),
         )
-        clf.fit(train[summary_col].map(normalize_text), train[rating_col].astype(str))
+        metrics["rating_text_predictor_converged"] = fit_text_classifier(
+            clf,
+            train[summary_col].map(normalize_text),
+            train[rating_col].astype(str),
+            ConvergenceWarning,
+        )
         pred = clf.predict(synthetic[summary_col].map(normalize_text))
         pred_dist = pd.Series(pred).value_counts(normalize=True).to_dict()
         metrics["predicted_rating_distribution"] = {str(k): float(v) for k, v in pred_dist.items()}
@@ -290,15 +306,27 @@ def text_consistency_metrics(
         if y.nunique() > 1:
             clf = make_pipeline(
                 TfidfVectorizer(max_features=50000, ngram_range=(1, 2)),
-                LogisticRegression(max_iter=300, n_jobs=1),
+                LogisticRegression(max_iter=1000, n_jobs=1),
             )
-            clf.fit(train[summary_col].map(normalize_text), y)
+            metrics["verified_text_predictor_converged"] = fit_text_classifier(
+                clf,
+                train[summary_col].map(normalize_text),
+                y,
+                ConvergenceWarning,
+            )
             if hasattr(clf[-1], "predict_proba"):
                 prob = clf.predict_proba(synthetic[summary_col].map(normalize_text))[:, 1]
                 syn_y = boolish_numeric(synthetic[verified_col])
                 if syn_y.nunique() > 1:
                     metrics["verified_text_predictor_auc"] = float(roc_auc_score(syn_y, prob))
     return metrics
+
+
+def fit_text_classifier(clf, texts: pd.Series, labels: pd.Series, convergence_warning_type) -> bool:
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", convergence_warning_type)
+        clf.fit(texts, labels)
+    return not any(issubclass(item.category, convergence_warning_type) for item in caught)
 
 
 def top_entity_mae(
@@ -391,4 +419,3 @@ def write_report(metrics: dict[str, Any], path: str | Path) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines))
-
