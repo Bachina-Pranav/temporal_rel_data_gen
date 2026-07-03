@@ -47,6 +47,8 @@ KEYS = [
     "joint_coactive_window_rate",
     "mean_dynamic_affinity_real",
     "mean_dynamic_affinity_synthetic",
+    "median_dynamic_affinity_real",
+    "median_dynamic_affinity_synthetic",
     "dynamic_affinity_distribution_ks",
     "event_tuple_c2st_accuracy",
 ]

@@ -81,3 +81,44 @@ def test_reorder_products_within_cells_preserves_each_cell_product_multiset():
     assert before == after
     assert summary["num_cells"] == 2
     assert summary["pairing_mode"] == "dynamic_projection"
+
+
+def test_penalized_pairing_can_avoid_real_exact_event_pair():
+    customers = np.asarray(["c0", "c1"], dtype=object)
+    products = np.asarray(["p0", "p1"], dtype=object)
+    customer_blocks = np.asarray([0, 0])
+    product_blocks = np.asarray([0, 0])
+    time_codes = np.asarray([0, 0])
+    time_gate_codes = np.asarray([0, 0])
+    num_products = 3
+    num_time_codes = 1
+    real_pair_keys = {0 * num_products + 0, 1 * num_products + 1}
+    real_event_keys = {key * num_time_codes + 0 for key in real_pair_keys}
+
+    reordered, summary = reorder_products_within_cells_by_dynamic_affinity(
+        customers,
+        products,
+        customer_blocks,
+        product_blocks,
+        time_codes,
+        time_gate_codes,
+        ToyAffinity(),
+        "dynamic_exact_penalized",
+        128,
+        np.random.default_rng(5),
+        code_to_time_gate=["2020-01"],
+        code_to_time_bucket=["2020-01-01"],
+        slot_customer_idx=np.asarray([0, 1]),
+        slot_product_idx=np.asarray([0, 1]),
+        real_pair_keys=real_pair_keys,
+        real_event_keys=real_event_keys,
+        num_products=num_products,
+        num_time_codes=num_time_codes,
+        lambda_duplicate_pair=0.0,
+        lambda_real_pair_overlap=0.0,
+        lambda_exact_event_overlap=10.0,
+    )
+
+    assert reordered.tolist() == ["p1", "p0"]
+    assert summary["pairing_mode"] == "dynamic_exact_penalized"
+    assert summary["num_penalized_cells"] == 1

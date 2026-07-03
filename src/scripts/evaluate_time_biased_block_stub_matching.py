@@ -103,6 +103,8 @@ def dynamic_affinity_diagnostics(
     return {
         "mean_dynamic_affinity_real": float(np.mean(real_scores)) if len(real_scores) else 0.0,
         "mean_dynamic_affinity_synthetic": float(np.mean(synthetic_scores)) if len(synthetic_scores) else 0.0,
+        "median_dynamic_affinity_real": float(np.median(real_scores)) if len(real_scores) else 0.0,
+        "median_dynamic_affinity_synthetic": float(np.median(synthetic_scores)) if len(synthetic_scores) else 0.0,
         "dynamic_affinity_distribution_ks": ks_stat(real_scores, synthetic_scores),
     }
 

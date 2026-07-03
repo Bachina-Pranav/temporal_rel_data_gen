@@ -38,7 +38,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--block-time-smoothing", type=float, default=5.0)
     parser.add_argument(
         "--pairing-mode",
-        choices=["random", "static_projection", "dynamic_projection", "dynamic_exact_small"],
+        choices=["random", "static_projection", "dynamic_projection", "dynamic_exact_small", "dynamic_exact_penalized"],
         default="dynamic_projection",
     )
     parser.add_argument("--max-exact-affinity-cell-size", type=int, default=128)
@@ -46,6 +46,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--desired-time-jitter", type=float, default=1e-3)
     parser.add_argument("--enable-fast-overlap-repair", action="store_true", default=False)
     parser.add_argument("--overlap-resample-prob", type=float, default=0.0)
+    parser.add_argument("--lambda-duplicate-pair", type=float, default=1.0)
+    parser.add_argument("--lambda-real-pair-overlap", type=float, default=1.0)
+    parser.add_argument("--lambda-exact-event-overlap", type=float, default=3.0)
     parser.add_argument("--skip-evaluation", action="store_true")
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--compute-c2st", action="store_true")
@@ -78,6 +81,9 @@ def main() -> None:
         desired_time_jitter=args.desired_time_jitter,
         enable_fast_overlap_repair=args.enable_fast_overlap_repair,
         overlap_resample_prob=args.overlap_resample_prob,
+        lambda_duplicate_pair=args.lambda_duplicate_pair,
+        lambda_real_pair_overlap=args.lambda_real_pair_overlap,
+        lambda_exact_event_overlap=args.lambda_exact_event_overlap,
         seed=args.seed,
     )
     if args.profile:

@@ -29,6 +29,15 @@ def reorder_products_within_cells_by_dynamic_affinity(
     code_to_time_bucket: Optional[Sequence[str]] = None,
     enable_fast_overlap_repair: bool = False,
     real_event_set: Optional[set[tuple[Any, Any, str]]] = None,
+    slot_customer_idx: Optional[Sequence[int]] = None,
+    slot_product_idx: Optional[Sequence[int]] = None,
+    real_pair_keys: Optional[set[int]] = None,
+    real_event_keys: Optional[set[int]] = None,
+    num_products: Optional[int] = None,
+    num_time_codes: Optional[int] = None,
+    lambda_duplicate_pair: float = 1.0,
+    lambda_real_pair_overlap: float = 1.0,
+    lambda_exact_event_overlap: float = 3.0,
     max_overlap_attempts: int = 5,
 ) -> tuple[np.ndarray, Dict[str, Any]]:
     """Reorder products inside exact cells while preserving all slot constraints."""
@@ -42,19 +51,46 @@ def reorder_products_within_cells_by_dynamic_affinity(
     product_block = np.asarray(slot_product_block, dtype=int)
     time_code = np.asarray(slot_time_code, dtype=int)
     time_gate_code = np.asarray(slot_time_gate_code, dtype=int)
-    cell_code = encode_cell_codes(customer_block, product_block, time_code)
+    customer_idx = (
+        np.asarray(slot_customer_idx, dtype=np.int64)
+        if slot_customer_idx is not None
+        else ids_to_indices(customers, getattr(affinity_model, "customer_index", {}))
+    )
+    product_idx = (
+        np.asarray(slot_product_idx, dtype=np.int64).copy()
+        if slot_product_idx is not None
+        else ids_to_indices(products, getattr(affinity_model, "product_index", {}))
+    )
+    if pairing_mode == "dynamic_exact_penalized":
+        if num_products is None:
+            num_products = int(max(product_idx.max() + 1, 1)) if len(product_idx) else 1
+        if num_time_codes is None:
+            num_time_codes = int(max(time_code.max() + 1, 1)) if len(time_code) else 1
+        if real_pair_keys is None:
+            real_pair_keys = set()
+        if real_event_keys is None:
+            real_event_keys = set()
+        cell_code = encode_time_first_cell_codes(customer_block, product_block, time_code)
+    else:
+        cell_code = encode_cell_codes(customer_block, product_block, time_code)
     order = np.argsort(cell_code)
     sorted_codes = cell_code[order]
     starts = np.r_[0, np.flatnonzero(sorted_codes[1:] != sorted_codes[:-1]) + 1] if len(sorted_codes) else np.asarray([], dtype=int)
     ends = np.r_[starts[1:], len(order)] if len(starts) else np.asarray([], dtype=int)
     exact_cells = 0
     projection_cells = 0
+    penalized_cells = 0
+    pair_counts: Dict[int, int] = {}
     repair_summary = {"num_repaired_cells": 0, "num_swaps": 0, "overlaps_before": 0, "overlaps_after": 0}
     for start_idx, end_idx in zip(starts, ends):
         indices = order[start_idx:end_idx]
         cell_customers = customers[indices]
         cell_products = products[indices]
+        cell_customer_idx = customer_idx[indices]
+        cell_product_idx = product_idx[indices]
         if len(indices) <= 1:
+            if pairing_mode == "dynamic_exact_penalized":
+                update_packed_pair_counts(pair_counts, cell_customer_idx, cell_product_idx, int(num_products))
             continue
         gate_key = gate_lookup(time_gate_code[indices[0]], code_to_time_gate, time_code[indices[0]], code_to_time_bucket)
         if pairing_mode == "random":
@@ -77,6 +113,27 @@ def reorder_products_within_cells_by_dynamic_affinity(
             else:
                 reordered = reorder_products_by_projection_affinity(cell_customers, cell_products, gate_key, affinity_model, rng, dynamic=True)
                 projection_cells += 1
+        elif pairing_mode == "dynamic_exact_penalized":
+            reordered, reordered_idx = reorder_products_by_penalized_exact_greedy_affinity(
+                cell_customers,
+                cell_products,
+                cell_customer_idx,
+                cell_product_idx,
+                gate_key,
+                int(time_code[indices[0]]),
+                affinity_model,
+                rng,
+                pair_counts,
+                int(num_products),
+                int(num_time_codes),
+                real_pair_keys,
+                real_event_keys,
+                lambda_duplicate_pair,
+                lambda_real_pair_overlap,
+                lambda_exact_event_overlap,
+            )
+            penalized_cells += 1
+            exact_cells += 1
         else:
             raise ValueError("Unsupported pairing_mode")
         if enable_fast_overlap_repair and real_event_set is not None:
@@ -94,7 +151,13 @@ def reorder_products_within_cells_by_dynamic_affinity(
             repair_summary["num_swaps"] += int(repair["num_swaps"])
             repair_summary["overlaps_before"] += int(repair["overlaps_before"])
             repair_summary["overlaps_after"] += int(repair["overlaps_after"])
+            if pairing_mode == "dynamic_exact_penalized":
+                product_lookup = getattr(affinity_model, "product_index", {})
+                reordered_idx = ids_to_indices(reordered, product_lookup)
         products[indices] = reordered
+        if pairing_mode == "dynamic_exact_penalized":
+            product_idx[indices] = reordered_idx
+            update_packed_pair_counts(pair_counts, cell_customer_idx, reordered_idx, int(num_products))
     counts = np.diff(np.r_[starts, len(order)]) if len(starts) else np.asarray([], dtype=int)
     summary = {
         "num_cells": int(len(starts)),
@@ -104,10 +167,93 @@ def reorder_products_within_cells_by_dynamic_affinity(
         "large_cell_pairing": large_cell_pairing,
         "num_exact_small_cells": int(exact_cells),
         "num_projection_cells": int(projection_cells),
+        "num_penalized_cells": int(penalized_cells),
+        "lambda_duplicate_pair": float(lambda_duplicate_pair),
+        "lambda_real_pair_overlap": float(lambda_real_pair_overlap),
+        "lambda_exact_event_overlap": float(lambda_exact_event_overlap),
         "dynamic_pairing_seconds": float(time.time() - start),
         **repair_summary,
     }
     return products, summary
+
+
+def reorder_products_by_penalized_exact_greedy_affinity(
+    customers: Sequence[Any],
+    products: Sequence[Any],
+    customer_idx: Sequence[int],
+    product_idx: Sequence[int],
+    time_bucket: Any,
+    time_code: int,
+    affinity_model: Any,
+    rng: np.random.Generator,
+    pair_counts: Dict[int, int],
+    num_products: int,
+    num_time_codes: int,
+    real_pair_keys: set[int],
+    real_event_keys: set[int],
+    lambda_duplicate_pair: float,
+    lambda_real_pair_overlap: float,
+    lambda_exact_event_overlap: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    customers = np.asarray(customers, dtype=object)
+    products = np.asarray(products, dtype=object)
+    customer_idx = np.asarray(customer_idx, dtype=np.int64)
+    product_idx = np.asarray(product_idx, dtype=np.int64)
+    if len(products) <= 1:
+        return products.copy(), product_idx.copy()
+    u_vectors = affinity_model.transformed_customer_vectors(customers, time_bucket)
+    v_vectors = affinity_model.product_vectors(products)
+    scores = u_vectors @ v_vectors.T
+    pair_keys = customer_idx[:, None] * int(num_products) + product_idx[None, :]
+    if lambda_duplicate_pair != 0.0:
+        duplicate_penalty = np.fromiter(
+            (np.log1p(pair_counts.get(int(key), 0)) for key in pair_keys.ravel()),
+            dtype=float,
+            count=pair_keys.size,
+        ).reshape(pair_keys.shape)
+        scores = scores - float(lambda_duplicate_pair) * duplicate_penalty
+    if lambda_real_pair_overlap != 0.0 and real_pair_keys:
+        real_pair_penalty = np.fromiter(
+            (int(int(key) in real_pair_keys) for key in pair_keys.ravel()),
+            dtype=float,
+            count=pair_keys.size,
+        ).reshape(pair_keys.shape)
+        scores = scores - float(lambda_real_pair_overlap) * real_pair_penalty
+    if lambda_exact_event_overlap != 0.0 and real_event_keys:
+        event_keys = pair_keys * int(num_time_codes) + int(time_code)
+        exact_event_penalty = np.fromiter(
+            (int(int(key) in real_event_keys) for key in event_keys.ravel()),
+            dtype=float,
+            count=event_keys.size,
+        ).reshape(event_keys.shape)
+        scores = scores - float(lambda_exact_event_overlap) * exact_event_penalty
+    product_order = greedy_match_products(scores, rng)
+    return products[product_order], product_idx[product_order]
+
+
+def greedy_match_products(scores: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    scores = np.asarray(scores, dtype=float)
+    n_customers, n_products = scores.shape
+    product_for_customer = np.full(n_customers, -1, dtype=np.int64)
+    used_customers = np.zeros(n_customers, dtype=bool)
+    used_products = np.zeros(n_products, dtype=bool)
+    jitter = 1e-12 * rng.random(scores.size)
+    for flat in np.argsort((scores.ravel() + jitter))[::-1]:
+        cidx = int(flat // n_products)
+        pidx = int(flat % n_products)
+        if used_customers[cidx] or used_products[pidx]:
+            continue
+        product_for_customer[cidx] = pidx
+        used_customers[cidx] = True
+        used_products[pidx] = True
+        if bool(used_customers.all()):
+            break
+    missing_customers = np.flatnonzero(~used_customers)
+    missing_products = np.flatnonzero(~used_products)
+    if len(missing_customers):
+        rng.shuffle(missing_products)
+        product_for_customer[missing_customers] = missing_products[: len(missing_customers)]
+    return product_for_customer
 
 
 def reorder_products_by_projection_affinity_for_test(
@@ -166,6 +312,28 @@ def encode_cell_codes(customer_block: np.ndarray, product_block: np.ndarray, tim
     max_product = int(product_block.max()) + 1 if len(product_block) else 1
     max_time = int(time_code.max()) + 1 if len(time_code) else 1
     return (customer_block.astype(np.int64) * max_product + product_block.astype(np.int64)) * max_time + time_code.astype(np.int64)
+
+
+def encode_time_first_cell_codes(customer_block: np.ndarray, product_block: np.ndarray, time_code: np.ndarray) -> np.ndarray:
+    max_customer = int(customer_block.max()) + 1 if len(customer_block) else 1
+    max_product = int(product_block.max()) + 1 if len(product_block) else 1
+    return (time_code.astype(np.int64) * max_customer + customer_block.astype(np.int64)) * max_product + product_block.astype(np.int64)
+
+
+def ids_to_indices(ids: Sequence[Any], index: Dict[Any, int]) -> np.ndarray:
+    return np.fromiter((int(index[item]) for item in ids), dtype=np.int64, count=len(ids))
+
+
+def update_packed_pair_counts(
+    pair_counts: Dict[int, int],
+    customer_idx: Sequence[int],
+    product_idx: Sequence[int],
+    num_products: int,
+) -> None:
+    keys = np.asarray(customer_idx, dtype=np.int64) * int(num_products) + np.asarray(product_idx, dtype=np.int64)
+    for key in keys:
+        packed = int(key)
+        pair_counts[packed] = pair_counts.get(packed, 0) + 1
 
 
 def gate_lookup(

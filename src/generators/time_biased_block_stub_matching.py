@@ -57,11 +57,14 @@ class TimeBiasedBlockStubMatchingGenerator:
         desired_time_jitter: float = 1e-3,
         enable_fast_overlap_repair: bool = False,
         overlap_resample_prob: float = 0.0,
+        lambda_duplicate_pair: float = 1.0,
+        lambda_real_pair_overlap: float = 1.0,
+        lambda_exact_event_overlap: float = 3.0,
         seed: int = 42,
     ):
         if time_granularity != "day":
             raise ValueError("TimeBiasedBlockStubMatchingGenerator currently supports day event buckets only")
-        if pairing_mode not in {"random", "static_projection", "dynamic_projection", "dynamic_exact_small"}:
+        if pairing_mode not in {"random", "static_projection", "dynamic_projection", "dynamic_exact_small", "dynamic_exact_penalized"}:
             raise ValueError("unsupported pairing_mode")
         if large_cell_pairing not in {"projection_sort", "exact_greedy"}:
             raise ValueError("large_cell_pairing must be projection_sort or exact_greedy")
@@ -82,6 +85,9 @@ class TimeBiasedBlockStubMatchingGenerator:
         self.desired_time_jitter = float(desired_time_jitter)
         self.enable_fast_overlap_repair = bool(enable_fast_overlap_repair)
         self.overlap_resample_prob = float(overlap_resample_prob)
+        self.lambda_duplicate_pair = float(lambda_duplicate_pair)
+        self.lambda_real_pair_overlap = float(lambda_real_pair_overlap)
+        self.lambda_exact_event_overlap = float(lambda_exact_event_overlap)
         self.seed = int(seed)
         self.real_df: Optional[pd.DataFrame] = None
         self.synthetic_df: Optional[pd.DataFrame] = None
@@ -95,6 +101,8 @@ class TimeBiasedBlockStubMatchingGenerator:
         self.customer_activity: Optional[FastTemporalActivityModel] = None
         self.product_activity: Optional[FastTemporalActivityModel] = None
         self.affinity_model: Optional[LowRankTimeGatedAffinity] = None
+        self.real_pair_keys: set[int] = set()
+        self.real_event_keys: set[int] = set()
         self.day_to_code: Dict[str, int] = {}
         self.code_to_day: List[str] = []
         self.gate_to_code: Dict[str, int] = {}
@@ -159,6 +167,7 @@ class TimeBiasedBlockStubMatchingGenerator:
             granularity=self.time_granularity,
             entity_kind="product",
         ).fit(frame, self.product_id_col, "_time_bucket", self.product_blocks)
+        self._build_real_overlap_key_sets(frame)
         print("[fit] fitting low-rank time-gated affinity", flush=True)
         self.affinity_model = LowRankTimeGatedAffinity(
             rank=self.rank,
@@ -223,6 +232,15 @@ class TimeBiasedBlockStubMatchingGenerator:
             code_to_time_bucket=self.code_to_day,
             enable_fast_overlap_repair=self.enable_fast_overlap_repair,
             real_event_set=self.real_event_set,
+            slot_customer_idx=self.slot_customer_idx,
+            slot_product_idx=self.slot_product_idx,
+            real_pair_keys=self.real_pair_keys,
+            real_event_keys=self.real_event_keys,
+            num_products=len(self.product_activity.entity_ids),
+            num_time_codes=len(self.code_to_day),
+            lambda_duplicate_pair=self.lambda_duplicate_pair,
+            lambda_real_pair_overlap=self.lambda_real_pair_overlap,
+            lambda_exact_event_overlap=self.lambda_exact_event_overlap,
         )
         print(f"[pairing] done in {self.dynamic_pairing_summary['dynamic_pairing_seconds']:.2f}s", flush=True)
         synthetic = pd.DataFrame(
@@ -351,6 +369,10 @@ class TimeBiasedBlockStubMatchingGenerator:
             "pairing_mode": self.pairing_mode,
             "large_cell_pairing": self.large_cell_pairing,
             "max_exact_affinity_cell_size": int(self.max_exact_affinity_cell_size),
+            "lambda_duplicate_pair": float(self.lambda_duplicate_pair),
+            "lambda_real_pair_overlap": float(self.lambda_real_pair_overlap),
+            "lambda_exact_event_overlap": float(self.lambda_exact_event_overlap),
+            "uses_penalized_dynamic_pairing": self.pairing_mode == "dynamic_exact_penalized",
             "desired_time_jitter": float(self.desired_time_jitter),
             "enable_fast_overlap_repair": bool(self.enable_fast_overlap_repair),
             "overlap_resample_prob": float(self.overlap_resample_prob),
@@ -385,6 +407,8 @@ class TimeBiasedBlockStubMatchingGenerator:
         return {
             "mean_dynamic_affinity_real": float(np.mean(real_scores)) if len(real_scores) else 0.0,
             "mean_dynamic_affinity_synthetic": float(np.mean(syn_scores)) if len(syn_scores) else 0.0,
+            "median_dynamic_affinity_real": float(np.median(real_scores)) if len(real_scores) else 0.0,
+            "median_dynamic_affinity_synthetic": float(np.median(syn_scores)) if len(syn_scores) else 0.0,
             "dynamic_affinity_distribution_ks": ks_stat(real_scores, syn_scores),
         }
 
@@ -413,6 +437,29 @@ class TimeBiasedBlockStubMatchingGenerator:
             warnings.append("product blocks missing; fell back to one product block")
             product_blocks = {entity: 0 for entity in frame[self.product_id_col].unique()}
         return customer_blocks, product_blocks, warnings
+
+    def _build_real_overlap_key_sets(self, frame: pd.DataFrame) -> None:
+        if self.customer_activity is None or self.product_activity is None:
+            return
+        customer_lookup = self.customer_activity.entity_to_index
+        product_lookup = self.product_activity.entity_to_index
+        customer_idx = np.fromiter(
+            (customer_lookup[value] for value in frame[self.customer_id_col].to_numpy(dtype=object)),
+            dtype=np.int64,
+            count=len(frame),
+        )
+        product_idx = np.fromiter(
+            (product_lookup[value] for value in frame[self.product_id_col].to_numpy(dtype=object)),
+            dtype=np.int64,
+            count=len(frame),
+        )
+        time_codes = frame["_time_code"].to_numpy(dtype=np.int64)
+        num_products = int(len(self.product_activity.entity_ids))
+        num_time_codes = int(len(self.code_to_day))
+        pair_keys = customer_idx * num_products + product_idx
+        event_keys = pair_keys * num_time_codes + time_codes
+        self.real_pair_keys = set(int(key) for key in pair_keys)
+        self.real_event_keys = set(int(key) for key in event_keys)
 
     def _build_block_pair_time_counts(self, frame: pd.DataFrame) -> pd.DataFrame:
         return (

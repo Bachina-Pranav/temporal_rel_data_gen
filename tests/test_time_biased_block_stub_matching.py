@@ -110,6 +110,37 @@ def test_full_time_biased_block_stub_matching_exact_constraints(tmp_path):
     assert (debug_out / "dynamic_pairing_summary.json").exists()
 
 
+def test_penalized_time_biased_generator_metadata_and_exact_constraints(tmp_path):
+    real = tiny_events()
+    debug_in = tmp_path / "debug_in"
+    write_blocks(debug_in)
+    generator = TimeBiasedBlockStubMatchingGenerator(
+        structure_debug_dir=debug_in,
+        rank=2,
+        pairing_mode="dynamic_exact_penalized",
+        lambda_duplicate_pair=2.0,
+        lambda_real_pair_overlap=2.0,
+        lambda_exact_event_overlap=5.0,
+        seed=6,
+    )
+
+    synthetic = generator.fit(real).sample(seed=6)
+    metadata = generator.metadata()
+    metrics = generator.evaluate(real, synthetic)
+
+    assert len(synthetic) == len(real)
+    assert Counter(synthetic["customer_id"]) == Counter(real["customer_id"])
+    assert Counter(synthetic["product_id"]) == Counter(real["product_id"])
+    assert bpt_counts(real).equals(bpt_counts(synthetic))
+    assert metadata["pairing_mode"] == "dynamic_exact_penalized"
+    assert metadata["uses_penalized_dynamic_pairing"] is True
+    assert metadata["lambda_duplicate_pair"] == 2.0
+    assert metadata["lambda_real_pair_overlap"] == 2.0
+    assert metadata["lambda_exact_event_overlap"] == 5.0
+    assert metrics["block_pair_time_exact_match"] is True
+    assert "median_dynamic_affinity_synthetic" in metrics
+
+
 def test_time_biased_generator_does_not_call_quota_or_degree_repair():
     source = inspect.getsource(TimeBiasedBlockStubMatchingGenerator)
 
