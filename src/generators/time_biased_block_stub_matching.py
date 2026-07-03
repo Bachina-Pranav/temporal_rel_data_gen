@@ -13,10 +13,11 @@ import pandas as pd
 
 from .fast_event_spine_metrics import evaluate_fast_event_spine
 from .fast_lowrank_temporal_event import load_entity_blocks
-from .fast_temporal_activity import FastTemporalActivityModel, canonical_time_bucket
+from .fast_temporal_activity import FastTemporalActivityModel, canonical_time_bucket, resolve_auto_alpha
 from .lowrank_time_gated_affinity import LowRankTimeGatedAffinity
 from .stub_dynamic_pairing import reorder_products_within_cells_by_dynamic_affinity
 from .stub_time_assignment import assign_stubs_to_slots_by_time
+from .temporal_shrinkage_estimator import DEFAULT_CANDIDATE_ALPHAS, estimate_temporal_shrinkage_alpha
 
 
 METHOD_NAME = "time_biased_block_stub_matching"
@@ -24,18 +25,17 @@ METHOD_ALIAS = "temporal_stub_matching_event"
 
 
 class TimeBiasedBlockStubMatchingGenerator:
-    """TimeBiasedBlockStubMatchingGenerator generates temporal relational
-    event spines by exactly matching entity stubs to block-pair-time slots.
-    For each customer/product block, it creates exact degree stubs using
-    np.repeat, samples a desired event time for each stub from the entity's
-    smoothed temporal activity distribution, and then sort-matches desired
-    times to the exact slots required by the block-pair-time tensor M[a,b,t].
-    This preserves exact customer degrees, exact product degrees, and exact
-    block-pair-time counts without rejection sampling or repair loops.
-    Within each (customer_block, product_block, time) cell, products are
-    reordered using the low-rank dynamic affinity
-    F_{u,i,t} = (z_u * g_t)^T z_i, retaining individual-level
-    customer-product-time compatibility.
+    """Exact degree/block-time temporal event-spine generator.
+
+    TimeBiasedBlockStubMatchingGenerator uses exact degree stubs and exact
+    block-pair-time slots. Entity stubs are assigned to temporal slots by
+    sampling desired times from a smoothed temporal activity distribution.
+    The shrinkage strength is selected automatically by held-out temporal
+    likelihood, avoiding dataset-specific tuning on synthetic evaluation
+    metrics. Within each temporal cell, products are paired to customers
+    using a fixed penalized low-rank dynamic affinity score
+    F_{u,i,t} = (z_u * g_t)^T z_i with anti-duplication and anti-copying
+    penalties.
     """
 
     def __init__(
@@ -49,9 +49,10 @@ class TimeBiasedBlockStubMatchingGenerator:
         rank: int = 32,
         alpha_customer_time: Any = "auto",
         alpha_product_time: Any = "auto",
+        temporal_shrinkage_mode: str = "empirical_bayes",
         alpha_time_gate: Any = "auto",
         block_time_smoothing: float = 5.0,
-        pairing_mode: str = "dynamic_projection",
+        pairing_mode: str = "dynamic_exact_penalized",
         max_exact_affinity_cell_size: int = 128,
         large_cell_pairing: str = "projection_sort",
         desired_time_jitter: float = 1e-3,
@@ -64,6 +65,8 @@ class TimeBiasedBlockStubMatchingGenerator:
     ):
         if time_granularity != "day":
             raise ValueError("TimeBiasedBlockStubMatchingGenerator currently supports day event buckets only")
+        if temporal_shrinkage_mode not in {"median_degree", "empirical_bayes", "fixed"}:
+            raise ValueError("temporal_shrinkage_mode must be median_degree, empirical_bayes, or fixed")
         if pairing_mode not in {"random", "static_projection", "dynamic_projection", "dynamic_exact_small", "dynamic_exact_penalized"}:
             raise ValueError("unsupported pairing_mode")
         if large_cell_pairing not in {"projection_sort", "exact_greedy"}:
@@ -77,6 +80,7 @@ class TimeBiasedBlockStubMatchingGenerator:
         self.rank = int(rank)
         self.alpha_customer_time = alpha_customer_time
         self.alpha_product_time = alpha_product_time
+        self.temporal_shrinkage_mode = temporal_shrinkage_mode
         self.alpha_time_gate = alpha_time_gate
         self.block_time_smoothing = float(block_time_smoothing)
         self.pairing_mode = pairing_mode
@@ -122,6 +126,10 @@ class TimeBiasedBlockStubMatchingGenerator:
         self.product_assignment_summary: Dict[str, Any] = {}
         self.dynamic_pairing_summary: Dict[str, Any] = {}
         self.runtime_metadata: Dict[str, Any] = {}
+        self.customer_alpha_result: Dict[str, Any] = {}
+        self.product_alpha_result: Dict[str, Any] = {}
+        self.alpha_customer_time_selected: Optional[float] = None
+        self.alpha_product_time_selected: Optional[float] = None
 
     def fit(self, real_df: pd.DataFrame) -> "TimeBiasedBlockStubMatchingGenerator":
         fit_start = time.time()
@@ -154,15 +162,16 @@ class TimeBiasedBlockStubMatchingGenerator:
             )
         )
         self.block_pair_time_counts = self._build_block_pair_time_counts(frame)
+        self._select_temporal_shrinkage_alphas(frame)
         print("[fit] fitting temporal activity models", flush=True)
         self.customer_activity = FastTemporalActivityModel(
-            alpha=self.alpha_customer_time,
+            alpha=self.alpha_customer_time_selected,
             block_time_smoothing=self.block_time_smoothing,
             granularity=self.time_granularity,
             entity_kind="customer",
         ).fit(frame, self.customer_id_col, "_time_bucket", self.customer_blocks)
         self.product_activity = FastTemporalActivityModel(
-            alpha=self.alpha_product_time,
+            alpha=self.alpha_product_time_selected,
             block_time_smoothing=self.block_time_smoothing,
             granularity=self.time_granularity,
             entity_kind="product",
@@ -315,6 +324,8 @@ class TimeBiasedBlockStubMatchingGenerator:
         write_json(self.customer_assignment_summary, debug / "customer_stub_assignment_summary.json")
         write_json(self.product_assignment_summary, debug / "product_stub_assignment_summary.json")
         write_json(self.dynamic_pairing_summary, debug / "dynamic_pairing_summary.json")
+        write_json(self.customer_alpha_result, debug / "customer_temporal_shrinkage_estimation.json")
+        write_json(self.product_alpha_result, debug / "product_temporal_shrinkage_estimation.json")
         write_json(self.array_dtype_summary(), debug / "array_dtype_summary.json")
 
     def save_metadata(self, path: str | Path) -> None:
@@ -366,12 +377,29 @@ class TimeBiasedBlockStubMatchingGenerator:
             "no_quota_rejection_sampling": True,
             "no_per_event_candidate_pool_scoring": True,
             "no_cell_level_repair_loops": True,
+            "temporal_shrinkage_mode": self.temporal_shrinkage_mode,
+            "alpha_customer_time_requested": self.alpha_customer_time,
+            "alpha_product_time_requested": self.alpha_product_time,
+            "alpha_customer_time_selected": float(self.alpha_customer_time_selected),
+            "alpha_product_time_selected": float(self.alpha_product_time_selected),
+            "alpha_selection_objective": self._alpha_selection_objective(),
+            "alpha_selection_uses_synthetic_metrics": False,
+            "alpha_candidate_grid": list(DEFAULT_CANDIDATE_ALPHAS),
+            "customer_alpha_best": self._alpha_result_value(self.customer_alpha_result, "best_alpha"),
+            "customer_alpha_num_holdout_events": int(self.customer_alpha_result.get("num_holdout_events", 0)),
+            "customer_alpha_fallback_used": bool(self.customer_alpha_result.get("fallback_used", False)),
+            "customer_alpha_candidate_results": list(self.customer_alpha_result.get("candidate_results", [])),
+            "product_alpha_best": self._alpha_result_value(self.product_alpha_result, "best_alpha"),
+            "product_alpha_num_holdout_events": int(self.product_alpha_result.get("num_holdout_events", 0)),
+            "product_alpha_fallback_used": bool(self.product_alpha_result.get("fallback_used", False)),
+            "product_alpha_candidate_results": list(self.product_alpha_result.get("candidate_results", [])),
             "pairing_mode": self.pairing_mode,
             "large_cell_pairing": self.large_cell_pairing,
             "max_exact_affinity_cell_size": int(self.max_exact_affinity_cell_size),
             "lambda_duplicate_pair": float(self.lambda_duplicate_pair),
             "lambda_real_pair_overlap": float(self.lambda_real_pair_overlap),
             "lambda_exact_event_overlap": float(self.lambda_exact_event_overlap),
+            "pairing_penalties_fixed_defaults": self._uses_default_pairing_penalties(),
             "uses_penalized_dynamic_pairing": self.pairing_mode == "dynamic_exact_penalized",
             "desired_time_jitter": float(self.desired_time_jitter),
             "enable_fast_overlap_repair": bool(self.enable_fast_overlap_repair),
@@ -437,6 +465,78 @@ class TimeBiasedBlockStubMatchingGenerator:
             warnings.append("product blocks missing; fell back to one product block")
             product_blocks = {entity: 0 for entity in frame[self.product_id_col].unique()}
         return customer_blocks, product_blocks, warnings
+
+    def _select_temporal_shrinkage_alphas(self, frame: pd.DataFrame) -> None:
+        """Choose customer/product alpha without looking at synthetic metrics."""
+
+        if self.temporal_shrinkage_mode == "empirical_bayes":
+            print("[fit] selecting temporal shrinkage alphas by held-out likelihood", flush=True)
+            self.customer_alpha_result = estimate_temporal_shrinkage_alpha(
+                df=frame,
+                entity_col=self.customer_id_col,
+                time_col="_time_bucket",
+                block_map=self.customer_blocks,
+                seed=self.seed,
+            )
+            self.product_alpha_result = estimate_temporal_shrinkage_alpha(
+                df=frame,
+                entity_col=self.product_id_col,
+                time_col="_time_bucket",
+                block_map=self.product_blocks,
+                seed=self.seed,
+            )
+            self.alpha_customer_time_selected = float(self.customer_alpha_result["best_alpha"])
+            self.alpha_product_time_selected = float(self.product_alpha_result["best_alpha"])
+            return
+
+        if self.temporal_shrinkage_mode == "median_degree":
+            customer_alpha = resolve_auto_alpha("auto", self.customer_degrees.values())
+            product_alpha = resolve_auto_alpha("auto", self.product_degrees.values())
+            objective = "median_entity_degree"
+            customer_fallback = False
+            product_fallback = False
+        else:
+            customer_alpha = resolve_auto_alpha(self.alpha_customer_time, self.customer_degrees.values())
+            product_alpha = resolve_auto_alpha(self.alpha_product_time, self.product_degrees.values())
+            objective = "fixed_manual_alpha"
+            customer_fallback = str(self.alpha_customer_time).lower() == "auto"
+            product_fallback = str(self.alpha_product_time).lower() == "auto"
+
+        self.alpha_customer_time_selected = float(customer_alpha)
+        self.alpha_product_time_selected = float(product_alpha)
+        self.customer_alpha_result = self._manual_alpha_result(customer_alpha, len(self.customer_degrees), objective, customer_fallback)
+        self.product_alpha_result = self._manual_alpha_result(product_alpha, len(self.product_degrees), objective, product_fallback)
+
+    def _manual_alpha_result(self, alpha: float, num_entities: int, objective: str, fallback_used: bool) -> Dict[str, Any]:
+        return {
+            "best_alpha": float(alpha),
+            "candidate_results": [],
+            "num_entities": int(num_entities),
+            "num_holdout_events": 0,
+            "fallback_used": bool(fallback_used),
+            "avg_log_likelihood": None,
+            "alpha_candidate_grid": list(DEFAULT_CANDIDATE_ALPHAS),
+            "selection_objective": objective,
+            "num_likelihood_evaluations": 0,
+        }
+
+    def _alpha_selection_objective(self) -> str:
+        if self.temporal_shrinkage_mode == "empirical_bayes":
+            return "heldout_temporal_log_likelihood"
+        if self.temporal_shrinkage_mode == "median_degree":
+            return "median_entity_degree"
+        return "fixed_manual_alpha"
+
+    def _alpha_result_value(self, result: Dict[str, Any], key: str) -> Optional[float]:
+        value = result.get(key)
+        return None if value is None else float(value)
+
+    def _uses_default_pairing_penalties(self) -> bool:
+        return (
+            float(self.lambda_duplicate_pair) == 1.0
+            and float(self.lambda_real_pair_overlap) == 1.0
+            and float(self.lambda_exact_event_overlap) == 3.0
+        )
 
     def _build_real_overlap_key_sets(self, frame: pd.DataFrame) -> None:
         if self.customer_activity is None or self.product_activity is None:

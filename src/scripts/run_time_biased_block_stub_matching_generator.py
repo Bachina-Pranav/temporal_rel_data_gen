@@ -34,12 +34,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rank", type=int, default=32)
     parser.add_argument("--alpha-customer-time", default="auto")
     parser.add_argument("--alpha-product-time", default="auto")
+    parser.add_argument(
+        "--temporal-shrinkage-mode",
+        choices=["median_degree", "empirical_bayes", "fixed"],
+        default="empirical_bayes",
+    )
     parser.add_argument("--alpha-time-gate", default="auto")
     parser.add_argument("--block-time-smoothing", type=float, default=5.0)
     parser.add_argument(
         "--pairing-mode",
         choices=["random", "static_projection", "dynamic_projection", "dynamic_exact_small", "dynamic_exact_penalized"],
-        default="dynamic_projection",
+        default="dynamic_exact_penalized",
     )
     parser.add_argument("--max-exact-affinity-cell-size", type=int, default=128)
     parser.add_argument("--large-cell-pairing", choices=["projection_sort", "exact_greedy"], default="projection_sort")
@@ -73,6 +78,7 @@ def main() -> None:
         rank=args.rank,
         alpha_customer_time=args.alpha_customer_time,
         alpha_product_time=args.alpha_product_time,
+        temporal_shrinkage_mode=args.temporal_shrinkage_mode,
         alpha_time_gate=args.alpha_time_gate,
         block_time_smoothing=args.block_time_smoothing,
         pairing_mode=args.pairing_mode,
