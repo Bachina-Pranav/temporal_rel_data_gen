@@ -27,6 +27,9 @@ RUNTIME_KEYS = [
     "max_cell_size",
     "percent_large_cells_projection_sort",
     "slot_build_seconds",
+    "customer_stub_assignment_seconds",
+    "product_stub_assignment_seconds",
+    "dynamic_pairing_seconds",
     "customer_assignment_seconds",
     "customer_repair_seconds",
     "product_assignment_seconds",
@@ -65,6 +68,8 @@ def evaluate_fast_event_spine(
         product_col,
         timestamp_col,
     )
+    bpt_l1 = metrics.get("block_pair_time_count_l1")
+    metrics["block_pair_time_exact_match"] = None if bpt_l1 is None else bool(float(bpt_l1) == 0.0)
     if metadata:
         for key in RUNTIME_KEYS:
             metrics[key] = metadata.get(key)
