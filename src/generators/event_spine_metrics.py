@@ -76,13 +76,24 @@ def overlap_metrics(real: pd.DataFrame, synthetic: pd.DataFrame, customer_col: s
     syn_pairs = list(zip(synthetic[customer_col], synthetic[product_col]))
     real_events = set(zip(real[customer_col], real[product_col], real[time_col]))
     syn_events = list(zip(synthetic[customer_col], synthetic[product_col], synthetic[time_col]))
-    pair_counts = pd.Series(syn_pairs).value_counts()
-    duplicate_rows = int(pair_counts[pair_counts > 1].sum()) if len(pair_counts) else 0
+    real_duplicate_rate = duplicate_pair_rate(real, customer_col, product_col)
+    synthetic_duplicate_rate = duplicate_pair_rate(synthetic, customer_col, product_col)
     return {
-        "duplicate_customer_product_rate": float(duplicate_rows / max(len(syn_pairs), 1)),
+        "real_duplicate_customer_product_rate": real_duplicate_rate,
+        "synthetic_duplicate_customer_product_rate": synthetic_duplicate_rate,
+        "duplicate_customer_product_rate": synthetic_duplicate_rate,
+        "duplicate_rate_ratio": None if real_duplicate_rate == 0.0 else float(synthetic_duplicate_rate / real_duplicate_rate),
         "real_edge_overlap_rate": float(sum(pair in real_pairs for pair in syn_pairs) / max(len(syn_pairs), 1)),
         "exact_event_overlap_rate": float(sum(event in real_events for event in syn_events) / max(len(syn_events), 1)),
     }
+
+
+def duplicate_pair_rate(frame: pd.DataFrame, customer_col: str, product_col: str) -> float:
+    if len(frame) == 0:
+        return 0.0
+    counts = frame.groupby([customer_col, product_col], sort=False).size()
+    duplicate_rows = int(counts[counts > 1].sum()) if len(counts) else 0
+    return float(duplicate_rows / max(len(frame), 1))
 
 
 def time_count_metrics(real: pd.DataFrame, synthetic: pd.DataFrame, time_col: str) -> Dict[str, float]:

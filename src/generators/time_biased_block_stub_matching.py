@@ -499,11 +499,24 @@ class TimeBiasedBlockStubMatchingGenerator:
             "created_at": datetime.utcnow().isoformat() + "Z",
         }
         for key in [
+            "num_cells_processed",
             "num_exact_penalized_cells",
             "num_projection_fallback_cells",
+            "num_random_cells",
+            "num_events_exact_penalized",
+            "num_events_projection_fallback",
+            "num_events_random",
+            "percent_cells_exact_penalized",
+            "percent_cells_projection_fallback",
+            "percent_cells_random",
             "percent_events_exact_penalized",
             "percent_events_projection_fallback",
+            "percent_events_random",
+            "percent_large_cells_projection_sort",
             "largest_cell_size",
+            "p95_cell_size",
+            "p99_cell_size",
+            "max_exact_affinity_cell_size",
         ]:
             metadata[key] = self.dynamic_pairing_summary.get(key)
         metadata.update(self.slot_summary)

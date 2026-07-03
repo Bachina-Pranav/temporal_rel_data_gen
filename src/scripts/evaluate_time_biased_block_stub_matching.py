@@ -60,6 +60,7 @@ def main() -> None:
         compute_c2st=False,
         metadata=metadata,
     )
+    metrics.update(pairing_instrumentation_metrics(metadata, Path(args.synthetic_reviews).parent / "debug"))
     if not args.skip_dynamic_affinity:
         metrics.update(
             dynamic_affinity_diagnostics(
@@ -151,6 +152,113 @@ def score_pairs_by_time(
 
 def metadata_value(metadata: Dict[str, Any] | None, key: str, default: Any) -> Any:
     return metadata.get(key, default) if metadata else default
+
+
+PAIRING_COUNTER_KEYS = [
+    "num_cells_processed",
+    "num_exact_penalized_cells",
+    "num_projection_fallback_cells",
+    "num_random_cells",
+    "num_events_exact_penalized",
+    "num_events_projection_fallback",
+    "num_events_random",
+    "percent_cells_exact_penalized",
+    "percent_cells_projection_fallback",
+    "percent_cells_random",
+    "percent_events_exact_penalized",
+    "percent_events_projection_fallback",
+    "percent_events_random",
+    "percent_large_cells_projection_sort",
+    "largest_cell_size",
+    "average_cell_size",
+    "p95_cell_size",
+    "p99_cell_size",
+    "max_exact_affinity_cell_size",
+]
+
+
+def pairing_instrumentation_metrics(metadata: Dict[str, Any] | None, debug_dir: Path) -> Dict[str, Any]:
+    output: Dict[str, Any] = {}
+    summary = load_json(debug_dir / "dynamic_pairing_summary.json")
+    if metadata:
+        for key in PAIRING_COUNTER_KEYS:
+            if metadata.get(key) is not None:
+                output[key] = metadata.get(key)
+    if summary:
+        normalized = normalize_pairing_summary(summary)
+        for key, value in normalized.items():
+            if value is not None:
+                output[key] = value
+    output.update(block_pair_time_cell_stats(debug_dir / "block_pair_time_counts.csv", output))
+    return {key: output.get(key) for key in PAIRING_COUNTER_KEYS if key in output}
+
+
+def normalize_pairing_summary(summary: Dict[str, Any]) -> Dict[str, Any]:
+    num_cells = int(summary.get("num_cells_processed", summary.get("num_cells", 0)) or 0)
+    exact_cells = int(summary.get("num_exact_penalized_cells", 0) or 0)
+    fallback_cells = int(summary.get("num_projection_fallback_cells", 0) or 0)
+    exact_events = int(summary.get("num_events_exact_penalized", 0) or 0)
+    fallback_events = int(summary.get("num_events_projection_fallback", 0) or 0)
+    if exact_events == 0 and summary.get("percent_events_exact_penalized") is not None:
+        exact_events = None
+    if fallback_events == 0 and summary.get("percent_events_projection_fallback") is not None:
+        fallback_events = None
+    return {
+        "num_cells_processed": num_cells,
+        "num_exact_penalized_cells": exact_cells,
+        "num_projection_fallback_cells": fallback_cells,
+        "num_random_cells": int(summary.get("num_random_cells", 0) or 0),
+        "num_events_exact_penalized": exact_events,
+        "num_events_projection_fallback": fallback_events,
+        "num_events_random": summary.get("num_events_random"),
+        "percent_cells_exact_penalized": float(summary.get("percent_cells_exact_penalized", exact_cells / max(num_cells, 1))),
+        "percent_cells_projection_fallback": float(summary.get("percent_cells_projection_fallback", fallback_cells / max(num_cells, 1))),
+        "percent_cells_random": summary.get("percent_cells_random"),
+        "percent_events_exact_penalized": summary.get("percent_events_exact_penalized"),
+        "percent_events_projection_fallback": summary.get("percent_events_projection_fallback"),
+        "percent_events_random": summary.get("percent_events_random"),
+        "percent_large_cells_projection_sort": summary.get(
+            "percent_large_cells_projection_sort",
+            summary.get("percent_events_projection_fallback"),
+        ),
+        "largest_cell_size": summary.get("largest_cell_size", summary.get("max_cell_size")),
+        "average_cell_size": summary.get("average_cell_size"),
+        "p95_cell_size": summary.get("p95_cell_size"),
+        "p99_cell_size": summary.get("p99_cell_size"),
+        "max_exact_affinity_cell_size": summary.get("max_exact_affinity_cell_size"),
+    }
+
+
+def block_pair_time_cell_stats(path: Path, existing: Dict[str, Any]) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    frame = pd.read_csv(path, usecols=["count"])
+    counts = frame["count"].to_numpy(dtype=float)
+    if len(counts) == 0:
+        return {}
+    total_events = float(np.sum(counts))
+    stats: Dict[str, Any] = {
+        "num_cells_processed": int(existing.get("num_cells_processed", len(counts)) or len(counts)),
+        "average_cell_size": float(np.mean(counts)),
+        "largest_cell_size": int(np.max(counts)),
+        "p95_cell_size": float(np.percentile(counts, 95.0)),
+        "p99_cell_size": float(np.percentile(counts, 99.0)),
+    }
+    for percent_key, count_key in [
+        ("percent_events_exact_penalized", "num_events_exact_penalized"),
+        ("percent_events_projection_fallback", "num_events_projection_fallback"),
+        ("percent_events_random", "num_events_random"),
+    ]:
+        if existing.get(count_key) is None and existing.get(percent_key) is not None:
+            stats[count_key] = int(round(float(existing[percent_key]) * total_events))
+    return stats
+
+
+def load_json(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    with path.open() as handle:
+        return json.load(handle)
 
 
 def score_pairs_by_time_aligned(

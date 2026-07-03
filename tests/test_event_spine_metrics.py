@@ -40,3 +40,27 @@ def test_event_spine_metrics_run_on_tiny_data(tmp_path):
     assert "event_tuple_c2st_accuracy" in metrics
     assert metrics["num_reviews_real"] == 4
     assert metrics["num_reviews_synthetic"] == 4
+
+
+def test_event_spine_metrics_report_real_and_synthetic_duplicate_rates(tmp_path):
+    real = pd.DataFrame(
+        {
+            "customer_id": ["c0", "c0", "c1", "c2"],
+            "product_id": ["p0", "p0", "p1", "p2"],
+            "review_time": ["2020-01-01", "2020-01-02", "2020-01-03", "2020-01-04"],
+        }
+    )
+    synthetic = pd.DataFrame(
+        {
+            "customer_id": ["c0", "c0", "c1", "c1"],
+            "product_id": ["p0", "p0", "p1", "p1"],
+            "review_time": ["2020-01-01", "2020-01-02", "2020-01-03", "2020-01-04"],
+        }
+    )
+
+    metrics = evaluate_event_spine(real, synthetic, structure_debug_dir=tmp_path)
+
+    assert metrics["real_duplicate_customer_product_rate"] == 0.5
+    assert metrics["synthetic_duplicate_customer_product_rate"] == 1.0
+    assert metrics["duplicate_customer_product_rate"] == 1.0
+    assert metrics["duplicate_rate_ratio"] == 2.0

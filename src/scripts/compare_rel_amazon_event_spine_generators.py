@@ -25,33 +25,46 @@ DEFAULT_RUNS = [
     ("ct_2k_sbm_temporal_kde_stubs", "outputs/rel-amazon/ct_2k_sbm_temporal_kde_stubs/synthetic_review.csv"),
     ("time_biased_median_mixture", "outputs/rel-amazon/time_biased_block_stub_matching_median_mixture/synthetic_review.csv"),
     ("time_biased_empirical_exact", "outputs/rel-amazon/time_biased_block_stub_matching_empirical_exact/synthetic_review.csv"),
+    ("time_biased_local_kernel_random_pairing", "outputs/rel-amazon/time_biased_block_stub_matching_local_kernel_random_pairing/synthetic_review.csv"),
     ("time_biased_local_kernel_main", "outputs/rel-amazon/time_biased_block_stub_matching_kernel_main/synthetic_review.csv"),
 ]
 
 COMPARISON_KEYS = [
     "num_reviews_synthetic",
+    "active_customers_synthetic",
+    "active_products_synthetic",
     "customer_degree_ks",
     "product_degree_ks",
     "customer_degree_exact_match",
     "product_degree_exact_match",
     "daily_count_l1",
+    "monthly_count_corr",
     "block_pair_time_count_l1",
+    "block_pair_time_exact_match",
     "product_first_time_corr",
     "product_last_time_corr",
     "product_peak_time_corr",
+    "product_active_span_ks",
     "product_relative_age_ks",
     "product_time_activity_distribution_ks",
     "customer_first_time_corr",
     "customer_last_time_corr",
     "customer_peak_time_corr",
+    "customer_active_span_ks",
     "customer_relative_age_ks",
     "customer_time_activity_distribution_ks",
+    "customer_active_window_rate",
+    "product_active_window_rate",
     "joint_coactive_window_rate",
-    "duplicate_customer_product_rate",
+    "real_duplicate_customer_product_rate",
+    "synthetic_duplicate_customer_product_rate",
+    "duplicate_rate_ratio",
     "real_edge_overlap_rate",
     "exact_event_overlap_rate",
     "mean_dynamic_affinity_synthetic",
     "dynamic_affinity_distribution_ks",
+    "event_tuple_c2st_accuracy",
+    "event_tuple_c2st_auc",
     "total_seconds",
     "events_per_second",
 ]
@@ -96,6 +109,7 @@ def main() -> None:
         if args.reuse_existing_metrics and metrics_path.exists():
             with metrics_path.open() as handle:
                 metrics = json.load(handle)
+            metrics.update(load_existing_eval_metrics(path.parent))
         else:
             print(f"[compare] evaluating {name}: {path}", flush=True)
             synthetic = pd.read_csv(path)
@@ -125,6 +139,7 @@ def main() -> None:
                     )
                 )
             write_metrics(metrics, path.parent / "comparison_eval_metrics.json")
+            metrics.update(load_existing_eval_metrics(path.parent))
         nested[name] = metrics
         rows.append({"model": name, **{key: metrics.get(key) for key in COMPARISON_KEYS}})
     if not rows:
@@ -147,6 +162,17 @@ def parse_runs(items: Iterable[str] | None) -> list[tuple[str, str]]:
         name, path = item.split("=", 1) if "=" in item else (Path(item).parent.name, item)
         runs.append((name, path))
     return runs
+
+
+def load_existing_eval_metrics(output_dir: Path) -> Dict[str, Any]:
+    merged: Dict[str, Any] = {}
+    for filename in ["eval_metrics.json", "eval_metrics_v2.json", "eval_metrics_c2st.json"]:
+        path = output_dir / filename
+        if not path.exists():
+            continue
+        with path.open() as handle:
+            merged.update(json.load(handle))
+    return merged
 
 
 def write_json(data: Dict[str, Dict[str, Any]], path: str | Path) -> None:

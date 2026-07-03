@@ -156,4 +156,11 @@ def test_penalized_pairing_large_cells_use_projection_fallback():
     assert Counter(reordered.tolist()) == Counter(products.tolist())
     assert summary["num_exact_penalized_cells"] == 0
     assert summary["num_projection_fallback_cells"] == 1
+    assert summary["num_cells_processed"] == 1
+    assert summary["num_events_projection_fallback"] == 3
+    assert summary["percent_cells_projection_fallback"] == 1.0
     assert summary["percent_events_projection_fallback"] == 1.0
+    assert summary["percent_large_cells_projection_sort"] == 1.0
+    assert summary["largest_cell_size"] == 3
+    assert summary["p95_cell_size"] == 3.0
+    assert summary["p99_cell_size"] == 3.0

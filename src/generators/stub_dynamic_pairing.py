@@ -81,6 +81,8 @@ def reorder_products_within_cells_by_dynamic_affinity(
     exact_cells = 0
     projection_cells = 0
     penalized_cells = 0
+    random_cells = 0
+    random_events = 0
     exact_penalized_cells = 0
     projection_fallback_cells = 0
     exact_penalized_events = 0
@@ -98,12 +100,17 @@ def reorder_products_within_cells_by_dynamic_affinity(
                 exact_penalized_cells += int(len(indices) == 1)
                 exact_penalized_events += int(len(indices))
                 update_packed_pair_counts(pair_counts, cell_customer_idx, cell_product_idx, int(num_products))
+            elif pairing_mode == "random":
+                random_cells += int(len(indices) == 1)
+                random_events += int(len(indices))
             continue
         gate_key = gate_lookup(time_gate_code[indices[0]], code_to_time_gate, time_code[indices[0]], code_to_time_bucket)
         if pairing_mode == "random":
             reordered = cell_products.copy()
             rng.shuffle(reordered)
             projection_cells += 1
+            random_cells += 1
+            random_events += int(len(indices))
         elif pairing_mode == "static_projection":
             reordered = reorder_products_by_projection_affinity(cell_customers, cell_products, gate_key, affinity_model, rng, dynamic=False)
             projection_cells += 1
@@ -139,6 +146,7 @@ def reorder_products_within_cells_by_dynamic_affinity(
                     lambda_duplicate_pair,
                     lambda_real_pair_overlap,
                     lambda_exact_event_overlap,
+                    max_score_matrix_size=int(max_exact_affinity_cell_size),
                 )
                 penalized_cells += 1
                 exact_cells += 1
@@ -198,21 +206,39 @@ def reorder_products_within_cells_by_dynamic_affinity(
             product_idx[indices] = reordered_idx
             update_packed_pair_counts(pair_counts, cell_customer_idx, reordered_idx, int(num_products))
     counts = np.diff(np.r_[starts, len(order)]) if len(starts) else np.asarray([], dtype=int)
+    num_cells = int(len(starts))
+    average_cell_size = float(np.mean(counts)) if len(counts) else 0.0
+    largest_cell_size = int(np.max(counts)) if len(counts) else 0
+    p95_cell_size = float(np.percentile(counts, 95.0)) if len(counts) else 0.0
+    p99_cell_size = float(np.percentile(counts, 99.0)) if len(counts) else 0.0
+    percent_projection_events = float(projection_fallback_events / max(len(products), 1))
     summary = {
-        "num_cells": int(len(starts)),
-        "average_cell_size": float(np.mean(counts)) if len(counts) else 0.0,
-        "max_cell_size": int(np.max(counts)) if len(counts) else 0,
-        "largest_cell_size": int(np.max(counts)) if len(counts) else 0,
+        "num_cells": num_cells,
+        "num_cells_processed": num_cells,
+        "average_cell_size": average_cell_size,
+        "max_cell_size": largest_cell_size,
+        "largest_cell_size": largest_cell_size,
+        "p95_cell_size": p95_cell_size,
+        "p99_cell_size": p99_cell_size,
         "max_exact_affinity_cell_size": int(max_exact_affinity_cell_size),
         "pairing_mode": pairing_mode,
         "large_cell_pairing": large_cell_pairing,
         "num_exact_small_cells": int(exact_cells),
         "num_projection_cells": int(projection_cells),
         "num_penalized_cells": int(penalized_cells),
+        "num_random_cells": int(random_cells),
         "num_exact_penalized_cells": int(exact_penalized_cells),
         "num_projection_fallback_cells": int(projection_fallback_cells),
+        "num_events_exact_penalized": int(exact_penalized_events),
+        "num_events_projection_fallback": int(projection_fallback_events),
+        "num_events_random": int(random_events),
+        "percent_cells_exact_penalized": float(exact_penalized_cells / max(num_cells, 1)),
+        "percent_cells_projection_fallback": float(projection_fallback_cells / max(num_cells, 1)),
+        "percent_cells_random": float(random_cells / max(num_cells, 1)),
         "percent_events_exact_penalized": float(exact_penalized_events / max(len(products), 1)),
-        "percent_events_projection_fallback": float(projection_fallback_events / max(len(products), 1)),
+        "percent_events_projection_fallback": percent_projection_events,
+        "percent_events_random": float(random_events / max(len(products), 1)),
+        "percent_large_cells_projection_sort": percent_projection_events,
         "large_cell_local_swap_attempts": int(large_cell_local_swap_attempts),
         "lambda_duplicate_pair": float(lambda_duplicate_pair),
         "lambda_real_pair_overlap": float(lambda_real_pair_overlap),
@@ -240,6 +266,7 @@ def reorder_products_by_penalized_exact_greedy_affinity(
     lambda_duplicate_pair: float,
     lambda_real_pair_overlap: float,
     lambda_exact_event_overlap: float,
+    max_score_matrix_size: Optional[int] = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     customers = np.asarray(customers, dtype=object)
     products = np.asarray(products, dtype=object)
@@ -247,6 +274,8 @@ def reorder_products_by_penalized_exact_greedy_affinity(
     product_idx = np.asarray(product_idx, dtype=np.int64)
     if len(products) <= 1:
         return products.copy(), product_idx.copy()
+    if max_score_matrix_size is not None and len(products) > int(max_score_matrix_size):
+        raise RuntimeError("Refusing to build exact penalized score matrix above max_score_matrix_size")
     u_vectors = affinity_model.transformed_customer_vectors(customers, time_bucket)
     v_vectors = affinity_model.product_vectors(products)
     scores = u_vectors @ v_vectors.T
