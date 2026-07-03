@@ -61,6 +61,7 @@ training:
   weight_decay: 0.01
   seed: 42
   num_workers: 4
+  dataloader_timeout_seconds: 120
   mixed_precision: true
   device: auto
 

@@ -71,24 +71,34 @@ def train_from_config(config: ConditionalTABDLMConfig, device: str | None = None
     )
     batch_size = int(training.get("batch_size", 128))
     num_workers = int(training.get("num_workers", training.get("workers", 0)))
+    dataloader_timeout = int(training.get("dataloader_timeout_seconds", 0) or 0)
+    dataloader_kwargs = {
+        "batch_size": batch_size,
+        "num_workers": num_workers,
+        "collate_fn": collate_fn,
+        "drop_last": False,
+    }
+    if num_workers > 0:
+        dataloader_kwargs["timeout"] = dataloader_timeout
     train_loader = DataLoader(
         train_dataset,
-        batch_size=batch_size,
         shuffle=True,
-        num_workers=num_workers,
-        collate_fn=collate_fn,
-        drop_last=False,
+        **dataloader_kwargs,
     )
     valid_loader = DataLoader(
         valid_dataset,
-        batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
-        collate_fn=collate_fn,
-        drop_last=False,
+        **dataloader_kwargs,
     )
 
     device = resolve_device(device or str(training.get("device", "auto")))
+    print(
+        "Training ConditionalTABDLM with "
+        f"train_rows={len(train_dataset)}, valid_rows={len(valid_dataset)}, "
+        f"batch_size={batch_size}, num_workers={num_workers}, "
+        f"dataloader_timeout_seconds={dataloader_timeout if num_workers > 0 else 0}, "
+        f"device={device}"
+    )
     model = build_model(config, categorical_vocabs, text_tokenizer).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
