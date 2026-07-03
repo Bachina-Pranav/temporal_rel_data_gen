@@ -70,6 +70,8 @@ def test_assign_stubs_to_slots_by_time_preserves_degrees_and_blocks():
 
 
 def test_assign_stubs_to_slots_by_time_raises_on_block_mismatch():
+    frame = pd.DataFrame({"entity": ["c0", "c0"], "review_time": ["2020-01-01", "2020-01-02"]})
+    model = FastTemporalActivityModel(alpha=1.0).fit(frame, "entity", "review_time", {"c0": 0})
     with pytest.raises(ValueError, match="Stub/slot mismatch"):
         assign_stubs_to_slots_by_time(
             ["c0"],
@@ -77,7 +79,7 @@ def test_assign_stubs_to_slots_by_time_raises_on_block_mismatch():
             {"c0": 0},
             np.asarray([0]),
             np.asarray([0]),
-            activity_model(),
+            model,
             np.random.default_rng(0),
         )
 
@@ -102,3 +104,41 @@ def test_assign_stubs_to_slots_by_time_is_time_biased():
     late_mean_time = float(slot_times[assigned == "late"].mean())
 
     assert early_mean_time < late_mean_time
+
+
+def test_assign_stubs_to_slots_by_time_can_return_integer_indices_with_timings():
+    entity_ids = [f"e{i}" for i in range(20)]
+    blocks = {entity: idx % 4 for idx, entity in enumerate(entity_ids)}
+    rows = []
+    degrees = {}
+    for idx, entity in enumerate(entity_ids):
+        degree = (idx % 5) + 1
+        degrees[entity] = degree
+        for event_idx in range(degree):
+            rows.append((entity, f"2020-01-{(event_idx % 5) + 1:02d}"))
+    frame = pd.DataFrame(rows, columns=["entity", "review_time"])
+    model = FastTemporalActivityModel(alpha=1.0).fit(frame, "entity", "review_time", blocks)
+    slot_blocks = []
+    for entity, degree in degrees.items():
+        slot_blocks.extend([blocks[entity]] * degree)
+    slot_blocks = np.asarray(slot_blocks, dtype=int)
+    slot_times = np.arange(len(slot_blocks), dtype=int) % 5
+
+    assigned_idx, summary = assign_stubs_to_slots_by_time(
+        entity_ids,
+        degrees,
+        blocks,
+        slot_blocks,
+        slot_times,
+        model,
+        np.random.default_rng(19),
+        log_label="test-stubs",
+        return_entity_indices=True,
+    )
+
+    assert assigned_idx.dtype.kind in {"i", "u"}
+    assert len(assigned_idx) == len(slot_blocks)
+    assert summary["stub_construction_seconds"] >= 0.0
+    assert summary["desired_time_sampling_seconds"] >= 0.0
+    assert summary["sorting_seconds"] >= 0.0
+    assert summary["slot_assignment_seconds"] >= 0.0

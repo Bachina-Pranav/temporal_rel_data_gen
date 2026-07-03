@@ -105,6 +105,8 @@ class TimeBiasedBlockStubMatchingGenerator:
         self.slot_time_code = np.asarray([], dtype=int)
         self.slot_time_bucket = np.asarray([], dtype=object)
         self.slot_time_gate_code = np.asarray([], dtype=int)
+        self.slot_customer_idx = np.asarray([], dtype=np.int64)
+        self.slot_product_idx = np.asarray([], dtype=np.int64)
         self.slot_customer_id = np.asarray([], dtype=object)
         self.slot_product_id = np.asarray([], dtype=object)
         self.slot_summary: Dict[str, Any] = {}
@@ -136,10 +138,13 @@ class TimeBiasedBlockStubMatchingGenerator:
         self.real_df = frame
         self.customer_degrees = frame[self.customer_id_col].value_counts().astype(int).to_dict()
         self.product_degrees = frame[self.product_id_col].value_counts().astype(int).to_dict()
-        self.real_event_set = {
-            (row[self.customer_id_col], row[self.product_id_col], row["_time_bucket"])
-            for _, row in frame.iterrows()
-        }
+        self.real_event_set = set(
+            zip(
+                frame[self.customer_id_col].to_numpy(dtype=object),
+                frame[self.product_id_col].to_numpy(dtype=object),
+                frame["_time_bucket"].to_numpy(dtype=object),
+            )
+        )
         self.block_pair_time_counts = self._build_block_pair_time_counts(frame)
         print("[fit] fitting temporal activity models", flush=True)
         self.customer_activity = FastTemporalActivityModel(
@@ -172,8 +177,8 @@ class TimeBiasedBlockStubMatchingGenerator:
         rng = np.random.default_rng(self.seed if seed is None else int(seed))
         self._build_slots()
         print("[customer-stubs] assigning exact customer stubs by time-biased sort", flush=True)
-        self.slot_customer_id, self.customer_assignment_summary = assign_stubs_to_slots_by_time(
-            sorted(self.customer_degrees),
+        self.slot_customer_idx, self.customer_assignment_summary = assign_stubs_to_slots_by_time(
+            self.customer_activity.entity_ids,
             self.customer_degrees,
             self.customer_blocks,
             self.slot_customer_block,
@@ -181,11 +186,13 @@ class TimeBiasedBlockStubMatchingGenerator:
             self.customer_activity,
             rng,
             jitter=self.desired_time_jitter,
+            log_label="customer-stubs",
+            return_entity_indices=True,
         )
         print(f"[customer-stubs] done in {self.customer_assignment_summary['assignment_seconds']:.2f}s", flush=True)
         print("[product-stubs] assigning exact product stubs by time-biased sort", flush=True)
-        self.slot_product_id, self.product_assignment_summary = assign_stubs_to_slots_by_time(
-            sorted(self.product_degrees),
+        self.slot_product_idx, self.product_assignment_summary = assign_stubs_to_slots_by_time(
+            self.product_activity.entity_ids,
             self.product_degrees,
             self.product_blocks,
             self.slot_product_block,
@@ -193,8 +200,12 @@ class TimeBiasedBlockStubMatchingGenerator:
             self.product_activity,
             rng,
             jitter=self.desired_time_jitter,
+            log_label="product-stubs",
+            return_entity_indices=True,
         )
         print(f"[product-stubs] done in {self.product_assignment_summary['assignment_seconds']:.2f}s", flush=True)
+        self.slot_customer_id = self.customer_activity.entity_ids[self.slot_customer_idx]
+        self.slot_product_id = self.product_activity.entity_ids[self.slot_product_idx]
         print(f"[pairing] {self.pairing_mode} over {len(self.block_pair_time_counts):,} cells", flush=True)
         self.slot_product_id, self.dynamic_pairing_summary = reorder_products_within_cells_by_dynamic_affinity(
             self.slot_customer_id,
@@ -222,18 +233,32 @@ class TimeBiasedBlockStubMatchingGenerator:
             }
         ).sort_values([self.timestamp_col, self.customer_id_col, self.product_id_col]).reset_index(drop=True)
         self.synthetic_df = synthetic
-        sample_seconds = float(time.time() - sample_start)
         self.runtime_metadata.update(
             {
                 "customer_stub_assignment_seconds": float(self.customer_assignment_summary["assignment_seconds"]),
                 "product_stub_assignment_seconds": float(self.product_assignment_summary["assignment_seconds"]),
+                "customer_stub_construction_seconds": float(self.customer_assignment_summary["stub_construction_seconds"]),
+                "customer_desired_time_sampling_seconds": float(self.customer_assignment_summary["desired_time_sampling_seconds"]),
+                "customer_sorting_seconds": float(self.customer_assignment_summary["sorting_seconds"]),
+                "customer_slot_assignment_seconds": float(self.customer_assignment_summary["slot_assignment_seconds"]),
+                "product_stub_construction_seconds": float(self.product_assignment_summary["stub_construction_seconds"]),
+                "product_desired_time_sampling_seconds": float(self.product_assignment_summary["desired_time_sampling_seconds"]),
+                "product_sorting_seconds": float(self.product_assignment_summary["sorting_seconds"]),
+                "product_slot_assignment_seconds": float(self.product_assignment_summary["slot_assignment_seconds"]),
                 "dynamic_pairing_seconds": float(self.dynamic_pairing_summary["dynamic_pairing_seconds"]),
+            }
+        )
+        verify_start = time.time()
+        self._verify_exact_constraints(synthetic)
+        self.runtime_metadata["verification_seconds"] = float(time.time() - verify_start)
+        sample_seconds = float(time.time() - sample_start)
+        self.runtime_metadata.update(
+            {
                 "sample_seconds": sample_seconds,
                 "total_seconds": sample_seconds + float(self.runtime_metadata.get("fit_seconds", 0.0)),
                 "events_per_second": float(len(synthetic) / max(sample_seconds, 1e-9)),
             }
         )
-        self._verify_exact_constraints(synthetic)
         print("[verify] all exact constraints passed", flush=True)
         print(
             f"[done] total_seconds={self.runtime_metadata['total_seconds']:.2f}, "
@@ -272,6 +297,7 @@ class TimeBiasedBlockStubMatchingGenerator:
         write_json(self.customer_assignment_summary, debug / "customer_stub_assignment_summary.json")
         write_json(self.product_assignment_summary, debug / "product_stub_assignment_summary.json")
         write_json(self.dynamic_pairing_summary, debug / "dynamic_pairing_summary.json")
+        write_json(self.array_dtype_summary(), debug / "array_dtype_summary.json")
 
     def save_metadata(self, path: str | Path) -> None:
         write_json(self.metadata(), path)
@@ -435,20 +461,91 @@ class TimeBiasedBlockStubMatchingGenerator:
         real = self.real_df
         if len(synthetic) != len(real):
             raise RuntimeError(f"Row count mismatch: synthetic={len(synthetic)} real={len(real)}")
-        if not real[self.customer_id_col].value_counts().sort_index().equals(
-            synthetic[self.customer_id_col].value_counts().sort_index()
-        ):
+        customer_target = self._target_degree_array(self.customer_activity, self.customer_degrees)
+        product_target = self._target_degree_array(self.product_activity, self.product_degrees)
+        customer_counts = np.bincount(self.slot_customer_idx, minlength=len(customer_target))
+        if not np.array_equal(customer_counts, customer_target):
             raise RuntimeError("Customer degree sequence mismatch")
-        if not real[self.product_id_col].value_counts().sort_index().equals(
-            synthetic[self.product_id_col].value_counts().sort_index()
-        ):
+        product_lookup = self.product_activity.entity_to_index
+        product_idx_after_pairing = np.fromiter(
+            (product_lookup[product] for product in self.slot_product_id),
+            dtype=np.int64,
+            count=len(self.slot_product_id),
+        )
+        product_counts = np.bincount(product_idx_after_pairing, minlength=len(product_target))
+        if not np.array_equal(product_counts, product_target):
             raise RuntimeError("Product degree sequence mismatch")
-        if not real["_time_bucket"].value_counts().sort_index().equals(
-            synthetic[self.timestamp_col].value_counts().sort_index()
-        ):
+        expected_time_counts = np.bincount(real["_time_code"].to_numpy(dtype=np.int64), minlength=len(self.code_to_day))
+        synthetic_time_counts = np.bincount(self.slot_time_code.astype(np.int64), minlength=len(self.code_to_day))
+        if not np.array_equal(expected_time_counts, synthetic_time_counts):
             raise RuntimeError("Daily count sequence mismatch")
-        if not self._bpt_counts(real).equals(self._bpt_counts(synthetic)):
+        customer_blocks_after = self.customer_activity.get_fast_sampling_state()["entity_block"][self.slot_customer_idx]
+        if not np.array_equal(customer_blocks_after.astype(np.int64), self.slot_customer_block.astype(np.int64)):
+            raise RuntimeError("Customer block assignment mismatch")
+        product_blocks_after = self.product_activity.get_fast_sampling_state()["entity_block"][product_idx_after_pairing]
+        if not np.array_equal(product_blocks_after.astype(np.int64), self.slot_product_block.astype(np.int64)):
+            raise RuntimeError("Product block assignment mismatch")
+        expected_codes = self._cell_codes(
+            self.block_pair_time_counts["customer_block"].to_numpy(dtype=np.int64),
+            self.block_pair_time_counts["product_block"].to_numpy(dtype=np.int64),
+            self.block_pair_time_counts["time_code"].to_numpy(dtype=np.int64),
+        )
+        generated_codes = self._cell_codes(
+            self.slot_customer_block.astype(np.int64),
+            self.slot_product_block.astype(np.int64),
+            self.slot_time_code.astype(np.int64),
+        )
+        expected_counts = np.zeros(max(int(expected_codes.max()) if len(expected_codes) else 0, int(generated_codes.max()) if len(generated_codes) else 0) + 1, dtype=np.int64)
+        np.add.at(expected_counts, expected_codes, self.block_pair_time_counts["count"].to_numpy(dtype=np.int64))
+        generated_counts = np.bincount(generated_codes, minlength=len(expected_counts))
+        if len(generated_counts) > len(expected_counts):
+            expected_counts = np.pad(expected_counts, (0, len(generated_counts) - len(expected_counts)))
+        if not np.array_equal(expected_counts, generated_counts):
             raise RuntimeError("Block-pair-time counts mismatch")
+
+    def _target_degree_array(self, activity_model: FastTemporalActivityModel, degrees: Dict[Any, int]) -> np.ndarray:
+        return np.asarray([int(degrees.get(entity, 0)) for entity in activity_model.entity_ids], dtype=np.int64)
+
+    def _cell_codes(self, customer_block: np.ndarray, product_block: np.ndarray, time_code: np.ndarray) -> np.ndarray:
+        max_product = max(
+            int(self.block_pair_time_counts["product_block"].max()) if len(self.block_pair_time_counts) else 0,
+            int(self.slot_product_block.max()) if len(self.slot_product_block) else 0,
+        ) + 1
+        max_time = max(
+            int(self.block_pair_time_counts["time_code"].max()) if len(self.block_pair_time_counts) else 0,
+            int(self.slot_time_code.max()) if len(self.slot_time_code) else 0,
+        ) + 1
+        return (customer_block.astype(np.int64) * max_product + product_block.astype(np.int64)) * max_time + time_code.astype(np.int64)
+
+    def array_dtype_summary(self) -> Dict[str, Any]:
+        arrays = {
+            "slot_id": self.slot_id,
+            "slot_customer_block": self.slot_customer_block,
+            "slot_product_block": self.slot_product_block,
+            "slot_time_code": self.slot_time_code,
+            "slot_time_gate_code": self.slot_time_gate_code,
+            "slot_customer_idx": self.slot_customer_idx,
+            "slot_product_idx": self.slot_product_idx,
+            "slot_customer_id": self.slot_customer_id,
+            "slot_product_id": self.slot_product_id,
+        }
+        summary = {}
+        for name, array in arrays.items():
+            arr = np.asarray(array)
+            summary[name] = {"dtype": str(arr.dtype), "shape": list(arr.shape)}
+        if self.customer_activity is not None:
+            customer_state = self.customer_activity.get_fast_sampling_state()
+            summary["customer_empirical_time_values"] = {
+                "dtype": str(customer_state["empirical_time_values"].dtype),
+                "shape": list(customer_state["empirical_time_values"].shape),
+            }
+        if self.product_activity is not None:
+            product_state = self.product_activity.get_fast_sampling_state()
+            summary["product_empirical_time_values"] = {
+                "dtype": str(product_state["empirical_time_values"].dtype),
+                "shape": list(product_state["empirical_time_values"].shape),
+            }
+        return summary
 
     def _bpt_counts(self, frame: pd.DataFrame) -> pd.Series:
         tmp = frame.copy()

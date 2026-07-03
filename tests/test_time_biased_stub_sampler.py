@@ -38,3 +38,27 @@ def test_sample_desired_times_for_stubs_respects_entity_activity():
     assert desired[:500].mean() < desired[500:].mean()
     assert desired.min() >= 0
     assert desired.max() < len(model.time_buckets)
+
+
+def test_sample_desired_times_for_stubs_does_not_call_probability():
+    class NoDenseProbabilityModel(FastTemporalActivityModel):
+        def probability(self, entity_id, time_bucket):
+            raise AssertionError("dense probability path should not be used")
+
+    frame = pd.DataFrame(
+        {
+            "customer_id": ["c0", "c0", "c1", "c1"],
+            "review_time": ["2020-01-01", "2020-01-02", "2020-01-02", "2020-01-03"],
+        }
+    )
+    model = NoDenseProbabilityModel(alpha=1.0).fit(
+        frame,
+        "customer_id",
+        "review_time",
+        {"c0": 0, "c1": 0},
+    )
+
+    desired = sample_desired_times_for_stubs(["c0", "c0", "c1", "c1"], model, np.random.default_rng(11))
+
+    assert len(desired) == 4
+    assert desired.dtype.kind in {"i", "u"}

@@ -4,7 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import cProfile
+import io
+import pstats
 import sys
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -42,6 +46,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--desired-time-jitter", type=float, default=1e-3)
     parser.add_argument("--enable-fast-overlap-repair", action="store_true", default=False)
     parser.add_argument("--overlap-resample-prob", type=float, default=0.0)
+    parser.add_argument("--skip-evaluation", action="store_true")
+    parser.add_argument("--profile", action="store_true")
     parser.add_argument("--compute-c2st", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
@@ -53,6 +59,7 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     debug_dir = output_dir / "debug"
     output_dir.mkdir(parents=True, exist_ok=True)
+    debug_dir.mkdir(parents=True, exist_ok=True)
     generator = TimeBiasedBlockStubMatchingGenerator(
         customer_id_col=args.customer_id_col,
         product_id_col=args.product_id_col,
@@ -73,11 +80,25 @@ def main() -> None:
         overlap_resample_prob=args.overlap_resample_prob,
         seed=args.seed,
     )
-    synthetic = generator.fit(real).sample(seed=args.seed)
+    if args.profile:
+        profiler = cProfile.Profile()
+        profiler.enable()
+        synthetic = generator.fit(real).sample(seed=args.seed)
+        profiler.disable()
+        write_profile_outputs(profiler, debug_dir)
+    else:
+        synthetic = generator.fit(real).sample(seed=args.seed)
     synthetic_path = output_dir / "synthetic_review.csv"
     synthetic.to_csv(synthetic_path, index=False)
     generator.save_debug(debug_dir)
     generator.save_metadata(output_dir / "metadata.json")
+    if args.skip_evaluation:
+        print("[evaluation] skipped by --skip-evaluation")
+        print(f"[done] wrote {synthetic_path}")
+        print(f"[done] wrote {output_dir / 'metadata.json'}")
+        print(f"[done] debug files in {debug_dir}")
+        return
+    evaluation_start = time.time()
     metrics = evaluate_fast_event_spine(
         real,
         synthetic,
@@ -89,11 +110,24 @@ def main() -> None:
         metadata=generator.metadata(),
     )
     metrics.update(generator.dynamic_affinity_diagnostics(real, synthetic))
+    metrics["evaluation_seconds"] = float(time.time() - evaluation_start)
     write_metrics(metrics, output_dir / "metrics.json")
+    print(f"[evaluation] done in {metrics['evaluation_seconds']:.2f}s")
     print(f"[done] wrote {synthetic_path}")
     print(f"[done] wrote {output_dir / 'metadata.json'}")
     print(f"[done] wrote {output_dir / 'metrics.json'}")
     print(f"[done] debug files in {debug_dir}")
+
+
+def write_profile_outputs(profiler: cProfile.Profile, debug_dir: Path) -> None:
+    profile_path = debug_dir / "profile_generation.prof"
+    profile_text_path = debug_dir / "profile_generation_top.txt"
+    profiler.dump_stats(profile_path)
+    stream = io.StringIO()
+    pstats.Stats(profiler, stream=stream).sort_stats("cumulative").print_stats(50)
+    profile_text_path.write_text(stream.getvalue())
+    print(f"[profile] wrote {profile_path}")
+    print(f"[profile] wrote {profile_text_path}")
 
 
 if __name__ == "__main__":

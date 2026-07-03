@@ -76,6 +76,7 @@ class FastTemporalActivityModel:
         self.degrees_by_block: Dict[int, np.ndarray] = {}
         self.weights_by_entity: Dict[Any, float] = {}
         self._cache: Dict[tuple[int, str], tuple[np.ndarray, np.ndarray]] = {}
+        self._fast_sampling_state: Optional[Dict[str, Any]] = None
 
     def fit(
         self,
@@ -129,6 +130,7 @@ class FastTemporalActivityModel:
             for block, entities in self.entities_by_block.items()
         }
         self._cache = {}
+        self._fast_sampling_state = self._build_fast_sampling_state()
         return self
 
     def probability(self, entity_id: Any, time_bucket: Any) -> float:
@@ -198,3 +200,67 @@ class FastTemporalActivityModel:
         with path.open("w") as handle:
             json.dump(self.summary(), handle, indent=2)
             handle.write("\n")
+
+    def get_fast_sampling_state(self) -> Dict[str, Any]:
+        """Return compact arrays for direct mixture sampling of desired times."""
+
+        if self._fast_sampling_state is None:
+            self._fast_sampling_state = self._build_fast_sampling_state()
+        return self._fast_sampling_state
+
+    def _build_fast_sampling_state(self) -> Dict[str, Any]:
+        entity_mix_weight = np.asarray(
+            [float(self.weights_by_entity.get(entity, 0.0)) for entity in self.entity_ids],
+            dtype=float,
+        )
+        entity_block = np.asarray(
+            [int(self.entity_block.get(entity, 0)) for entity in self.entity_ids],
+            dtype=np.int64,
+        )
+        empirical_offsets = np.zeros(len(self.entity_ids) + 1, dtype=np.int64)
+        empirical_values: list[int] = []
+        for idx, entity in enumerate(self.entity_ids):
+            counts = self.entity_time_counts.get(entity, {})
+            for bucket, count in counts.items():
+                time_idx = self.time_index.get(bucket)
+                if time_idx is not None and int(count) > 0:
+                    empirical_values.extend([int(time_idx)] * int(count))
+            empirical_offsets[idx + 1] = len(empirical_values)
+        empirical_time_values = np.asarray(empirical_values, dtype=np.int32)
+        global_time_values, global_time_cdf = compact_cdf(self.global_time_probs)
+        block_time_values: Dict[int, np.ndarray] = {}
+        block_time_cdfs: Dict[int, np.ndarray] = {}
+        for block, probs in self.block_time_probs.items():
+            values, cdf = compact_cdf(probs)
+            block_time_values[int(block)] = values
+            block_time_cdfs[int(block)] = cdf
+        return {
+            "entity_ids": self.entity_ids,
+            "entity_to_index": self.entity_to_index,
+            "entity_mix_weight": entity_mix_weight,
+            "entity_block": entity_block,
+            "empirical_offsets": empirical_offsets,
+            "empirical_time_values": empirical_time_values,
+            "block_time_values": block_time_values,
+            "block_time_cdfs": block_time_cdfs,
+            "global_time_values": global_time_values,
+            "global_time_cdf": global_time_cdf,
+        }
+
+
+def compact_cdf(probs: np.ndarray, eps: float = 1e-12) -> tuple[np.ndarray, np.ndarray]:
+    probs = np.asarray(probs, dtype=float)
+    if len(probs) == 0:
+        return np.asarray([], dtype=np.int32), np.asarray([], dtype=float)
+    probs = np.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0).clip(min=0.0)
+    mask = probs > eps
+    if not bool(mask.any()):
+        values = np.arange(len(probs), dtype=np.int32)
+        normalized = np.ones(len(values), dtype=float) / max(len(values), 1)
+    else:
+        values = np.flatnonzero(mask).astype(np.int32)
+        normalized = probs[mask] / float(probs[mask].sum())
+    cdf = np.cumsum(normalized, dtype=float)
+    if len(cdf):
+        cdf[-1] = 1.0
+    return values, cdf
