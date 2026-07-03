@@ -12,14 +12,14 @@ import pandas as pd
 
 
 MAIN_METHOD_KEY = "time_biased_local_kernel_main"
-MAIN_METHOD_LABEL = "TimeBiasedBlockStubMatching local_kernel + penalized dynamic affinity"
+MAIN_METHOD_LABEL = "TBSM-local-kernel-dynamic"
 
 METHOD_LABELS = {
     "static_degree": "StaticDegree",
-    "ct_2k_sbm_temporal_kde_stubs": "CT-2K-SBM temporal KDE stubs",
-    "time_biased_median_mixture": "TimeBiased median mixture",
-    "time_biased_empirical_exact": "TimeBiased empirical exact",
-    "time_biased_local_kernel_random_pairing": "TimeBiased local kernel + random pairing",
+    "ct_2k_sbm_temporal_kde_stubs": "CT-2K-SBM",
+    "time_biased_median_mixture": "TBSM-median-mixture",
+    "time_biased_empirical_exact": "TBSM-empirical-exact",
+    "time_biased_local_kernel_random_pairing": "TBSM-local-kernel-random",
     MAIN_METHOD_KEY: MAIN_METHOD_LABEL,
 }
 
@@ -58,8 +58,10 @@ def paper_row(method_key: str, metrics: Dict[str, Any]) -> Dict[str, str]:
         "Product first/last/peak corr": triple(metrics, "product_first_time_corr", "product_last_time_corr", "product_peak_time_corr"),
         "Customer first/last/peak corr": triple(metrics, "customer_first_time_corr", "customer_last_time_corr", "customer_peak_time_corr"),
         "Joint coactive window": fmt(metrics.get("joint_coactive_window_rate")),
-        "Exact event overlap": sci(metrics.get("exact_event_overlap_rate")),
+        "Real duplicate rate": fmt(metrics.get("real_duplicate_customer_product_rate")),
+        "Synthetic duplicate rate": fmt(metrics.get("synthetic_duplicate_customer_product_rate")),
         "Duplicate ratio": fmt(metrics.get("duplicate_rate_ratio")),
+        "Exact event overlap": sci(metrics.get("exact_event_overlap_rate")),
         "Dynamic affinity KS": fmt(metrics.get("dynamic_affinity_distribution_ks")),
         "C2ST AUC": fmt(metrics.get("event_tuple_c2st_auc")),
         "Runtime": runtime(metrics),

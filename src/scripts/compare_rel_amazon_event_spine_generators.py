@@ -31,8 +31,6 @@ DEFAULT_RUNS = [
 
 COMPARISON_KEYS = [
     "num_reviews_synthetic",
-    "active_customers_synthetic",
-    "active_products_synthetic",
     "customer_degree_ks",
     "product_degree_ks",
     "customer_degree_exact_match",
@@ -61,10 +59,17 @@ COMPARISON_KEYS = [
     "duplicate_rate_ratio",
     "real_edge_overlap_rate",
     "exact_event_overlap_rate",
+    "mean_dynamic_affinity_real",
     "mean_dynamic_affinity_synthetic",
     "dynamic_affinity_distribution_ks",
     "event_tuple_c2st_accuracy",
     "event_tuple_c2st_auc",
+    "c2st_sample_size",
+    "num_cells_processed",
+    "num_exact_penalized_cells",
+    "num_projection_fallback_cells",
+    "percent_events_exact_penalized",
+    "percent_events_projection_fallback",
     "total_seconds",
     "events_per_second",
 ]
@@ -85,6 +90,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--skip-dynamic-affinity", action="store_true")
     parser.add_argument("--reuse-existing-metrics", action="store_true")
+    parser.add_argument("--force-evaluate", action="store_true")
     parser.add_argument("--output-json", default="outputs/rel-amazon/event_spine_generator_comparison.json")
     parser.add_argument("--output-csv", default="outputs/rel-amazon/event_spine_generator_comparison.csv")
     return parser.parse_args()
@@ -92,10 +98,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    real_path = Path(args.real_reviews)
-    if not real_path.exists():
-        raise SystemExit(f"Missing real review CSV: {real_path}")
-    real = pd.read_csv(real_path)
+    real = None
     rows = []
     nested: Dict[str, Dict[str, Any]] = {}
     for name, synthetic_path in parse_runs(args.runs):
@@ -106,11 +109,13 @@ def main() -> None:
         metadata_path = path.parent / "metadata.json"
         metrics_path = path.parent / "metrics.json"
         metadata = load_metadata(metadata_path)
-        if args.reuse_existing_metrics and metrics_path.exists():
-            with metrics_path.open() as handle:
-                metrics = json.load(handle)
-            metrics.update(load_existing_eval_metrics(path.parent))
-        else:
+        metrics = {} if args.force_evaluate else load_preferred_metrics(path.parent)
+        if not metrics:
+            if real is None:
+                real_path = Path(args.real_reviews)
+                if not real_path.exists():
+                    raise SystemExit(f"Missing real review CSV: {real_path}")
+                real = pd.read_csv(real_path)
             print(f"[compare] evaluating {name}: {path}", flush=True)
             synthetic = pd.read_csv(path)
             metrics = evaluate_fast_event_spine(
@@ -141,7 +146,7 @@ def main() -> None:
             write_metrics(metrics, path.parent / "comparison_eval_metrics.json")
             metrics.update(load_existing_eval_metrics(path.parent))
         nested[name] = metrics
-        rows.append({"model": name, **{key: metrics.get(key) for key in COMPARISON_KEYS}})
+        rows.append({"method": name, **{key: metrics.get(key) for key in COMPARISON_KEYS}})
     if not rows:
         raise SystemExit("No comparison outputs were found.")
     write_json(nested, args.output_json)
@@ -164,9 +169,28 @@ def parse_runs(items: Iterable[str] | None) -> list[tuple[str, str]]:
     return runs
 
 
+def load_preferred_metrics(output_dir: Path) -> Dict[str, Any]:
+    for filename in ["eval_metrics_c2st_v2.json", "eval_metrics_v3.json", "metrics.json"]:
+        path = output_dir / filename
+        if not path.exists():
+            continue
+        with path.open() as handle:
+            metrics = json.load(handle)
+        metrics.update(load_existing_eval_metrics(output_dir))
+        return metrics
+    return {}
+
+
 def load_existing_eval_metrics(output_dir: Path) -> Dict[str, Any]:
     merged: Dict[str, Any] = {}
-    for filename in ["eval_metrics.json", "eval_metrics_v2.json", "eval_metrics_c2st.json"]:
+    for filename in [
+        "metrics.json",
+        "eval_metrics.json",
+        "eval_metrics_v2.json",
+        "eval_metrics_v3.json",
+        "eval_metrics_c2st.json",
+        "eval_metrics_c2st_v2.json",
+    ]:
         path = output_dir / filename
         if not path.exists():
             continue

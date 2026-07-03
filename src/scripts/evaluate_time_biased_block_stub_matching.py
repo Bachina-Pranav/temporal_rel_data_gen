@@ -170,6 +170,7 @@ PAIRING_COUNTER_KEYS = [
     "percent_events_random",
     "percent_large_cells_projection_sort",
     "largest_cell_size",
+    "max_cell_size",
     "average_cell_size",
     "p95_cell_size",
     "p99_cell_size",
@@ -241,9 +242,28 @@ def block_pair_time_cell_stats(path: Path, existing: Dict[str, Any]) -> Dict[str
         "num_cells_processed": int(existing.get("num_cells_processed", len(counts)) or len(counts)),
         "average_cell_size": float(np.mean(counts)),
         "largest_cell_size": int(np.max(counts)),
+        "max_cell_size": int(np.max(counts)),
         "p95_cell_size": float(np.percentile(counts, 95.0)),
         "p99_cell_size": float(np.percentile(counts, 99.0)),
     }
+    max_exact = existing.get("max_exact_affinity_cell_size")
+    if max_exact is not None:
+        max_exact_int = int(max_exact)
+        exact_mask = counts <= max_exact_int
+        fallback_mask = ~exact_mask
+        exact_cells = int(exact_mask.sum())
+        fallback_cells = int(fallback_mask.sum())
+        exact_events = int(counts[exact_mask].sum())
+        fallback_events = int(counts[fallback_mask].sum())
+        stats.setdefault("num_exact_penalized_cells", exact_cells)
+        stats.setdefault("num_projection_fallback_cells", fallback_cells)
+        stats.setdefault("num_events_exact_penalized", exact_events)
+        stats.setdefault("num_events_projection_fallback", fallback_events)
+        stats.setdefault("percent_cells_exact_penalized", float(exact_cells / max(len(counts), 1)))
+        stats.setdefault("percent_cells_projection_fallback", float(fallback_cells / max(len(counts), 1)))
+        stats.setdefault("percent_events_exact_penalized", float(exact_events / max(total_events, 1.0)))
+        stats.setdefault("percent_events_projection_fallback", float(fallback_events / max(total_events, 1.0)))
+        stats.setdefault("percent_large_cells_projection_sort", float(fallback_events / max(total_events, 1.0)))
     for percent_key, count_key in [
         ("percent_events_exact_penalized", "num_events_exact_penalized"),
         ("percent_events_projection_fallback", "num_events_projection_fallback"),
