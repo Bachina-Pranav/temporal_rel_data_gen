@@ -130,7 +130,9 @@ def run_one(
     synthetic.to_csv(synthetic_path, index=False)
     generator.save_debug(output_dir / "debug")
     generator.save_metadata(output_dir / "metadata.json")
+    print(f"[evaluation] {output_dir.name}: starting event-spine metrics", flush=True)
     metrics = generator.evaluate(real, synthetic, compute_c2st=args.compute_c2st)
+    print(f"[evaluation] {output_dir.name}: done", flush=True)
     metadata = generator.metadata()
     metrics.update(
         {

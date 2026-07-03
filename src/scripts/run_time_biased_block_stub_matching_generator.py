@@ -110,6 +110,7 @@ def main() -> None:
         print(f"[done] wrote {output_dir / 'metadata.json'}")
         print(f"[done] debug files in {debug_dir}")
         return
+    print("[evaluation] starting event-spine metrics", flush=True)
     evaluation_start = time.time()
     metrics = evaluate_fast_event_spine(
         real,

@@ -9,7 +9,6 @@ from typing import Any, Dict, Mapping, Optional
 import numpy as np
 import pandas as pd
 
-from .event_affinity import day_index
 from .joint_temporal_2k_sbm_event import load_blocks
 from .temporal_activity_models import canonical_day_bucket
 
@@ -57,6 +56,7 @@ def evaluate_event_spine(
 def canonicalize(frame: pd.DataFrame, customer_col: str, product_col: str, timestamp_col: str) -> pd.DataFrame:
     out = frame[[customer_col, product_col, timestamp_col]].copy()
     out["_time_bucket"] = canonical_day_bucket(out[timestamp_col])
+    out["_day_index"] = day_index_series(out["_time_bucket"])
     return out
 
 
@@ -166,19 +166,26 @@ def lifecycle_metrics(real: pd.DataFrame, synthetic: pd.DataFrame, entity_col: s
 def coactivity_metrics(real: pd.DataFrame, synthetic: pd.DataFrame, customer_col: str, product_col: str, time_col: str, margin_days: int) -> Dict[str, float]:
     customer_windows = windows(real, customer_col, time_col)
     product_windows = windows(real, product_col, time_col)
-    customer_ok = []
-    product_ok = []
-    for _, row in synthetic.iterrows():
-        t = day_index(row[time_col])
-        cw = customer_windows.get(row[customer_col])
-        pw = product_windows.get(row[product_col])
-        customer_ok.append(bool(cw and cw[0] - margin_days <= t <= cw[1] + margin_days))
-        product_ok.append(bool(pw and pw[0] - margin_days <= t <= pw[1] + margin_days))
-    joint = [c and p for c, p in zip(customer_ok, product_ok)]
+    time_values = day_index_values(synthetic, time_col).astype(float)
+    customer_first, customer_last = mapped_window_arrays(synthetic[customer_col], customer_windows)
+    product_first, product_last = mapped_window_arrays(synthetic[product_col], product_windows)
+    customer_ok = (
+        np.isfinite(customer_first)
+        & np.isfinite(customer_last)
+        & (customer_first - float(margin_days) <= time_values)
+        & (time_values <= customer_last + float(margin_days))
+    )
+    product_ok = (
+        np.isfinite(product_first)
+        & np.isfinite(product_last)
+        & (product_first - float(margin_days) <= time_values)
+        & (time_values <= product_last + float(margin_days))
+    )
+    joint = customer_ok & product_ok
     return {
-        "customer_active_window_rate": float(sum(customer_ok) / max(len(customer_ok), 1)),
-        "product_active_window_rate": float(sum(product_ok) / max(len(product_ok), 1)),
-        "joint_coactive_window_rate": float(sum(joint) / max(len(joint), 1)),
+        "customer_active_window_rate": float(customer_ok.mean()) if len(customer_ok) else 0.0,
+        "product_active_window_rate": float(product_ok.mean()) if len(product_ok) else 0.0,
+        "joint_coactive_window_rate": float(joint.mean()) if len(joint) else 0.0,
     }
 
 
@@ -215,7 +222,7 @@ def event_tuple_c2st(
                 "product_degree": data[product_col].map(product_degree).fillna(0).astype(float),
                 "customer_block": data[customer_col].map(customer_blocks).fillna(0).astype(float),
                 "product_block": data[product_col].map(product_blocks).fillna(0).astype(float),
-                "day_index": data[time_col].map(day_index).astype(float),
+                "day_index": day_index_values(data, time_col).astype(float),
                 "customer_relative_age": relative_ages(data, customer_col, time_col, customer_windows),
                 "product_relative_age": relative_ages(data, product_col, time_col, product_windows),
             }
@@ -230,55 +237,83 @@ def event_tuple_c2st(
 
 
 def lifecycle_table(frame: pd.DataFrame, entity_col: str, time_col: str) -> pd.DataFrame:
-    rows = []
-    for entity, group in frame.groupby(entity_col):
-        counts = group[time_col].value_counts()
-        first = min(counts.index)
-        last = max(counts.index)
-        peak = sorted(counts.items(), key=lambda item: (-item[1], item[0]))[0][0]
-        probs = counts.to_numpy(dtype=float) / max(float(counts.sum()), 1.0)
-        entropy = float(-np.sum(probs * np.log(np.clip(probs, 1e-12, None))))
-        rows.append(
-            {
-                "entity": entity,
-                "first": day_index(first),
-                "last": day_index(last),
-                "peak": day_index(peak),
-                "span": max(day_index(last) - day_index(first), 0),
-                "entropy": entropy,
-            }
-        )
-    return pd.DataFrame(rows).set_index("entity") if rows else pd.DataFrame(columns=["first", "last", "peak", "span", "entropy"])
+    if len(frame) == 0:
+        return pd.DataFrame(columns=["first", "last", "peak", "span", "entropy"])
+    counts = pd.DataFrame(
+        {
+            "entity": frame[entity_col].to_numpy(dtype=object),
+            "day": day_index_values(frame, time_col),
+        }
+    ).groupby(["entity", "day"], sort=False).size().rename("count").reset_index()
+    lifecycle = counts.groupby("entity", sort=False)["day"].agg(first="min", last="max")
+    peak = (
+        counts.sort_values(["entity", "count", "day"], ascending=[True, False, True])
+        .drop_duplicates("entity")
+        .set_index("entity")["day"]
+    )
+    totals = counts.groupby("entity", sort=False)["count"].transform("sum").to_numpy(dtype=float)
+    probs = counts["count"].to_numpy(dtype=float) / np.maximum(totals, 1.0)
+    entropy_terms = pd.Series(-(probs * np.log(np.clip(probs, 1e-12, None))), index=counts["entity"])
+    lifecycle["peak"] = peak.reindex(lifecycle.index).to_numpy(dtype=float)
+    lifecycle["span"] = np.maximum(lifecycle["last"].to_numpy(dtype=float) - lifecycle["first"].to_numpy(dtype=float), 0.0)
+    lifecycle["entropy"] = entropy_terms.groupby(level=0, sort=False).sum().reindex(lifecycle.index).to_numpy(dtype=float)
+    return lifecycle
 
 
 def entity_time_distribution_values(frame: pd.DataFrame, entity_col: str, time_col: str) -> np.ndarray:
-    values = []
-    for _, group in frame.groupby(entity_col):
-        counts = group[time_col].value_counts().to_numpy(dtype=float)
-        probs = counts / max(float(counts.sum()), 1.0)
-        values.extend(probs.tolist())
-    return np.asarray(values, dtype=float)
+    if len(frame) == 0:
+        return np.asarray([], dtype=float)
+    counts = frame.groupby([entity_col, time_col], sort=False).size().astype(float)
+    totals = counts.groupby(level=0, sort=False).transform("sum")
+    return (counts / totals.clip(lower=1.0)).to_numpy(dtype=float)
 
 
 def windows(frame: pd.DataFrame, entity_col: str, time_col: str) -> Dict[Any, tuple[int, int]]:
-    output = {}
-    for entity, group in frame.groupby(entity_col):
-        days = group[time_col].map(day_index)
-        output[entity] = (int(days.min()), int(days.max()))
-    return output
+    if len(frame) == 0:
+        return {}
+    grouped = pd.DataFrame(
+        {
+            "entity": frame[entity_col].to_numpy(dtype=object),
+            "day": day_index_values(frame, time_col),
+        }
+    ).groupby("entity", sort=False)["day"].agg(["min", "max"])
+    return {
+        entity: (int(first), int(last))
+        for entity, first, last in zip(grouped.index, grouped["min"].to_numpy(), grouped["max"].to_numpy())
+    }
 
 
 def relative_ages(frame: pd.DataFrame, entity_col: str, time_col: str, real_windows: Mapping[Any, tuple[int, int]]) -> np.ndarray:
-    ages = []
-    for _, row in frame.iterrows():
-        window = real_windows.get(row[entity_col])
-        if not window:
-            ages.append(0.0)
-            continue
-        first, last = window
-        span = max(last - first, 1)
-        ages.append((day_index(row[time_col]) - first) / span)
-    return np.asarray(ages, dtype=float)
+    if len(frame) == 0:
+        return np.asarray([], dtype=float)
+    first, last = mapped_window_arrays(frame[entity_col], real_windows)
+    time_values = day_index_values(frame, time_col).astype(float)
+    ages = np.zeros(len(frame), dtype=float)
+    valid = np.isfinite(first) & np.isfinite(last)
+    span = np.maximum(last[valid] - first[valid], 1.0)
+    ages[valid] = (time_values[valid] - first[valid]) / span
+    return ages
+
+
+def day_index_series(series: pd.Series) -> pd.Series:
+    buckets = canonical_day_bucket(series)
+    unique_buckets = pd.unique(buckets)
+    mapping = {bucket: int(pd.Timestamp(bucket).toordinal()) for bucket in unique_buckets}
+    return buckets.map(mapping).astype(np.int64)
+
+
+def day_index_values(frame: pd.DataFrame, time_col: str) -> np.ndarray:
+    if time_col == "_time_bucket" and "_day_index" in frame.columns:
+        return frame["_day_index"].to_numpy(dtype=np.int64)
+    return day_index_series(frame[time_col]).to_numpy(dtype=np.int64)
+
+
+def mapped_window_arrays(entity_series: pd.Series, window_map: Mapping[Any, tuple[int, int]]) -> tuple[np.ndarray, np.ndarray]:
+    first_map = {entity: bounds[0] for entity, bounds in window_map.items()}
+    last_map = {entity: bounds[1] for entity, bounds in window_map.items()}
+    first = entity_series.map(first_map).to_numpy(dtype=float)
+    last = entity_series.map(last_map).to_numpy(dtype=float)
+    return first, last
 
 
 def month_counts(frame: pd.DataFrame, time_col: str) -> pd.Series:
