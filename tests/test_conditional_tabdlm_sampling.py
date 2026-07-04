@@ -78,7 +78,7 @@ def test_sampling_produces_valid_categorical_values():
         top_p=0.9,
         device="cpu",
     )
-    assert set(attrs["rating"]).issubset(set(vocabs["rating"].token_to_id))
+    assert set(attrs["rating"]).issubset({1, 5})
     assert set(attrs["verified"]).issubset(set(vocabs["verified"].token_to_id))
     assert len(attrs["summary"]) == 2
 

@@ -11,6 +11,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from .constrained import categorical_validity_mask, normalized_valid_values
 from .graph_schema import graph_conditioning_enabled, graph_metadata
 from .schema import ConditionalTABDLMConfig
 from .tokenization import normalize_text, summary_length_bucket_name
@@ -61,6 +62,25 @@ def evaluate_from_config(
         ]:
             if key in sample_metadata:
                 metrics["graph_conditioning"][key] = sample_metadata[key]
+    graph_metadata_path = synthetic_reviews_path.parent / "graph" / "graph_metadata.json"
+    if graph_metadata_path.exists():
+        with graph_metadata_path.open() as handle:
+            graph_debug_metadata = json.load(handle)
+        metrics.setdefault("graph_conditioning", {}).update(
+            {
+                key: graph_debug_metadata[key]
+                for key in [
+                    "fraction_rows_with_customer_history",
+                    "fraction_rows_with_product_history",
+                    "fraction_rows_with_any_history",
+                    "mean_customer_history_count_used",
+                    "mean_product_history_count_used",
+                    "p90_customer_history_count_used",
+                    "p90_product_history_count_used",
+                ]
+                if key in graph_debug_metadata
+            }
+        )
     save_json(metrics, output_path)
     write_report(metrics, output_dir / "eval_report.md")
     print(f"Wrote {output_path}")
@@ -162,9 +182,15 @@ def validity_metrics(real: pd.DataFrame, synthetic: pd.DataFrame, schema) -> dic
         "num_synthetic_rows": int(len(synthetic)),
     }
     for column in schema.categorical_targets:
-        valid = set(real[column].astype(str).dropna().unique()) if column in real else set()
-        values = synthetic[column].astype(str) if column in synthetic else pd.Series([], dtype=str)
-        out[f"invalid_{column}_rate"] = float((~values.isin(valid)).mean()) if len(values) else None
+        valid = normalized_valid_values(column, real[column].dropna().unique()) if column in real else []
+        values = synthetic[column] if column in synthetic else pd.Series([], dtype=object)
+        if len(values):
+            valid_mask = categorical_validity_mask(values, column, valid)
+            out[f"invalid_{column}_rate"] = float((~valid_mask).mean())
+            if column == "rating":
+                out["valid_rating_values"] = [int(value) for value in valid if str(value).isdigit()]
+        else:
+            out[f"invalid_{column}_rate"] = None
     for column in schema.text_targets:
         if column in synthetic:
             syn_len = summary_lengths(synthetic[column])

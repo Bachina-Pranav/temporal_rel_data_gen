@@ -12,6 +12,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
+from .attribute_corruption import GraphAttributeStore, build_attribute_graph_batch
 from .dataset import (
     ConditionalTABDLMDataset,
     auxiliary_target_values,
@@ -21,8 +22,14 @@ from .dataset import (
     make_collate_fn,
 )
 from .graph_dataset import build_temporal_history_index, write_temporal_graph_metadata
-from .graph_encoder import TemporalStructureOnlyGraphEncoder
-from .graph_schema import assert_valid_graph_conditioning, graph_conditioning_enabled, graph_metadata
+from .graph_encoder import TemporalAttributeDenoisingGraphEncoder, TemporalStructureOnlyGraphEncoder, build_temporal_graph_encoder
+from .graph_schema import (
+    assert_valid_graph_conditioning,
+    attribute_denoising_config,
+    graph_conditioning_enabled,
+    graph_metadata,
+    graph_mode,
+)
 from .model import ConditionalTABDLM
 from .schema import ConditionalTABDLMConfig
 from .tokenization import CategoryVocab, SimpleTextTokenizer
@@ -107,15 +114,29 @@ def train_from_config(config: ConditionalTABDLMConfig, device: str | None = None
         f"device={device}"
     )
     model = build_model(config, categorical_vocabs, text_tokenizer).to(device)
-    graph_encoder = build_graph_encoder(config).to(device) if use_graph_context else None
+    graph_encoder = build_graph_encoder(config, categorical_vocabs, text_tokenizer).to(device) if use_graph_context else None
     train_history_index = build_temporal_history_index(train_frame, config, seed=seed) if use_graph_context else None
     valid_graph_frame = pd.concat([train_frame, valid_frame], ignore_index=True) if use_graph_context else valid_frame
     valid_history_index = build_temporal_history_index(valid_graph_frame, config, seed=seed + 1) if use_graph_context else None
     valid_row_id_offset = len(train_frame) if use_graph_context else 0
+    use_attr_denoising_graph = use_graph_context and graph_mode(config.raw) == "temporal_attribute_denoising"
+    train_attr_store = (
+        GraphAttributeStore.from_frame(train_frame, config, categorical_vocabs, text_tokenizer)
+        if use_attr_denoising_graph
+        else None
+    )
+    valid_attr_store = (
+        GraphAttributeStore.from_frame(valid_graph_frame, config, categorical_vocabs, text_tokenizer)
+        if use_attr_denoising_graph
+        else None
+    )
+    metadata_dir = ensure_dir(output_dir / "metadata")
     if use_graph_context:
         graph_meta_dir = ensure_dir(output_dir / "graph")
         write_temporal_graph_metadata(train_frame, config, graph_meta_dir, source="real_training_rows", seed=seed)
-        save_json(graph_metadata(config.raw, real_graph_used_at_sampling=False), output_dir / "graph_conditioning_flags.json")
+        graph_flags = graph_metadata(config.raw, real_graph_used_at_sampling=False)
+        save_json(graph_flags, output_dir / "graph_conditioning_flags.json")
+        save_json(graph_flags, metadata_dir / "graph_conditioning.json")
     optimizer = torch.optim.AdamW(
         trainable_parameters(model, graph_encoder),
         lr=float(training.get("learning_rate", training.get("lr", 3e-4))),
@@ -123,7 +144,6 @@ def train_from_config(config: ConditionalTABDLMConfig, device: str | None = None
     )
     loss_weights = dict(config.raw.get("loss_weights", {}))
     summary_token_loss_weights = dict(config.raw.get("summary_token_loss_weights", {}))
-    metadata_dir = ensure_dir(output_dir / "metadata")
     length_class_weights = compute_summary_length_class_weights(
         train_frame,
         config,
@@ -161,6 +181,8 @@ def train_from_config(config: ConditionalTABDLMConfig, device: str | None = None
             graph_encoder=graph_encoder,
             graph_history_index=train_history_index,
             graph_deterministic=False,
+            graph_attr_store=train_attr_store,
+            config=config,
         )
         valid_metrics = run_epoch(
             model,
@@ -177,6 +199,8 @@ def train_from_config(config: ConditionalTABDLMConfig, device: str | None = None
             graph_history_index=valid_history_index,
             graph_deterministic=True,
             graph_row_id_offset=valid_row_id_offset,
+            graph_attr_store=valid_attr_store,
+            config=config,
         )
         length_calibration = compute_summary_length_calibration(
             model,
@@ -189,6 +213,7 @@ def train_from_config(config: ConditionalTABDLMConfig, device: str | None = None
             graph_encoder=graph_encoder,
             graph_history_index=valid_history_index,
             graph_row_id_offset=valid_row_id_offset,
+            graph_attr_store=valid_attr_store,
         )
         if length_calibration is not None:
             save_json(length_calibration, metadata_dir / "summary_length_calibration.json")
@@ -274,8 +299,21 @@ def build_model(
     )
 
 
-def build_graph_encoder(config: ConditionalTABDLMConfig) -> TemporalStructureOnlyGraphEncoder:
-    return TemporalStructureOnlyGraphEncoder.from_config(config.raw)
+def build_graph_encoder(
+    config: ConditionalTABDLMConfig,
+    categorical_vocabs: dict[str, CategoryVocab] | None = None,
+    text_tokenizer: SimpleTextTokenizer | None = None,
+) -> TemporalStructureOnlyGraphEncoder:
+    if graph_mode(config.raw) == "temporal_attribute_denoising":
+        if categorical_vocabs is None or text_tokenizer is None:
+            raise ValueError("temporal_attribute_denoising graph encoder requires categorical vocabs and text tokenizer")
+        return build_temporal_graph_encoder(config.raw, config.schema, categorical_vocabs, text_tokenizer)
+    return build_temporal_graph_encoder(
+        config.raw,
+        config.schema,
+        categorical_vocabs or {},
+        text_tokenizer or SimpleTextTokenizer(),
+    )
 
 
 def run_epoch(
@@ -293,6 +331,8 @@ def run_epoch(
     graph_history_index: Any | None = None,
     graph_deterministic: bool = True,
     graph_row_id_offset: int = 0,
+    graph_attr_store: GraphAttributeStore | None = None,
+    config: ConditionalTABDLMConfig | None = None,
 ) -> dict[str, float]:
     training = optimizer is not None
     model.train(training)
@@ -314,13 +354,16 @@ def run_epoch(
         if training:
             optimizer.zero_grad(set_to_none=True)
         with torch.cuda.amp.autocast(enabled=use_amp):
-            graph_context = compute_graph_context(
+            graph_context, graph_component = compute_graph_outputs(
                 graph_encoder,
                 graph_history_index,
                 batch,
                 device,
                 deterministic=graph_deterministic or not training,
                 row_id_offset=graph_row_id_offset,
+                graph_attr_store=graph_attr_store,
+                config=config,
+                training=training,
             )
             if graph_context is not None:
                 norms = graph_context.float().norm(dim=1).detach()
@@ -345,6 +388,17 @@ def run_epoch(
                 summary_token_loss_weights=summary_token_loss_weights or {},
                 summary_length_class_weights=summary_length_class_weights,
             )
+            aux_loss = graph_component.get("auxiliary_neighbor_denoising_loss_tensor")
+            if aux_loss is not None:
+                aux_weight = float((loss_weights or {}).get("auxiliary_neighbor_denoising", graph_component.get("auxiliary_neighbor_denoising_weight", 1.0)))
+                loss = loss + aux_weight * aux_loss
+                component["auxiliary_neighbor_denoising"] = {
+                    "loss_sum": float(graph_component.get("auxiliary_neighbor_denoising_loss_sum", 0.0)),
+                    "count": int(graph_component.get("auxiliary_neighbor_denoising_count", 1)),
+                }
+            for diag_key in ["history_attr_mask_rate", "target_attr_mask_rate"]:
+                if diag_key in graph_component:
+                    component[diag_key] = {"loss_sum": float(graph_component[diag_key]), "count": 1}
         if training:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -366,7 +420,7 @@ def run_epoch(
         metric_key = component_metric_name(key)
         component_loss = float(totals[key] / count)
         metrics[f"{metric_key}_loss"] = component_loss
-        if is_main_loss_component(key, model.schema):
+        if is_main_loss_component(key, model.schema) or key == "auxiliary_neighbor_denoising":
             total_loss += float(component_weight(key, loss_weights or {})) * component_loss
         if key in model.schema.model_categorical_targets:
             metrics[f"{metric_key}_accuracy"] = float(corrects.get(key, 0) / count)
@@ -467,6 +521,8 @@ def _denoising_loss_impl(
 
 
 def component_metric_name(column: str) -> str:
+    if column == "auxiliary_neighbor_denoising":
+        return "auxiliary_neighbor_denoising"
     if column == "summary_length_bucket":
         return "summary_length"
     for suffix in ["_pad_component", "_eos_component", "_content_component"]:
@@ -602,6 +658,7 @@ def compute_summary_length_calibration(
     graph_encoder: TemporalStructureOnlyGraphEncoder | None = None,
     graph_history_index: Any | None = None,
     graph_row_id_offset: int = 0,
+    graph_attr_store: GraphAttributeStore | None = None,
 ) -> dict[str, Any] | None:
     if "summary_length_bucket" not in config.schema.model_categorical_targets:
         return None
@@ -622,13 +679,16 @@ def compute_summary_length_calibration(
         cat_input = initial_masked_categorical_inputs(batch["categorical_clean_ids"], config.schema, categorical_vocabs)
         text_input, text_attention = initial_masked_text_inputs(batch["text_clean_ids"], config.schema, tokenizer)
         with torch.cuda.amp.autocast(enabled=use_amp):
-            graph_context = compute_graph_context(
+            graph_context, _ = compute_graph_outputs(
                 graph_encoder,
                 graph_history_index,
                 batch,
                 device,
                 deterministic=True,
                 row_id_offset=graph_row_id_offset,
+                graph_attr_store=graph_attr_store,
+                config=config,
+                training=False,
             )
             logits = model(
                 foreign_key_ids=batch["foreign_key_ids"],
@@ -735,7 +795,7 @@ def trainable_parameters(
     return params
 
 
-def compute_graph_context(
+def compute_graph_outputs(
     graph_encoder: TemporalStructureOnlyGraphEncoder | None,
     graph_history_index: Any | None,
     batch: dict[str, Any],
@@ -743,9 +803,12 @@ def compute_graph_context(
     *,
     deterministic: bool = True,
     row_id_offset: int = 0,
-) -> torch.Tensor | None:
+    graph_attr_store: GraphAttributeStore | None = None,
+    config: ConditionalTABDLMConfig | None = None,
+    training: bool = False,
+) -> tuple[torch.Tensor | None, dict[str, Any]]:
     if graph_encoder is None:
-        return None
+        return None, {}
     if graph_history_index is None:
         raise ValueError("graph_history_index is required when graph_encoder is enabled")
     row_ids = batch["row_id"]
@@ -756,7 +819,57 @@ def compute_graph_context(
         device=device,
         deterministic=deterministic,
     )
-    return graph_encoder(graph_batch)
+    component: dict[str, Any] = {}
+    if graph_attr_store is not None and config is not None:
+        attr_batch, attr_diag = build_attribute_graph_batch(
+            graph_batch,
+            batch,
+            graph_attr_store,
+            config,
+            device=device,
+            training=training,
+        )
+        graph_batch.update(attr_batch)
+        component.update(attr_diag)
+    context = graph_encoder(graph_batch)
+    if isinstance(graph_encoder, TemporalAttributeDenoisingGraphEncoder):
+        aux_cfg = attribute_denoising_config(config.raw if config is not None else {}).get("auxiliary_neighbor_denoising_loss", {})
+        if bool(aux_cfg.get("enabled", False)) and graph_attr_store is not None:
+            aux_loss, aux_component = graph_encoder.auxiliary_neighbor_loss(
+                graph_batch,
+                max_nodes=int(aux_cfg.get("max_neighbor_nodes_for_loss", 256)),
+            )
+            component["auxiliary_neighbor_denoising_loss_tensor"] = aux_loss
+            component["auxiliary_neighbor_denoising_loss_sum"] = aux_component.get("loss_sum", 0.0)
+            component["auxiliary_neighbor_denoising_count"] = aux_component.get("count", 1)
+            component["auxiliary_neighbor_denoising_weight"] = float(aux_cfg.get("weight", 0.25))
+    return context, component
+
+
+def compute_graph_context(
+    graph_encoder: TemporalStructureOnlyGraphEncoder | None,
+    graph_history_index: Any | None,
+    batch: dict[str, Any],
+    device: str,
+    *,
+    deterministic: bool = True,
+    row_id_offset: int = 0,
+    graph_attr_store: GraphAttributeStore | None = None,
+    config: ConditionalTABDLMConfig | None = None,
+    training: bool = False,
+) -> torch.Tensor | None:
+    context, _ = compute_graph_outputs(
+        graph_encoder,
+        graph_history_index,
+        batch,
+        device,
+        deterministic=deterministic,
+        row_id_offset=row_id_offset,
+        graph_attr_store=graph_attr_store,
+        config=config,
+        training=training,
+    )
+    return context
 
 
 def parameter_grad_norm(parameters: Any) -> float:

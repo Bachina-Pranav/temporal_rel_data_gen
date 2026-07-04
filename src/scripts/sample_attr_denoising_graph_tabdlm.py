@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sample attributes from a Conditional TABDLM checkpoint."""
+"""Sample v3 temporal attribute-denoising graph Conditional TABDLM."""
 
 from __future__ import annotations
 
@@ -16,8 +16,11 @@ from attribute_generation.conditional_tabdlm.schema import load_config  # noqa: 
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Sample Conditional TABDLM attributes.")
-    parser.add_argument("--config", default="configs/attribute_generation/conditional_tabdlm_rel_amazon_exp1.yaml")
+    parser = argparse.ArgumentParser(description="Sample v3 temporal attribute-denoising graph Conditional TABDLM attributes.")
+    parser.add_argument(
+        "--config",
+        default="configs/attribute_generation/conditional_tabdlm_amazon_toy_exp3_temporal_attr_denoising_graph.yaml",
+    )
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--synthetic-spine", default=None)
     parser.add_argument("--output", default=None)

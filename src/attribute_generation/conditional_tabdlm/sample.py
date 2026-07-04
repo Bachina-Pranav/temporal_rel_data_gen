@@ -10,9 +10,16 @@ from typing import Any
 import pandas as pd
 import torch
 
+from .attribute_corruption import GraphAttributeStore, build_attribute_graph_batch
+from .constrained import (
+    decode_category_id,
+    mask_invalid_category_logits,
+    valid_category_values,
+    validate_output_categoricals,
+)
 from .graph_dataset import build_temporal_history_index, write_temporal_graph_metadata
-from .graph_encoder import TemporalStructureOnlyGraphEncoder
-from .graph_schema import graph_conditioning_enabled, graph_metadata
+from .graph_encoder import TemporalAttributeDenoisingGraphEncoder, TemporalStructureOnlyGraphEncoder
+from .graph_schema import graph_conditioning_enabled, graph_metadata, graph_mode
 from .model import ConditionalTABDLM
 from .schema import ConditionalTABDLMConfig, ConditionalTABDLMSchema
 from .tokenization import CategoryVocab, SimpleTextTokenizer, sample_length_from_bucket, stable_hash_bucket
@@ -39,6 +46,7 @@ def sample_from_config(
     synthetic_spine_path: str | Path | None = None,
     debug_write_aux_targets: bool = False,
     disable_length_calibration: bool = False,
+    repair_invalid_categoricals: bool = False,
 ) -> Path:
     sampling = config.raw.get("sampling", {})
     checkpoint_path = Path(checkpoint_path) if checkpoint_path else config.checkpoint_dir / "best.pt"
@@ -64,8 +72,10 @@ def sample_from_config(
     spine = spine.reset_index(drop=True)
     graph_history_index = None
     if graph_encoder is not None or graph_conditioning_enabled(ckpt_config.raw):
-        graph_encoder = graph_encoder or build_graph_encoder(ckpt_config).to(device)
+        graph_encoder = graph_encoder or build_graph_encoder(ckpt_config, vocabs, tokenizer).to(device)
         graph_encoder.eval()
+        if graph_mode(ckpt_config.raw) == "temporal_attribute_denoising":
+            spine = sort_spine_chronologically(spine, ckpt_config.schema)
         graph_history_index = build_temporal_history_index(spine, ckpt_config, seed=seed)
         write_temporal_graph_metadata(
             spine,
@@ -99,6 +109,11 @@ def sample_from_config(
             output[column] = attrs[column]
     for column in ckpt_config.schema.text_targets:
         output[column] = attrs[column]
+    output = validate_output_categoricals(
+        output,
+        {column: vocabs[column] for column in ckpt_config.schema.categorical_targets if column in vocabs},
+        repair_invalid=repair_invalid_categoricals,
+    )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output.to_csv(output_path, index=False)
     metadata = {
@@ -116,13 +131,27 @@ def sample_from_config(
         "force_eos_after_sampled_length": ckpt_config.schema.force_eos_after_sampled_length,
         "force_pad_after_eos": bool(ckpt_config.schema.force_pad_after_eos),
         "length_calibration_disabled": bool(disable_length_calibration),
+        "repair_invalid_categoricals": bool(repair_invalid_categoricals),
+        "valid_categorical_values": {
+            column: valid_category_values(column, vocabs[column])
+            for column in ckpt_config.schema.categorical_targets
+            if column in vocabs
+        },
     }
+    if "rating" in vocabs:
+        metadata["valid_rating_values"] = valid_category_values("rating", vocabs["rating"])
     if graph_encoder is not None:
         metadata.update(graph_metadata(ckpt_config.raw, real_graph_used_at_sampling=False))
         metadata.update(
             {
                 "synthetic_graph_history_source": "synthetic_spine",
                 "graph_history_rows": int(len(spine)),
+                "sampling_chronological": graph_mode(ckpt_config.raw) == "temporal_attribute_denoising",
+                "history_source_sampling": "generated_past_synthetic_attributes"
+                if graph_mode(ckpt_config.raw) == "temporal_attribute_denoising"
+                else "synthetic_spine_structure_only",
+                "future_synthetic_events_used_at_sampling": False,
+                "current_batch_events_used_as_history": False,
             }
         )
     with (output_path.parent / "sample_metadata.json").open("w") as handle:
@@ -158,7 +187,7 @@ def load_model_checkpoint(
     model.eval()
     graph_encoder = None
     if include_graph and graph_conditioning_enabled(raw_config):
-        graph_encoder = build_graph_encoder(config).to(device)
+        graph_encoder = build_graph_encoder(config, vocabs, tokenizer).to(device)
         state = checkpoint.get("graph_encoder_state_dict")
         if state is not None:
             graph_encoder.load_state_dict(state)
@@ -198,6 +227,12 @@ def sample_attributes(
         column: [] for column in schema.model_categorical_targets + schema.text_targets
     }
     debug_examples: list[dict[str, Any]] = []
+    attr_sampling = isinstance(graph_encoder, TemporalAttributeDenoisingGraphEncoder)
+    generated_attr_store = (
+        GraphAttributeStore.empty_generated(len(spine), schema, categorical_vocabs, text_tokenizer)
+        if attr_sampling
+        else None
+    )
     iterator = range(0, len(spine), int(batch_size))
     if tqdm is not None:
         iterator = tqdm(iterator, total=(len(spine) + int(batch_size) - 1) // int(batch_size), desc="sample")
@@ -205,7 +240,7 @@ def sample_attributes(
         batch_frame = spine.iloc[start : start + int(batch_size)]
         foreign_key_ids, datetime_values = encode_conditions(batch_frame, schema, num_hash_buckets, device)
         graph_context = None
-        if graph_encoder is not None:
+        if graph_encoder is not None and not attr_sampling:
             if graph_history_index is None:
                 raise ValueError("graph_history_index is required when graph_encoder is enabled")
             row_indices = list(range(start, start + len(batch_frame)))
@@ -231,6 +266,17 @@ def sample_attributes(
         logits: dict[str, Any] | None = None
         for step in range(timesteps, 0, -1):
             t = torch.full((len(batch_frame),), step / max(timesteps, 1), dtype=torch.float32, device=device)
+            if attr_sampling:
+                graph_context = sampling_graph_context(
+                    graph_encoder,
+                    graph_history_index,
+                    generated_attr_store,
+                    config,
+                    row_indices=list(range(start, start + len(batch_frame))),
+                    cat_input=cat_input,
+                    text_input=text_input,
+                    device=device,
+                )
             logits = model(
                 foreign_key_ids=foreign_key_ids,
                 datetime_values=datetime_values,
@@ -254,7 +300,12 @@ def sample_attributes(
                         temperature=temperature,
                     )
                 else:
-                    sampled = sample_logits(logits["categorical"][column], temperature=temperature, top_p=1.0)
+                    sampled = sample_categorical_logits(
+                        logits["categorical"][column],
+                        column,
+                        categorical_vocabs[column],
+                        temperature=temperature,
+                    )
                 reveal = remaining & (torch.rand_like(remaining.float()) < reveal_prob)
                 if step == 1:
                     reveal = remaining
@@ -273,6 +324,17 @@ def sample_attributes(
                 text_remaining[column][reveal] = False
 
         final_t = torch.zeros((len(batch_frame),), dtype=torch.float32, device=device)
+        if attr_sampling:
+            graph_context = sampling_graph_context(
+                graph_encoder,
+                graph_history_index,
+                generated_attr_store,
+                config,
+                row_indices=list(range(start, start + len(batch_frame))),
+                cat_input=cat_input,
+                text_input=text_input,
+                device=device,
+            )
         logits = model(
             foreign_key_ids=foreign_key_ids,
             datetime_values=datetime_values,
@@ -298,7 +360,10 @@ def sample_attributes(
 
         decoded_cats: dict[str, list[str]] = {}
         for idx, column in enumerate(schema.model_categorical_targets):
-            decoded = [categorical_vocabs[column].decode(value) for value in cat_input[:, idx].detach().cpu().tolist()]
+            decoded = [
+                decode_category_id(column, categorical_vocabs[column], value)
+                for value in cat_input[:, idx].detach().cpu().tolist()
+            ]
             decoded_cats[column] = decoded
             result[column].extend(decoded)  # type: ignore[arg-type]
         for column in schema.text_targets:
@@ -324,6 +389,12 @@ def sample_attributes(
                     **length_debug_rows[local_idx],
                 }
                 debug_examples.append(example)
+        if attr_sampling and generated_attr_store is not None:
+            generated_attr_store.update_rows(
+                list(range(start, start + len(batch_frame))),
+                cat_input,
+                text_input,
+            )
     result["_debug_examples"] = debug_examples
     result["_length_calibration"] = calibration or {}
     return result
@@ -436,11 +507,22 @@ def sample_length_bucket_logits(
     schema: ConditionalTABDLMSchema,
     temperature: float,
 ) -> torch.Tensor:
+    logits = mask_invalid_category_logits(logits, "summary_length_bucket", vocab)
     probs = calibrated_length_probs(logits, vocab, calibration, schema)
     if temperature != 1.0:
         logits = torch.log(probs.clamp_min(1e-12)) / max(float(temperature), 1e-6)
         probs = torch.softmax(logits, dim=-1)
     return torch.multinomial(probs, num_samples=1).squeeze(1)
+
+
+def sample_categorical_logits(
+    logits: torch.Tensor,
+    column: str,
+    vocab: CategoryVocab,
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    constrained = mask_invalid_category_logits(logits, column, vocab)
+    return sample_logits(constrained, temperature=temperature, top_p=1.0)
 
 
 def calibrated_length_probs(
@@ -583,6 +665,46 @@ def normalized_counts(values: list[Any]) -> dict[str, float]:
         return {}
     counts = pd.Series(values).value_counts(normalize=True).sort_index()
     return {str(key): float(value) for key, value in counts.items()}
+
+
+def sort_spine_chronologically(spine: pd.DataFrame, schema: ConditionalTABDLMSchema) -> pd.DataFrame:
+    timestamp_col = schema.datetime_columns[0]
+    frame = spine.copy()
+    frame["_original_row_index"] = range(len(frame))
+    frame[timestamp_col] = pd.to_datetime(frame[timestamp_col], errors="coerce")
+    return frame.sort_values([timestamp_col, "_original_row_index"], kind="mergesort").drop(columns=["_original_row_index"]).reset_index(drop=True)
+
+
+def sampling_graph_context(
+    graph_encoder: TemporalStructureOnlyGraphEncoder | None,
+    graph_history_index: Any | None,
+    generated_attr_store: GraphAttributeStore | None,
+    config: ConditionalTABDLMConfig,
+    *,
+    row_indices: list[int],
+    cat_input: torch.Tensor,
+    text_input: dict[str, torch.Tensor],
+    device: str,
+) -> torch.Tensor | None:
+    if graph_encoder is None:
+        return None
+    if graph_history_index is None or generated_attr_store is None:
+        raise ValueError("v3 sampling requires graph_history_index and generated_attr_store")
+    graph_batch = graph_history_index.build_batch(row_indices, device=device, deterministic=True)
+    target_batch = {
+        "categorical_input_ids": cat_input,
+        "text_input_ids": text_input,
+    }
+    attr_batch, _ = build_attribute_graph_batch(
+        graph_batch,
+        target_batch,
+        generated_attr_store,
+        config,
+        device=device,
+        training=False,
+    )
+    graph_batch.update(attr_batch)
+    return graph_encoder(graph_batch)
 
 
 def encode_conditions(
