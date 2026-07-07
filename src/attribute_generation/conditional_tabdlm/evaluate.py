@@ -65,6 +65,19 @@ def evaluate_from_config(
             "graph_uses_target_attributes",
             "real_graph_used_at_sampling",
             "synthetic_graph_history_source",
+            "history_source_sampling",
+            "sampling_chronological",
+            "graph_attribute_input_mode",
+            "graph_attr_inputs",
+            "include_summary_tokens_in_graph",
+            "include_summary_length_in_graph",
+            "auxiliary_neighbor_denoising_weight",
+            "history_attr_mask_prob",
+            "summary_token_graph_dropout",
+            "summary_attr_gate",
+            "learnable_summary_attr_gate",
+            "summary_attr_gate_init",
+            "summary_attr_gate_regularization",
         ]:
             if key in sample_metadata:
                 metrics["graph_conditioning"][key] = sample_metadata[key]

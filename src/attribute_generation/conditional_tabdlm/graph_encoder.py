@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .graph_schema import attribute_denoising_config, graph_encoder_config, graph_mode
+from .graph_schema import attribute_denoising_config, graph_attribute_inputs, graph_encoder_config, graph_mode
 from .model import DateTimeEncoder
 from .schema import ConditionalTABDLMSchema
 from .tokenization import CategoryVocab, SimpleTextTokenizer
@@ -190,14 +191,22 @@ class ReviewEventAttributeStateEncoder(nn.Module):
         summary_length_dim: int = 32,
         summary_dim: int = 128,
         dropout: float = 0.1,
+        categorical_columns: list[str] | tuple[str, ...] | None = None,
+        text_columns: list[str] | tuple[str, ...] | None = None,
+        summary_token_graph_dropout: float = 0.0,
+        learnable_summary_attr_gate: bool = False,
+        summary_attr_gate_init: float = 1.0,
     ):
         super().__init__()
         self.schema = schema
         self.hidden_dim = int(hidden_dim)
         self.text_tokenizer = text_tokenizer
+        self.categorical_columns = list(schema.model_categorical_targets if categorical_columns is None else categorical_columns)
+        self.text_columns = list(schema.text_targets if text_columns is None else text_columns)
+        self.learnable_summary_attr_gate = bool(learnable_summary_attr_gate)
         self.categorical_embeddings = nn.ModuleDict()
         cat_dims = []
-        for column in schema.model_categorical_targets:
+        for column in self.categorical_columns:
             if column == "rating":
                 dim = int(rating_dim)
             elif column == "verified":
@@ -208,8 +217,17 @@ class ReviewEventAttributeStateEncoder(nn.Module):
                 dim = int(summary_length_dim)
             self.categorical_embeddings[column] = nn.Embedding(categorical_vocabs[column].size + 1, dim)
             cat_dims.append(dim)
-        self.text_embedding = nn.Embedding(text_tokenizer.vocab_size, int(summary_dim))
-        input_dim = int(sum(cat_dims) + (int(summary_dim) if schema.text_targets else 0))
+        self.text_embedding = nn.Embedding(text_tokenizer.vocab_size, int(summary_dim)) if self.text_columns else None
+        self.summary_token_graph_dropout = nn.Dropout(float(summary_token_graph_dropout))
+        gate_init = min(max(float(summary_attr_gate_init), 1e-6), 1.0 - 1e-6)
+        raw_gate = math.log(gate_init / (1.0 - gate_init))
+        if self.text_columns and self.learnable_summary_attr_gate:
+            self.summary_attr_raw_gate = nn.Parameter(torch.tensor(float(raw_gate)))
+        else:
+            self.register_buffer("summary_attr_raw_gate", torch.tensor(float(raw_gate)))
+        input_dim = int(sum(cat_dims) + len(self.text_columns) * int(summary_dim))
+        if input_dim <= 0:
+            raise ValueError("ReviewEventAttributeStateEncoder needs at least one graph attribute input")
         self.projector = nn.Sequential(
             nn.Linear(input_dim, self.hidden_dim),
             nn.GELU(),
@@ -223,16 +241,22 @@ class ReviewEventAttributeStateEncoder(nn.Module):
         text_ids: dict[str, torch.Tensor],
     ) -> torch.Tensor:
         pieces = []
-        for idx, column in enumerate(self.schema.model_categorical_targets):
+        for idx, column in enumerate(self.categorical_columns):
             pieces.append(self.categorical_embeddings[column](categorical_ids[..., idx]))
-        if self.schema.text_targets:
-            column = self.schema.text_targets[0]
+        for column in self.text_columns:
             ids = text_ids[column]
+            if self.text_embedding is None:
+                continue
             emb = self.text_embedding(ids)
             mask = (ids != self.text_tokenizer.pad_id).float().unsqueeze(-1)
             pooled = (emb * mask).sum(dim=-2) / mask.sum(dim=-2).clamp_min(1.0)
+            pooled = self.summary_token_graph_dropout(pooled)
+            pooled = self.summary_attr_gate() * pooled
             pieces.append(pooled)
         return self.projector(torch.cat(pieces, dim=-1))
+
+    def summary_attr_gate(self) -> torch.Tensor:
+        return torch.sigmoid(self.summary_attr_raw_gate)
 
 
 class TemporalAttributeDenoisingGraphEncoder(TemporalStructureOnlyGraphEncoder):
@@ -251,6 +275,9 @@ class TemporalAttributeDenoisingGraphEncoder(TemporalStructureOnlyGraphEncoder):
         self.categorical_vocabs = categorical_vocabs
         self.text_tokenizer = text_tokenizer
         embedding_cfg = attr_cfg.get("attribute_embedding", {}) if isinstance(attr_cfg, dict) else {}
+        attr_inputs = graph_attribute_inputs({"attribute_denoising": attr_cfg, "graph_conditioning": {"mode": "temporal_attribute_denoising"}}, schema)
+        self.graph_attr_inputs = list(attr_inputs["graph_attr_inputs"])
+        self.summary_attr_gate_regularization = float(attr_inputs.get("summary_attr_gate_regularization", 0.0))
         self.attr_state_encoder = ReviewEventAttributeStateEncoder(
             schema,
             categorical_vocabs,
@@ -261,12 +288,17 @@ class TemporalAttributeDenoisingGraphEncoder(TemporalStructureOnlyGraphEncoder):
             summary_length_dim=int(embedding_cfg.get("summary_length_dim", 32)),
             summary_dim=int(embedding_cfg.get("summary_dim", 128)),
             dropout=float(embedding_cfg.get("dropout", self.dropout)),
+            categorical_columns=list(attr_inputs["categorical_columns"]),
+            text_columns=list(attr_inputs["text_columns"]),
+            summary_token_graph_dropout=float(attr_inputs.get("summary_token_graph_dropout", 0.0)),
+            learnable_summary_attr_gate=bool(attr_inputs.get("learnable_summary_attr_gate", False)),
+            summary_attr_gate_init=float(attr_inputs.get("summary_attr_gate_init", 1.0)),
         )
         self.aux_categorical_heads = nn.ModuleDict(
-            {column: nn.Linear(self.hidden_dim, categorical_vocabs[column].size) for column in schema.model_categorical_targets}
+            {column: nn.Linear(self.hidden_dim, categorical_vocabs[column].size) for column in self.attr_state_encoder.categorical_columns}
         )
         self.aux_text_heads = nn.ModuleDict(
-            {column: nn.Linear(self.hidden_dim, text_tokenizer.vocab_size) for column in schema.text_targets}
+            {column: nn.Linear(self.hidden_dim, text_tokenizer.vocab_size) for column in self.attr_state_encoder.text_columns}
         )
 
     @classmethod
@@ -304,7 +336,7 @@ class TemporalAttributeDenoisingGraphEncoder(TemporalStructureOnlyGraphEncoder):
         if "target_categorical_ids" in graph_batch:
             target = target + self.attr_state_encoder(
                 graph_batch["target_categorical_ids"],
-                {column: graph_batch[f"target_text_ids_{column}"] for column in self.schema.text_targets},
+                {column: graph_batch[f"target_text_ids_{column}"] for column in self.attr_state_encoder.text_columns},
             )
         customer_hist = self._encode_history_with_attr(graph_batch, "customer", source_type=0)
         product_hist = self._encode_history_with_attr(graph_batch, "product", source_type=1)
@@ -334,7 +366,7 @@ class TemporalAttributeDenoisingGraphEncoder(TemporalStructureOnlyGraphEncoder):
             return base
         history_attr = self.attr_state_encoder(
             graph_batch[cat_key],
-            {column: graph_batch[f"{kind}_history_text_ids_{column}"] for column in self.schema.text_targets},
+            {column: graph_batch[f"{kind}_history_text_ids_{column}"] for column in self.attr_state_encoder.text_columns},
         )
         weights = graph_batch[f"{kind}_history_mask"].float().unsqueeze(-1)
         pooled = (history_attr * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
@@ -344,7 +376,7 @@ class TemporalAttributeDenoisingGraphEncoder(TemporalStructureOnlyGraphEncoder):
         reps = []
         labels = []
         masks = []
-        text_labels: dict[str, list[torch.Tensor]] = {column: [] for column in self.schema.text_targets}
+        text_labels: dict[str, list[torch.Tensor]] = {column: [] for column in self.attr_state_encoder.text_columns}
         for kind, source_type in (("customer", 0), ("product", 1)):
             cat_key = f"{kind}_history_categorical_ids"
             clean_key = f"{kind}_history_clean_categorical_ids"
@@ -358,12 +390,12 @@ class TemporalAttributeDenoisingGraphEncoder(TemporalStructureOnlyGraphEncoder):
             )
             attr = self.attr_state_encoder(
                 graph_batch[cat_key],
-                {column: graph_batch[f"{kind}_history_text_ids_{column}"] for column in self.schema.text_targets},
+                {column: graph_batch[f"{kind}_history_text_ids_{column}"] for column in self.attr_state_encoder.text_columns},
             )
             reps.append(struct + attr)
             labels.append(graph_batch[clean_key])
             masks.append(graph_batch[f"{kind}_history_mask"])
-            for column in self.schema.text_targets:
+            for column in self.attr_state_encoder.text_columns:
                 text_labels[column].append(graph_batch[f"{kind}_history_clean_text_ids_{column}"])
         if not reps:
             zero = next(self.parameters()).sum() * 0.0
@@ -377,31 +409,55 @@ class TemporalAttributeDenoisingGraphEncoder(TemporalStructureOnlyGraphEncoder):
             trimmed_mask[keep_positions] = True
             mask = trimmed_mask
         losses = []
+        component_losses: dict[str, dict[str, float | int]] = {}
         count = int(mask.sum().detach().cpu())
-        for idx, column in enumerate(self.schema.model_categorical_targets):
+        for idx, column in enumerate(self.attr_state_encoder.categorical_columns):
             if count == 0:
                 continue
             logits = self.aux_categorical_heads[column](rep)
-            losses.append(F.cross_entropy(logits[mask], label[mask, idx], reduction="mean"))
-        for column in self.schema.text_targets:
+            column_loss = F.cross_entropy(logits[mask], label[mask, idx], reduction="mean")
+            losses.append(column_loss)
+            component_losses[aux_component_name(column)] = {
+                "loss_sum": float(column_loss.detach().cpu()) * max(count, 1),
+                "count": max(count, 1),
+            }
+        for column in self.attr_state_encoder.text_columns:
             clean = torch.cat([value.reshape(-1, value.shape[-1]) for value in text_labels[column]], dim=0)
             if count == 0:
                 continue
             token_logits = self.aux_text_heads[column](rep[mask])
             repeated = token_logits.unsqueeze(1).expand(-1, clean.shape[1], -1)
-            losses.append(
-                F.cross_entropy(
-                    repeated.reshape(-1, repeated.shape[-1]),
-                    clean[mask].reshape(-1),
-                    ignore_index=self.text_tokenizer.pad_id,
-                    reduction="mean",
-                )
+            column_loss = F.cross_entropy(
+                repeated.reshape(-1, repeated.shape[-1]),
+                clean[mask].reshape(-1),
+                ignore_index=self.text_tokenizer.pad_id,
+                reduction="mean",
             )
+            losses.append(column_loss)
+            component_losses[aux_component_name(column)] = {
+                "loss_sum": float(column_loss.detach().cpu()) * max(count, 1),
+                "count": max(count, 1),
+            }
         if not losses:
             zero = next(self.parameters()).sum() * 0.0
             return zero, {"loss_sum": 0.0, "count": 0}
         loss = torch.stack(losses).mean()
-        return loss, {"loss_sum": float(loss.detach().cpu()) * max(count, 1), "count": max(count, 1)}
+        return loss, {
+            "loss_sum": float(loss.detach().cpu()) * max(count, 1),
+            "count": max(count, 1),
+            "components": component_losses,
+        }
+
+    def summary_attr_gate_value(self) -> float | None:
+        if not self.attr_state_encoder.text_columns:
+            return None
+        return float(self.attr_state_encoder.summary_attr_gate().detach().cpu())
+
+    def summary_attr_gate_regularization_loss(self) -> torch.Tensor | None:
+        if not self.attr_state_encoder.text_columns or self.summary_attr_gate_regularization <= 0:
+            return None
+        gate = self.attr_state_encoder.summary_attr_gate()
+        return float(self.summary_attr_gate_regularization) * gate.pow(2)
 
     def _encode_history_events(
         self,
@@ -429,7 +485,18 @@ class TemporalAttributeDenoisingGraphEncoder(TemporalStructureOnlyGraphEncoder):
     def to_config(self) -> dict[str, Any]:
         data = super().to_config()
         data["type"] = "temporal_attr_denoising_ego_encoder"
+        data["graph_attr_inputs"] = list(self.graph_attr_inputs)
+        if self.attr_state_encoder.text_columns:
+            data["summary_attr_gate"] = self.summary_attr_gate_value()
         return data
+
+
+def aux_component_name(column: str) -> str:
+    if column == "summary_length_bucket":
+        return "summary_length"
+    if column == "summary":
+        return "summary"
+    return column
 
 
 def build_temporal_graph_encoder(

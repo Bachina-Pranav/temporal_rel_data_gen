@@ -58,6 +58,14 @@ def graph_mode(raw_config: dict[str, Any]) -> str:
 def attribute_denoising_config(raw_config: dict[str, Any]) -> dict[str, Any]:
     cfg = dict(raw_config.get("attribute_denoising", {}) or {})
     cfg.setdefault("enabled", graph_mode(raw_config) == "temporal_attribute_denoising")
+    inputs = [str(value) for value in cfg.get("review_event_attribute_inputs", ["rating", "verified", "summary_length_bucket", "summary"])]
+    cfg["review_event_attribute_inputs"] = inputs
+    cfg.setdefault("include_summary_length_in_graph", "summary_length_bucket" in inputs)
+    cfg.setdefault("include_summary_tokens_in_graph", "summary" in inputs)
+    cfg.setdefault("summary_token_graph_dropout", 0.0)
+    cfg.setdefault("learnable_summary_attr_gate", False)
+    cfg.setdefault("summary_attr_gate_init", 1.0)
+    cfg.setdefault("summary_attr_gate_regularization", 0.0)
     cfg.setdefault("input_mode_training", "noised_attributes")
     cfg.setdefault("input_mode_sampling", "generated_past_attributes_plus_current_noised_state")
     cfg.setdefault("corrupt_target_event_attributes", True)
@@ -86,6 +94,36 @@ def attribute_denoising_config(raw_config: dict[str, Any]) -> dict[str, Any]:
     embedding.setdefault("dropout", 0.1)
     cfg["attribute_embedding"] = embedding
     return cfg
+
+
+def graph_attribute_inputs(raw_config: dict[str, Any], schema: Any) -> dict[str, Any]:
+    cfg = attribute_denoising_config(raw_config)
+    requested = set(str(value) for value in cfg.get("review_event_attribute_inputs", []))
+    include_summary_length = bool(cfg.get("include_summary_length_in_graph", "summary_length_bucket" in requested))
+    include_summary_tokens = bool(cfg.get("include_summary_tokens_in_graph", "summary" in requested))
+    categorical = []
+    for column in schema.model_categorical_targets:
+        if column == "summary_length_bucket":
+            if include_summary_length:
+                categorical.append(column)
+        elif column in requested:
+            categorical.append(column)
+    text = [column for column in schema.text_targets if include_summary_tokens and column in requested]
+    return {
+        "graph_attr_inputs": list(categorical + text),
+        "categorical_columns": categorical,
+        "text_columns": text,
+        "include_rating": "rating" in categorical,
+        "include_verified": "verified" in categorical,
+        "include_summary_length_in_graph": "summary_length_bucket" in categorical,
+        "include_summary_tokens_in_graph": bool(text),
+        "summary_token_graph_dropout": float(cfg.get("summary_token_graph_dropout", 0.0)),
+        "learnable_summary_attr_gate": bool(cfg.get("learnable_summary_attr_gate", False)),
+        "summary_attr_gate_init": float(cfg.get("summary_attr_gate_init", 1.0)),
+        "summary_attr_gate_regularization": float(cfg.get("summary_attr_gate_regularization", 0.0)),
+        "auxiliary_neighbor_denoising_weight": float(cfg.get("auxiliary_neighbor_denoising_loss", {}).get("weight", 0.25)),
+        "history_attr_mask_prob": float(cfg.get("history_attribute_corruption", {}).get("mask_prob", 0.15)),
+    }
 
 
 def assert_valid_graph_conditioning(raw_config: dict[str, Any]) -> None:
@@ -167,6 +205,18 @@ def graph_metadata(raw_config: dict[str, Any], *, real_graph_used_at_sampling: b
     metadata["graph_num_layers"] = int(graph_encoder_config(raw_config).get("num_layers", 2))
     metadata["graph_hidden_dim"] = int(graph_encoder_config(raw_config).get("hidden_dim", 256))
     metadata["graph_output_dim"] = int(graph_encoder_config(raw_config).get("output_dim", 256))
+    if mode == "temporal_attribute_denoising":
+        attr_cfg = attribute_denoising_config(raw_config)
+        metadata["graph_attr_inputs"] = list(attr_cfg.get("review_event_attribute_inputs", []))
+        metadata["include_summary_tokens_in_graph"] = bool(attr_cfg.get("include_summary_tokens_in_graph", False))
+        metadata["include_summary_length_in_graph"] = bool(attr_cfg.get("include_summary_length_in_graph", False))
+        metadata["auxiliary_neighbor_denoising_weight"] = float(attr_cfg.get("auxiliary_neighbor_denoising_loss", {}).get("weight", 0.25))
+        metadata["history_attr_mask_prob"] = float(attr_cfg.get("history_attribute_corruption", {}).get("mask_prob", 0.15))
+        if bool(attr_cfg.get("include_summary_tokens_in_graph", False)):
+            metadata["summary_token_graph_dropout"] = float(attr_cfg.get("summary_token_graph_dropout", 0.0))
+            metadata["learnable_summary_attr_gate"] = bool(attr_cfg.get("learnable_summary_attr_gate", False))
+            metadata["summary_attr_gate_init"] = float(attr_cfg.get("summary_attr_gate_init", 1.0))
+            metadata["summary_attr_gate_regularization"] = float(attr_cfg.get("summary_attr_gate_regularization", 0.0))
     if real_graph_used_at_sampling is not None:
         metadata["real_graph_used_at_sampling"] = bool(real_graph_used_at_sampling)
     return metadata

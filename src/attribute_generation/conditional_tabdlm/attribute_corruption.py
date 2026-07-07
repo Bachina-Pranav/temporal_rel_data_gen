@@ -10,7 +10,7 @@ import pandas as pd
 import torch
 
 from .dataset import auxiliary_target_values, normalize_frame
-from .graph_schema import attribute_denoising_config
+from .graph_schema import attribute_denoising_config, graph_attribute_inputs
 from .schema import ConditionalTABDLMConfig, ConditionalTABDLMSchema
 from .tokenization import CategoryVocab, SimpleTextTokenizer
 
@@ -100,31 +100,43 @@ def build_attribute_graph_batch(
     training: bool,
 ) -> tuple[dict[str, torch.Tensor], dict[str, float]]:
     attr_cfg = attribute_denoising_config(config.raw)
+    attr_inputs = graph_attribute_inputs(config.raw, config.schema)
+    categorical_columns = list(attr_inputs["categorical_columns"])
+    categorical_indices = [config.schema.model_categorical_targets.index(column) for column in categorical_columns]
+    text_columns = list(attr_inputs["text_columns"])
     history_cfg = attr_cfg["history_attribute_corruption"] if training else attr_cfg["sampling_history_attribute_corruption"]
     mask_prob = float(history_cfg.get("mask_prob", 0.15 if training else 0.0)) if bool(history_cfg.get("enabled", True)) else 0.0
-    attr_batch: dict[str, torch.Tensor] = {
-        "target_categorical_ids": batch["categorical_input_ids"].to(device),
-    }
-    for column in config.schema.text_targets:
+    target_categorical = batch["categorical_input_ids"].to(device)
+    attr_batch: dict[str, torch.Tensor] = {}
+    if categorical_indices:
+        attr_batch["target_categorical_ids"] = target_categorical[:, categorical_indices]
+    for column in text_columns:
         attr_batch[f"target_text_ids_{column}"] = batch["text_input_ids"][column].to(device)
 
     mask_stats = []
-    target_stats = [target_mask_rate(batch, store)]
+    target_stats = [target_mask_rate(batch, store, categorical_columns=categorical_columns, text_columns=text_columns)]
     for kind in ("customer", "product"):
         rows = graph_batch[f"{kind}_history_row_index"].detach().cpu().numpy()
         mask = graph_batch[f"{kind}_history_mask"].to(device)
-        clean_cat = gather_categorical(store, rows, device=device)
-        noised_cat, cat_rate = corrupt_categorical_history(clean_cat, mask, store, mask_prob=mask_prob)
-        attr_batch[f"{kind}_history_categorical_ids"] = noised_cat
-        attr_batch[f"{kind}_history_clean_categorical_ids"] = clean_cat
+        if categorical_indices:
+            clean_cat = gather_categorical(store, rows, device=device)[:, :, categorical_indices]
+            noised_cat, cat_rate = corrupt_categorical_history(
+                clean_cat,
+                mask,
+                store,
+                categorical_columns=categorical_columns,
+                mask_prob=mask_prob,
+            )
+            attr_batch[f"{kind}_history_categorical_ids"] = noised_cat
+            attr_batch[f"{kind}_history_clean_categorical_ids"] = clean_cat
+            mask_stats.append(cat_rate)
         text_rates = []
-        for column in config.schema.text_targets:
+        for column in text_columns:
             clean_text = gather_text(store, rows, column, device=device)
             noised_text, rate = corrupt_text_history(clean_text, mask, store.text_tokenizer, mask_prob=mask_prob)
             attr_batch[f"{kind}_history_text_ids_{column}"] = noised_text
             attr_batch[f"{kind}_history_clean_text_ids_{column}"] = clean_text
             text_rates.append(rate)
-        mask_stats.append(cat_rate)
         mask_stats.extend(text_rates)
 
     diagnostics = {
@@ -172,14 +184,16 @@ def corrupt_categorical_history(
     mask: torch.Tensor,
     store: GraphAttributeStore,
     *,
+    categorical_columns: list[str] | tuple[str, ...] | None = None,
     mask_prob: float,
 ) -> tuple[torch.Tensor, float]:
     if mask_prob <= 0:
         return values.clone(), 0.0
+    columns = list(store.schema.model_categorical_targets if categorical_columns is None else categorical_columns)
     out = values.clone()
     valid = mask.unsqueeze(-1).expand_as(out).clone()
     random_mask = (torch.rand(out.shape, device=out.device) < float(mask_prob)) & valid
-    for idx, column in enumerate(store.schema.model_categorical_targets):
+    for idx, column in enumerate(columns):
         out[:, :, idx] = torch.where(random_mask[:, :, idx], torch.full_like(out[:, :, idx], store.categorical_vocabs[column].mask_id), out[:, :, idx])
     denom = int(valid.sum().detach().cpu())
     return out, float(random_mask.sum().detach().cpu() / max(denom, 1))
@@ -204,12 +218,20 @@ def corrupt_text_history(
     return out, float(random_mask.sum().detach().cpu() / max(denom, 1))
 
 
-def target_mask_rate(batch: dict[str, Any], store: GraphAttributeStore) -> float:
+def target_mask_rate(
+    batch: dict[str, Any],
+    store: GraphAttributeStore,
+    *,
+    categorical_columns: list[str] | tuple[str, ...] | None = None,
+    text_columns: list[str] | tuple[str, ...] | None = None,
+) -> float:
     rates = []
     cat = batch["categorical_input_ids"]
-    for idx, column in enumerate(store.schema.model_categorical_targets):
+    columns = list(store.schema.model_categorical_targets if categorical_columns is None else categorical_columns)
+    for column in columns:
+        idx = store.schema.model_categorical_targets.index(column)
         rates.append(float((cat[:, idx] == store.categorical_vocabs[column].mask_id).float().mean().detach().cpu()))
-    for column in store.schema.text_targets:
+    for column in list(store.schema.text_targets if text_columns is None else text_columns):
         values = batch["text_input_ids"][column]
         candidate = torch.ones_like(values, dtype=torch.bool)
         if values.shape[1] > 0:

@@ -346,6 +346,8 @@ def run_epoch(
     graph_norm_count = 0
     graph_grad_norm_sum = 0.0
     graph_grad_norm_count = 0
+    extra_metric_sums: dict[str, float] = {}
+    extra_metric_counts: dict[str, int] = {}
     iterator = loader
     if tqdm is not None:
         iterator = tqdm(loader, leave=False, desc="train" if training else "valid")
@@ -396,6 +398,21 @@ def run_epoch(
                     "loss_sum": float(graph_component.get("auxiliary_neighbor_denoising_loss_sum", 0.0)),
                     "count": int(graph_component.get("auxiliary_neighbor_denoising_count", 1)),
                 }
+                for name, stats in graph_component.get("auxiliary_neighbor_denoising_components", {}).items():
+                    component[f"aux_neighbor_{name}"] = {
+                        "loss_sum": float(stats.get("loss_sum", 0.0)),
+                        "count": int(stats.get("count", 1)),
+                    }
+            gate_reg = graph_component.get("summary_attr_gate_regularization_loss_tensor")
+            if gate_reg is not None:
+                loss = loss + gate_reg
+                component["summary_attr_gate_regularization"] = {
+                    "loss_sum": float(gate_reg.detach().cpu()),
+                    "count": 1,
+                }
+            if "summary_attr_gate" in graph_component:
+                extra_metric_sums["summary_attr_gate"] = extra_metric_sums.get("summary_attr_gate", 0.0) + float(graph_component["summary_attr_gate"])
+                extra_metric_counts["summary_attr_gate"] = extra_metric_counts.get("summary_attr_gate", 0) + 1
             for diag_key in ["history_attr_mask_rate", "target_attr_mask_rate"]:
                 if diag_key in graph_component:
                     component[diag_key] = {"loss_sum": float(graph_component[diag_key]), "count": 1}
@@ -419,7 +436,10 @@ def run_epoch(
         count = max(float(counts.get(key, 0.0)), 1.0)
         metric_key = component_metric_name(key)
         component_loss = float(totals[key] / count)
-        metrics[f"{metric_key}_loss"] = component_loss
+        if str(metric_key).startswith("loss_"):
+            metrics[metric_key] = component_loss
+        else:
+            metrics[f"{metric_key}_loss"] = component_loss
         if is_main_loss_component(key, model.schema) or key == "auxiliary_neighbor_denoising":
             total_loss += float(component_weight(key, loss_weights or {})) * component_loss
         if key in model.schema.model_categorical_targets:
@@ -432,6 +452,8 @@ def run_epoch(
         metrics["graph_context_norm_std"] = float(var ** 0.5)
     if graph_grad_norm_count > 0:
         metrics["graph_encoder_grad_norm"] = float(graph_grad_norm_sum / max(graph_grad_norm_count, 1))
+    for key, value in extra_metric_sums.items():
+        metrics[key] = float(value / max(extra_metric_counts.get(key, 0), 1))
     return metrics
 
 
@@ -523,6 +545,8 @@ def _denoising_loss_impl(
 def component_metric_name(column: str) -> str:
     if column == "auxiliary_neighbor_denoising":
         return "auxiliary_neighbor_denoising"
+    if str(column).startswith("aux_neighbor_"):
+        return "loss_aux_neighbor_" + str(column)[len("aux_neighbor_") :]
     if column == "summary_length_bucket":
         return "summary_length"
     for suffix in ["_pad_component", "_eos_component", "_content_component"]:
@@ -842,7 +866,14 @@ def compute_graph_outputs(
             component["auxiliary_neighbor_denoising_loss_tensor"] = aux_loss
             component["auxiliary_neighbor_denoising_loss_sum"] = aux_component.get("loss_sum", 0.0)
             component["auxiliary_neighbor_denoising_count"] = aux_component.get("count", 1)
+            component["auxiliary_neighbor_denoising_components"] = aux_component.get("components", {})
             component["auxiliary_neighbor_denoising_weight"] = float(aux_cfg.get("weight", 0.25))
+        gate_value = graph_encoder.summary_attr_gate_value()
+        if gate_value is not None:
+            component["summary_attr_gate"] = float(gate_value)
+        gate_reg = graph_encoder.summary_attr_gate_regularization_loss()
+        if gate_reg is not None:
+            component["summary_attr_gate_regularization_loss_tensor"] = gate_reg
     return context, component
 
 

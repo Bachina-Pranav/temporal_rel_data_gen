@@ -154,6 +154,10 @@ def sample_from_config(
                 "current_batch_events_used_as_history": False,
             }
         )
+        if isinstance(graph_encoder, TemporalAttributeDenoisingGraphEncoder):
+            gate_value = graph_encoder.summary_attr_gate_value()
+            if gate_value is not None:
+                metadata["summary_attr_gate"] = float(gate_value)
     with (output_path.parent / "sample_metadata.json").open("w") as handle:
         json.dump(metadata, handle, indent=2, sort_keys=True)
         handle.write("\n")

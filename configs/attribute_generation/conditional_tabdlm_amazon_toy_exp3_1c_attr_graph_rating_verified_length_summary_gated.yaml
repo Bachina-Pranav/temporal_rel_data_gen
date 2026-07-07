@@ -1,0 +1,198 @@
+dataset_name: amazon-toy
+experiment_name: conditional_tabdlm_exp3_1c_attr_graph_rating_verified_length_summary_gated
+
+paths:
+  train_data_path: data/original/rel-amazon-toy/review.csv
+  synthetic_spine_path: outputs/amazon-toy/time_biased_block_stub_matching_kernel_main/synthetic_review.csv
+  output_dir: outputs/amazon-toy/conditional_tabdlm_exp3_1c_attr_graph_rating_verified_length_summary_gated
+
+columns:
+  condition:
+    foreign_keys: [customer_id, product_id]
+    datetimes: [review_time]
+  target:
+    categorical: [rating, verified]
+    numerical: []
+    text: [summary]
+
+auxiliary_targets:
+  categorical: [summary_length_bucket]
+
+graph_conditioning:
+  enabled: true
+  mode: temporal_attribute_denoising
+  temporal_filter:
+    enabled: true
+    mode: past_only
+    timestamp_column: review_time
+    allow_same_timestamp_events: false
+    same_timestamp_tiebreak: row_index
+    exclude_target_event_from_neighbors: true
+    max_history_events_per_customer: 50
+    max_history_events_per_product: 100
+    history_sampling_strategy: recent
+    deterministic_eval: true
+  graph_encoder:
+    type: temporal_attr_denoising_ego_encoder
+    hidden_dim: 256
+    output_dim: 256
+    num_layers: 2
+    dropout: 0.1
+    aggregator: mean
+    use_edge_type_embeddings: true
+    use_residual: true
+    normalize_output: true
+  graph_context_token:
+    enabled: true
+    position: after_condition_tokens
+    projection_dim: 384
+  leakage_policy:
+    graph_uses_future_events: false
+    graph_uses_clean_target_attributes: false
+    graph_uses_clean_future_attributes: false
+    real_graph_used_at_sampling: false
+    synthetic_graph_history_source: synthetic_spine
+
+attribute_denoising:
+  enabled: true
+  review_event_attribute_inputs: [rating, verified, summary_length_bucket, summary]
+  include_summary_length_in_graph: true
+  include_summary_tokens_in_graph: true
+  summary_token_graph_dropout: 0.50
+  learnable_summary_attr_gate: true
+  summary_attr_gate_init: 0.05
+  summary_attr_gate_regularization: 0.001
+  input_mode_training: noised_attributes
+  input_mode_sampling: generated_past_attributes_plus_current_noised_state
+  corrupt_target_event_attributes: true
+  corrupt_history_event_attributes: true
+  history_attribute_corruption:
+    enabled: true
+    mode: mask_dropout
+    mask_prob: 0.30
+  sampling_history_attribute_corruption:
+    enabled: true
+    mode: mask_dropout
+    mask_prob: 0.0
+  target_attribute_corruption:
+    use_diffusion_timestep: true
+  forbid_clean_target_attributes_to_gnn: true
+  forbid_future_attributes_to_gnn: true
+  auxiliary_neighbor_denoising_loss:
+    enabled: true
+    weight: 0.10
+    max_neighbor_nodes_for_loss: 256
+  attribute_embedding:
+    rating_dim: 64
+    verified_dim: 32
+    summary_length_dim: 32
+    summary_token_pooling: mean
+    summary_dim: 128
+    combined_attr_dim: 256
+    dropout: 0.1
+
+text:
+  max_length:
+    summary: 32
+  special_tokens:
+    add_bos: true
+    add_eos: true
+    add_pad: true
+    include_pad_in_loss: true
+    include_eos_in_loss: true
+
+summary_length:
+  enabled: true
+  use_length_bucket_in_sampling: true
+  calibrate_length_bucket_sampling: true
+  calibration_split: valid
+  calibration_strength: 1.0
+  calibration_epsilon: 1.0e-6
+  force_eos_after_sampled_length: soft
+  force_pad_after_eos: true
+  buckets:
+    len_0: [0, 0]
+    len_1_2: [1, 2]
+    len_3_5: [3, 5]
+    len_6_10: [6, 10]
+    len_11_16: [11, 16]
+    len_17_32: [17, 32]
+
+summary_token_loss_weights:
+  pad: 0.15
+  eos: 2.0
+  bos: 0.0
+  content: 1.0
+  unk: 1.0
+
+summary_length_loss:
+  class_balanced: true
+  class_weight_power: 0.5
+  max_class_weight: 5.0
+  min_class_weight: 0.5
+
+tokenizer:
+  max_vocab_size: 30000
+  min_frequency: 1
+  lowercase: true
+
+id_encoding:
+  type: hash_embedding
+  num_buckets: 262144
+  embedding_dim: 128
+
+datetime_encoding:
+  type: continuous_time_fourier
+  embedding_dim: 64
+
+model:
+  backbone: small_mlm_transformer
+  hidden_dim: 384
+  num_layers: 6
+  num_heads: 6
+  dropout: 0.1
+  condition_dim: 256
+  use_graph_context: true
+  graph_context_dim: 256
+  graph_context_mode: temporal_attribute_denoising
+
+diffusion:
+  type: masked_language_diffusion
+  timesteps: 50
+  mask_schedule: linear
+  min_mask_prob: 0.05
+  max_mask_prob: 0.95
+
+training:
+  max_rows: null
+  batch_size: 128
+  epochs: 50
+  early_stopping_patience: 8
+  early_stopping_min_delta: 0.0001
+  lr: 0.0003
+  weight_decay: 0.01
+  seed: 42
+  num_workers: 4
+  dataloader_timeout_seconds: 0
+  mixed_precision: true
+  save_best_by: valid/loss_total
+  device: auto
+
+loss_weights:
+  rating: 2.0
+  verified: 2.0
+  summary_length: 2.0
+  summary: 1.0
+  auxiliary_neighbor_denoising: 0.10
+
+sampling:
+  num_rows: 50000
+  batch_size: 128
+  chronological: true
+  strict_past_only_history: true
+  temperature: 0.9
+  top_p: 0.95
+  summary_content_repetition_penalty: 1.15
+  min_summary_content_tokens: 1
+  seed: 42
+  device: auto
