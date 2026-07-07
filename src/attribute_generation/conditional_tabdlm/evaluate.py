@@ -11,7 +11,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from .constrained import categorical_validity_mask, normalized_valid_values
+from .constrained import categorical_validity_mask, normalize_rating_value, normalized_valid_values
 from .graph_schema import graph_conditioning_enabled, graph_metadata
 from .schema import ConditionalTABDLMConfig
 from .tokenization import normalize_text, summary_length_bucket_name
@@ -23,6 +23,12 @@ from .utils import (
     safe_corr,
     save_json,
 )
+
+
+RATING_SUPPORT = [1, 2, 3, 4, 5]
+VERIFIED_SUPPORT = [0, 1]
+NORMALIZED_COLUMN_SUFFIX = "_norm"
+INVALID_COLUMN_SUFFIX = "_invalid"
 
 
 def evaluate_from_config(
@@ -97,10 +103,14 @@ def evaluate_frames(
     schema = config.schema
     real = normalize_for_eval(real, config)
     synthetic = normalize_for_eval(synthetic, config)
+    real = add_normalized_categorical_columns(real, schema)
+    synthetic = add_normalized_categorical_columns(synthetic, schema)
     rating_col = schema.categorical_targets[0] if schema.categorical_targets else None
     verified_col = "verified" if "verified" in schema.categorical_targets else (
         schema.categorical_targets[1] if len(schema.categorical_targets) > 1 else None
     )
+    rating_eval_col = eval_column(real, rating_col)
+    verified_eval_col = eval_column(real, verified_col)
     summary_col = schema.text_targets[0] if schema.text_targets else None
     timestamp_col = schema.datetime_columns[0]
     customer_col = schema.foreign_key_columns[0]
@@ -119,14 +129,32 @@ def evaluate_frames(
     }
     if graph_conditioning_enabled(config.raw):
         metrics["graph_conditioning"] = graph_metadata(config.raw, real_graph_used_at_sampling=False)
-    if rating_col:
-        metrics["marginal_categorical"].update(categorical_distribution_metrics(real, synthetic, rating_col, numeric=True))
-    if verified_col:
-        metrics["marginal_categorical"].update(categorical_distribution_metrics(real, synthetic, verified_col, numeric=False))
-    if rating_col:
-        metrics["temporal"].update(monthly_numeric_metrics(real, synthetic, timestamp_col, rating_col, "monthly_rating_mean"))
-    if verified_col:
-        metrics["temporal"].update(monthly_numeric_metrics(real, synthetic, timestamp_col, verified_col, "monthly_verified_rate"))
+    if rating_col and rating_eval_col:
+        metrics["marginal_categorical"].update(
+            categorical_distribution_metrics(
+                real,
+                synthetic,
+                rating_eval_col,
+                numeric=True,
+                prefix=rating_col,
+                support=RATING_SUPPORT,
+            )
+        )
+    if verified_col and verified_eval_col:
+        metrics["marginal_categorical"].update(
+            categorical_distribution_metrics(
+                real,
+                synthetic,
+                verified_eval_col,
+                numeric=False,
+                prefix=verified_col,
+                support=VERIFIED_SUPPORT,
+            )
+        )
+    if rating_col and rating_eval_col:
+        metrics["temporal"].update(monthly_numeric_metrics(real, synthetic, timestamp_col, rating_eval_col, "monthly_rating_mean"))
+    if verified_col and verified_eval_col:
+        metrics["temporal"].update(monthly_numeric_metrics(real, synthetic, timestamp_col, verified_eval_col, "monthly_verified_rate"))
     if summary_col:
         real_len = summary_lengths(real[summary_col])
         syn_len = summary_lengths(synthetic[summary_col])
@@ -149,17 +177,18 @@ def evaluate_frames(
             )
         )
         metrics["text_privacy"].update(text_privacy_metrics(real[summary_col], synthetic[summary_col]))
-    if rating_col and verified_col:
-        metrics["joint"].update(joint_rating_verified_metrics(real, synthetic, rating_col, verified_col))
-    if summary_col and rating_col:
-        metrics["text_consistency"].update(text_consistency_metrics(real, synthetic, summary_col, rating_col, verified_col))
-    if rating_col:
-        metrics["conditional_fidelity"].update(top_entity_mae(real, synthetic, product_col, rating_col, "product_rating", numeric=True))
-        metrics["conditional_fidelity"].update(top_entity_mae(real, synthetic, customer_col, rating_col, "customer_rating", numeric=True))
-    if verified_col:
-        metrics["conditional_fidelity"].update(top_entity_mae(real, synthetic, product_col, verified_col, "product_verified", numeric=True))
-        metrics["conditional_fidelity"].update(top_entity_mae(real, synthetic, customer_col, verified_col, "customer_verified", numeric=True))
+    if rating_col and verified_col and rating_eval_col and verified_eval_col:
+        metrics["joint"].update(joint_rating_verified_metrics(real, synthetic, rating_eval_col, verified_eval_col))
+    if summary_col and rating_col and rating_eval_col:
+        metrics["text_consistency"].update(text_consistency_metrics(real, synthetic, summary_col, rating_eval_col, verified_eval_col))
+    if rating_col and rating_eval_col:
+        metrics["conditional_fidelity"].update(top_entity_mae(real, synthetic, product_col, rating_eval_col, "product_rating", numeric=True))
+        metrics["conditional_fidelity"].update(top_entity_mae(real, synthetic, customer_col, rating_eval_col, "customer_rating", numeric=True))
+    if verified_col and verified_eval_col:
+        metrics["conditional_fidelity"].update(top_entity_mae(real, synthetic, product_col, verified_eval_col, "product_verified", numeric=True))
+        metrics["conditional_fidelity"].update(top_entity_mae(real, synthetic, customer_col, verified_eval_col, "customer_verified", numeric=True))
     metrics["conditional_fidelity"]["condition_columns_used"] = list(schema.condition_columns)
+    metrics["warnings"] = evaluation_warnings(metrics)
     return metrics
 
 
@@ -176,12 +205,105 @@ def normalize_for_eval(frame: pd.DataFrame, config: ConditionalTABDLMConfig) -> 
     return frame.dropna(subset=list(config.schema.datetime_columns)).reset_index(drop=True)
 
 
+def normalized_column_name(column: str) -> str:
+    return f"{column}{NORMALIZED_COLUMN_SUFFIX}"
+
+
+def invalid_column_name(column: str) -> str:
+    return f"{column}{INVALID_COLUMN_SUFFIX}"
+
+
+def eval_column(frame: pd.DataFrame, column: str | None) -> str | None:
+    if column is None:
+        return None
+    normalized = normalized_column_name(column)
+    return normalized if normalized in frame.columns else column
+
+
+def add_normalized_categorical_columns(frame: pd.DataFrame, schema) -> pd.DataFrame:
+    frame = frame.copy()
+    for column in schema.categorical_targets:
+        if column not in frame.columns:
+            continue
+        if column == "rating":
+            normalized, invalid_mask = normalize_rating_series(frame[column])
+        elif column == "verified":
+            normalized, invalid_mask = normalize_verified_series(frame[column])
+        else:
+            continue
+        frame[normalized_column_name(column)] = normalized
+        frame[invalid_column_name(column)] = invalid_mask
+    return frame
+
+
+def normalize_rating_series(
+    series: pd.Series,
+    valid_rating_values: list[int] | tuple[int, ...] = tuple(RATING_SUPPORT),
+) -> tuple[pd.Series, pd.Series]:
+    valid = set(int(value) for value in valid_rating_values)
+
+    def normalize(value: Any) -> int | float:
+        rating = normalize_rating_value(value)
+        if rating is None or int(rating) not in valid:
+            return np.nan
+        return int(rating)
+
+    normalized = series.map(normalize).astype(object)
+    invalid_mask = normalized.isna()
+    return normalized, invalid_mask
+
+
+def normalize_verified_series(series: pd.Series) -> tuple[pd.Series, pd.Series]:
+    normalized = series.map(normalize_verified_value).astype(object)
+    invalid_mask = normalized.isna()
+    return normalized, invalid_mask
+
+
+def normalize_verified_value(value: Any) -> int | float:
+    if value is None:
+        return np.nan
+    try:
+        if pd.isna(value):
+            return np.nan
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, (bool, np.bool_)):
+        return int(value)
+    text = str(value).strip().lower()
+    if not text:
+        return np.nan
+    true_values = {"true", "t", "yes", "y", "1", "1.0", "verified"}
+    false_values = {"false", "f", "no", "n", "0", "0.0", "unverified"}
+    if text in true_values:
+        return 1
+    if text in false_values:
+        return 0
+    try:
+        numeric = float(text)
+    except ValueError:
+        return np.nan
+    if not np.isfinite(numeric):
+        return np.nan
+    rounded = int(round(numeric))
+    if abs(numeric - rounded) > 1e-8 or rounded not in VERIFIED_SUPPORT:
+        return np.nan
+    return rounded
+
+
 def validity_metrics(real: pd.DataFrame, synthetic: pd.DataFrame, schema) -> dict[str, Any]:
     out: dict[str, Any] = {
         "num_real_rows": int(len(real)),
         "num_synthetic_rows": int(len(synthetic)),
     }
     for column in schema.categorical_targets:
+        normalized = normalized_column_name(column)
+        invalid = invalid_column_name(column)
+        if normalized in synthetic.columns and invalid in synthetic.columns:
+            values = synthetic[normalized]
+            out[f"invalid_{column}_rate"] = float(synthetic[invalid].mean()) if len(values) else None
+            if column == "rating":
+                out["valid_rating_values"] = list(RATING_SUPPORT)
+            continue
         valid = normalized_valid_values(column, real[column].dropna().unique()) if column in real else []
         values = synthetic[column] if column in synthetic else pd.Series([], dtype=object)
         if len(values):
@@ -294,27 +416,64 @@ def load_debug_examples(path: str | Path) -> list[dict[str, Any]]:
     return rows
 
 
-def categorical_distribution_metrics(real: pd.DataFrame, synthetic: pd.DataFrame, column: str, numeric: bool) -> dict[str, Any]:
+def categorical_distribution_metrics(
+    real: pd.DataFrame,
+    synthetic: pd.DataFrame,
+    column: str,
+    numeric: bool,
+    *,
+    prefix: str | None = None,
+    support: list[Any] | tuple[Any, ...] | None = None,
+) -> dict[str, Any]:
+    metric_prefix = prefix or column
+    if support is None:
+        l1 = distribution_l1(real[column], synthetic[column])
+        js = js_divergence(real[column], synthetic[column])
+    else:
+        real_probs = categorical_probabilities(real[column], support)
+        syn_probs = categorical_probabilities(synthetic[column], support)
+        l1 = float(np.abs(real_probs - syn_probs).sum())
+        js = js_divergence_from_probabilities(real_probs, syn_probs)
     out = {
-        f"{column}_distribution_l1": distribution_l1(real[column], synthetic[column]),
-        f"{column}_distribution_js": js_divergence(real[column], synthetic[column]),
-        f"{column}_total_variation": 0.5 * distribution_l1(real[column], synthetic[column]),
+        f"{metric_prefix}_distribution_l1": l1,
+        f"{metric_prefix}_distribution_js": js,
+        f"{metric_prefix}_total_variation": 0.5 * l1,
     }
     if numeric:
-        out[f"{column}_ks"] = ks_statistic(pd.to_numeric(real[column], errors="coerce"), pd.to_numeric(synthetic[column], errors="coerce"))
-    if column == "verified":
-        real_rate = boolish_numeric(real[column]).mean()
-        syn_rate = boolish_numeric(synthetic[column]).mean()
+        out[f"{metric_prefix}_ks"] = ks_statistic(numeric_eval_series(real[column]), numeric_eval_series(synthetic[column]))
+    if metric_prefix == "verified":
+        real_rate = numeric_eval_series(real[column]).mean()
+        syn_rate = numeric_eval_series(synthetic[column]).mean()
         out["verified_rate_real"] = float(real_rate)
         out["verified_rate_synthetic"] = float(syn_rate)
         out["verified_rate_diff"] = float(syn_rate - real_rate)
     return out
 
 
+def categorical_probabilities(series: pd.Series, support: list[Any] | tuple[Any, ...]) -> np.ndarray:
+    values = series.dropna()
+    if values.empty:
+        return np.zeros(len(support), dtype=float)
+    counts = values.value_counts(normalize=True)
+    return counts.reindex(list(support), fill_value=0.0).to_numpy(dtype=float)
+
+
+def js_divergence_from_probabilities(real_probs: np.ndarray, syn_probs: np.ndarray) -> float:
+    p = np.asarray(real_probs, dtype=float)
+    q = np.asarray(syn_probs, dtype=float)
+    m = 0.5 * (p + q)
+    return float(0.5 * kl_divergence(p, m) + 0.5 * kl_divergence(q, m))
+
+
+def kl_divergence(p: np.ndarray, q: np.ndarray) -> float:
+    mask = p > 0
+    return float(np.sum(p[mask] * np.log(p[mask] / np.clip(q[mask], 1e-12, None))))
+
+
 def monthly_numeric_metrics(real: pd.DataFrame, synthetic: pd.DataFrame, timestamp_col: str, column: str, prefix: str) -> dict[str, Any]:
     return monthly_series_metrics(
-        real.assign(_value=boolish_numeric(real[column]) if column == "verified" else pd.to_numeric(real[column], errors="coerce")),
-        synthetic.assign(_value=boolish_numeric(synthetic[column]) if column == "verified" else pd.to_numeric(synthetic[column], errors="coerce")),
+        real.assign(_value=numeric_eval_series(real[column])),
+        synthetic.assign(_value=numeric_eval_series(synthetic[column])),
         timestamp_col,
         "_value",
         prefix,
@@ -349,25 +508,52 @@ def monthly_mean_series(frame: pd.DataFrame, timestamp_col: str, value_col: str)
 
 
 def joint_rating_verified_metrics(real: pd.DataFrame, synthetic: pd.DataFrame, rating_col: str, verified_col: str) -> dict[str, Any]:
-    real_joint = real.groupby([rating_col, verified_col]).size() / max(len(real), 1)
-    syn_joint = synthetic.groupby([rating_col, verified_col]).size() / max(len(synthetic), 1)
-    index = real_joint.index.union(syn_joint.index)
-    real_given_verified = real.groupby(verified_col)[rating_col].value_counts(normalize=True)
-    syn_given_verified = synthetic.groupby(verified_col)[rating_col].value_counts(normalize=True)
-    gv_index = real_given_verified.index.union(syn_given_verified.index)
+    real_joint = joint_probabilities(real, rating_col, verified_col)
+    syn_joint = joint_probabilities(synthetic, rating_col, verified_col)
+    real_given_verified = rating_given_verified_probabilities(real, rating_col, verified_col)
+    syn_given_verified = rating_given_verified_probabilities(synthetic, rating_col, verified_col)
     return {
-        "rating_verified_joint_l1": float(np.abs(real_joint.reindex(index, fill_value=0.0) - syn_joint.reindex(index, fill_value=0.0)).sum()),
-        "verified_rate_by_rating_mae": grouped_rate_mae(real, synthetic, rating_col, verified_col),
+        "rating_verified_joint_l1": float(np.abs(real_joint - syn_joint).sum()),
+        "verified_rate_by_rating_mae": grouped_rate_mae(real, synthetic, rating_col, verified_col, group_support=RATING_SUPPORT),
         "rating_distribution_given_verified_l1": float(
-            np.abs(real_given_verified.reindex(gv_index, fill_value=0.0) - syn_given_verified.reindex(gv_index, fill_value=0.0)).sum()
+            np.abs(real_given_verified - syn_given_verified).sum()
         ),
     }
 
 
-def grouped_rate_mae(real: pd.DataFrame, synthetic: pd.DataFrame, group_col: str, value_col: str) -> float | None:
-    r = real.assign(_v=boolish_numeric(real[value_col])).groupby(group_col)["_v"].mean()
-    s = synthetic.assign(_v=boolish_numeric(synthetic[value_col])).groupby(group_col)["_v"].mean()
-    index = r.index.intersection(s.index)
+def joint_probabilities(frame: pd.DataFrame, rating_col: str, verified_col: str) -> pd.Series:
+    index = pd.MultiIndex.from_product([RATING_SUPPORT, VERIFIED_SUPPORT], names=[rating_col, verified_col])
+    valid = frame[[rating_col, verified_col]].dropna()
+    if valid.empty:
+        return pd.Series(0.0, index=index)
+    counts = valid.groupby([rating_col, verified_col]).size()
+    probs = counts / max(float(counts.sum()), 1.0)
+    return probs.reindex(index, fill_value=0.0)
+
+
+def rating_given_verified_probabilities(frame: pd.DataFrame, rating_col: str, verified_col: str) -> pd.Series:
+    index = pd.MultiIndex.from_product([VERIFIED_SUPPORT, RATING_SUPPORT], names=[verified_col, rating_col])
+    values: dict[tuple[int, int], float] = {}
+    valid = frame[[rating_col, verified_col]].dropna()
+    for verified in VERIFIED_SUPPORT:
+        subset = valid.loc[valid[verified_col] == verified, rating_col]
+        probs = categorical_probabilities(subset, RATING_SUPPORT)
+        for rating, prob in zip(RATING_SUPPORT, probs):
+            values[(verified, rating)] = float(prob)
+    return pd.Series(values).reindex(index, fill_value=0.0)
+
+
+def grouped_rate_mae(
+    real: pd.DataFrame,
+    synthetic: pd.DataFrame,
+    group_col: str,
+    value_col: str,
+    group_support: list[Any] | tuple[Any, ...] | None = None,
+) -> float | None:
+    r = real.assign(_v=numeric_eval_series(real[value_col])).dropna(subset=[group_col, "_v"]).groupby(group_col)["_v"].mean()
+    s = synthetic.assign(_v=numeric_eval_series(synthetic[value_col])).dropna(subset=[group_col, "_v"]).groupby(group_col)["_v"].mean()
+    index = pd.Index(group_support) if group_support is not None else r.index.intersection(s.index)
+    index = index.intersection(r.index).intersection(s.index)
     if len(index) == 0:
         return None
     return float(np.mean(np.abs(r.reindex(index).to_numpy(dtype=float) - s.reindex(index).to_numpy(dtype=float))))
@@ -444,6 +630,7 @@ def text_consistency_metrics(
     if len(train) > max_train_rows:
         train = train.sample(max_train_rows, random_state=29)
     if train[rating_col].nunique() > 1:
+        eval_frame = synthetic.dropna(subset=[summary_col, rating_col])
         clf = make_pipeline(
             TfidfVectorizer(max_features=50000, ngram_range=(1, 2)),
             LogisticRegression(max_iter=1000, n_jobs=1),
@@ -451,15 +638,25 @@ def text_consistency_metrics(
         metrics["rating_text_predictor_converged"] = fit_text_classifier(
             clf,
             train[summary_col].map(normalize_text),
-            train[rating_col].astype(str),
+            normalized_label_strings(train[rating_col]),
             ConvergenceWarning,
         )
-        pred = clf.predict(synthetic[summary_col].map(normalize_text))
-        pred_dist = pd.Series(pred).value_counts(normalize=True).to_dict()
-        metrics["predicted_rating_distribution"] = {str(k): float(v) for k, v in pred_dist.items()}
-        metrics["rating_text_consistency_accuracy"] = float(accuracy_score(synthetic[rating_col].astype(str), pred))
+        if len(eval_frame):
+            pred = clf.predict(eval_frame[summary_col].map(normalize_text))
+            pred_dist = pd.Series(pred).value_counts(normalize=True)
+            metrics["predicted_rating_distribution"] = {
+                str(rating): float(pred_dist.reindex([str(rating)], fill_value=0.0).iloc[0])
+                for rating in RATING_SUPPORT
+            }
+            metrics["rating_text_consistency_accuracy"] = float(accuracy_score(normalized_label_strings(eval_frame[rating_col]), pred))
     if verified_col and verified_col in real and verified_col in synthetic:
-        y = boolish_numeric(train[verified_col])
+        train_verified = real.dropna(subset=[summary_col, verified_col])
+        if len(train_verified) > max_train_rows:
+            train_verified = train_verified.sample(max_train_rows, random_state=31)
+        y = numeric_eval_series(train_verified[verified_col])
+        valid_train = y.notna()
+        train_verified = train_verified.loc[valid_train]
+        y = y.loc[valid_train].astype(int)
         if y.nunique() > 1:
             clf = make_pipeline(
                 TfidfVectorizer(max_features=50000, ngram_range=(1, 2)),
@@ -467,16 +664,25 @@ def text_consistency_metrics(
             )
             metrics["verified_text_predictor_converged"] = fit_text_classifier(
                 clf,
-                train[summary_col].map(normalize_text),
+                train_verified[summary_col].map(normalize_text),
                 y,
                 ConvergenceWarning,
             )
             if hasattr(clf[-1], "predict_proba"):
-                prob = clf.predict_proba(synthetic[summary_col].map(normalize_text))[:, 1]
-                syn_y = boolish_numeric(synthetic[verified_col])
+                eval_verified = synthetic.dropna(subset=[summary_col, verified_col])
+                syn_y = numeric_eval_series(eval_verified[verified_col])
+                valid_eval = syn_y.notna()
+                eval_verified = eval_verified.loc[valid_eval]
+                syn_y = syn_y.loc[valid_eval].astype(int)
+                prob = clf.predict_proba(eval_verified[summary_col].map(normalize_text))[:, 1] if len(eval_verified) else np.array([])
                 if syn_y.nunique() > 1:
                     metrics["verified_text_predictor_auc"] = float(roc_auc_score(syn_y, prob))
     return metrics
+
+
+def normalized_label_strings(series: pd.Series) -> pd.Series:
+    numeric = numeric_eval_series(series)
+    return numeric.round().astype(int).astype(str)
 
 
 def fit_text_classifier(clf, texts: pd.Series, labels: pd.Series, convergence_warning_type) -> bool:
@@ -496,12 +702,8 @@ def top_entity_mae(
     top_k: int = 1000,
 ) -> dict[str, Any]:
     top = real[entity_col].value_counts().head(top_k).index
-    if value_col == "verified":
-        real_values = real.assign(_value=boolish_numeric(real[value_col]))
-        syn_values = synthetic.assign(_value=boolish_numeric(synthetic[value_col]))
-    else:
-        real_values = real.assign(_value=pd.to_numeric(real[value_col], errors="coerce"))
-        syn_values = synthetic.assign(_value=pd.to_numeric(synthetic[value_col], errors="coerce"))
+    real_values = real.assign(_value=numeric_eval_series(real[value_col]))
+    syn_values = synthetic.assign(_value=numeric_eval_series(synthetic[value_col]))
     r = real_values[real_values[entity_col].isin(top)].groupby(entity_col)["_value"].mean()
     s = syn_values[syn_values[entity_col].isin(top)].groupby(entity_col)["_value"].mean()
     index = r.index.intersection(s.index)
@@ -509,6 +711,10 @@ def top_entity_mae(
         f"{prefix}_top_{top_k}_mae": float(np.mean(np.abs(r.reindex(index).to_numpy(dtype=float) - s.reindex(index).to_numpy(dtype=float)))) if len(index) else None,
         f"{prefix}_top_{top_k}_coverage": float(len(index) / max(len(top), 1)),
     }
+
+
+def numeric_eval_series(series: pd.Series) -> pd.Series:
+    return pd.to_numeric(series, errors="coerce").astype(float)
 
 
 def boolish_numeric(series: pd.Series) -> pd.Series:
@@ -558,7 +764,7 @@ def longest_common_subsequence(left: list[str], right: list[str]) -> int:
 
 def write_report(metrics: dict[str, Any], path: str | Path) -> None:
     lines = ["# Conditional TABDLM Evaluation", ""]
-    warnings = evaluation_warnings(metrics)
+    warnings = metrics.get("warnings") or evaluation_warnings(metrics)
     if warnings:
         lines.append("## Warnings")
         for warning in warnings:
@@ -589,6 +795,9 @@ def evaluation_warnings(metrics: dict[str, Any]) -> list[str]:
     privacy = metrics.get("text_privacy", {})
     text = metrics.get("text", {})
     length = metrics.get("length_diagnostics", {})
+    marginal = metrics.get("marginal_categorical", {})
+    joint = metrics.get("joint", {})
+    consistency = metrics.get("text_consistency", {})
     exact_overlap = privacy.get("exact_summary_train_overlap_rate")
     unique_rate = text.get("unique_summary_rate")
     mean_length = length.get("summary_length_mean_synthetic")
@@ -601,4 +810,36 @@ def evaluation_warnings(metrics: dict[str, Any]) -> list[str]:
         warnings_out.append(f"summary_length_mean_synthetic is outside [3.0, 6.0]: {mean_length:.4g}")
     if length_ks is not None and length_ks > 0.35:
         warnings_out.append(f"summary_length_ks is high: {length_ks:.4g} > 0.35")
+    warnings_out.extend(metric_sanity_warnings(marginal, joint, consistency))
+    return warnings_out
+
+
+def metric_sanity_warnings(
+    marginal: dict[str, Any],
+    joint: dict[str, Any],
+    consistency: dict[str, Any],
+) -> list[str]:
+    warnings_out: list[str] = []
+    for key in ["rating_distribution_l1", "verified_distribution_l1"]:
+        value = marginal.get(key)
+        if value is not None and not (-1e-9 <= float(value) <= 2.0 + 1e-9):
+            warnings_out.append(f"{key} is outside [0, 2]: {float(value):.4g}")
+    joint_l1 = joint.get("rating_verified_joint_l1")
+    if joint_l1 is not None and not (-1e-9 <= float(joint_l1) <= 2.0 + 1e-9):
+        warnings_out.append(f"rating_verified_joint_l1 is outside [0, 2]: {float(joint_l1):.4g}")
+    rating_l1 = marginal.get("rating_distribution_l1")
+    rating_tv = marginal.get("rating_total_variation")
+    if rating_l1 is not None and rating_tv is not None and abs(float(rating_tv) - 0.5 * float(rating_l1)) > 1e-8:
+        warnings_out.append("rating_total_variation does not equal rating_distribution_l1 / 2")
+    verified_l1 = marginal.get("verified_distribution_l1")
+    verified_tv = marginal.get("verified_total_variation")
+    if verified_l1 is not None and verified_tv is not None and abs(float(verified_tv) - 0.5 * float(verified_l1)) > 1e-8:
+        warnings_out.append("verified_total_variation does not equal verified_distribution_l1 / 2")
+    rating_ks = marginal.get("rating_ks")
+    if rating_l1 is not None and rating_ks is not None and float(rating_l1) >= 1.99 and float(rating_ks) <= 0.05:
+        warnings_out.append("Possible rating label normalization bug: marginal L1 is maximal but KS is small.")
+    predicted = consistency.get("predicted_rating_distribution")
+    accuracy = consistency.get("rating_text_consistency_accuracy")
+    if accuracy is not None and float(accuracy) == 0.0 and predicted:
+        warnings_out.append("Possible rating label mismatch in text-consistency evaluator.")
     return warnings_out
