@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from attribute_generation.conditional_tabdlm.dataset import ConditionalTABDLMDataset  # noqa: E402
-from attribute_generation.conditional_tabdlm.lstm_joint import build_lstm_model, make_lstm_collate_fn  # noqa: E402
+from attribute_generation.conditional_tabdlm.lstm_joint import build_lstm_model, make_lstm_collate_fn, scatter_state  # noqa: E402
 from attribute_generation.conditional_tabdlm.schema import ConditionalTABDLMConfig, ConditionalTABDLMSchema  # noqa: E402
 from attribute_generation.conditional_tabdlm.tokenization import CategoryVocab, SimpleTextTokenizer  # noqa: E402
 
@@ -96,3 +96,17 @@ def test_lstm_joint_generate_returns_all_outputs():
     assert len(generated["text"]["summary"]) == 2
     assert len(generated["text"]["review_text"]) == 2
 
+
+def test_lstm_scatter_state_handles_autocast_dtype_mismatch():
+    hidden = torch.zeros(1, 3, 2, dtype=torch.bfloat16)
+    cell = torch.zeros(1, 3, 2, dtype=torch.bfloat16)
+    new_hidden = torch.ones(1, 2, 2, dtype=torch.float16)
+    new_cell = torch.ones(1, 2, 2, dtype=torch.float16)
+    index = torch.tensor([0, 2], dtype=torch.long)
+
+    out_hidden, out_cell = scatter_state((hidden, cell), (new_hidden, new_cell), index, "lstm")
+
+    assert out_hidden.dtype == torch.bfloat16
+    assert out_cell.dtype == torch.bfloat16
+    assert torch.allclose(out_hidden[:, index, :].float(), torch.ones(1, 2, 2))
+    assert torch.allclose(out_cell[:, index, :].float(), torch.ones(1, 2, 2))

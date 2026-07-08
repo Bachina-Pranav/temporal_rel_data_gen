@@ -1082,10 +1082,16 @@ def select_state(state: Any, index: torch.Tensor, decoder_type: str) -> Any:
 
 def scatter_state(state: Any, new_state: Any, index: torch.Tensor, decoder_type: str) -> Any:
     if str(decoder_type) == "gru":
+        if new_state.dtype != state.dtype:
+            new_state = new_state.to(dtype=state.dtype)
         state[:, index, :] = new_state
         return state
     hidden, cell = state
     new_hidden, new_cell = new_state
+    if new_hidden.dtype != hidden.dtype:
+        new_hidden = new_hidden.to(dtype=hidden.dtype)
+    if new_cell.dtype != cell.dtype:
+        new_cell = new_cell.to(dtype=cell.dtype)
     hidden[:, index, :] = new_hidden
     cell[:, index, :] = new_cell
     return hidden, cell
