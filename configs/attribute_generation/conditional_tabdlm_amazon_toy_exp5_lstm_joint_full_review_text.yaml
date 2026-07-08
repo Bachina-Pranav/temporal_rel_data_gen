@@ -177,7 +177,7 @@ text_decoder:
 
 training:
   max_rows: null
-  batch_size: 256
+  batch_size: 64
   epochs: 50
   early_stopping_patience: 8
   early_stopping_min_delta: 0.0001
@@ -189,7 +189,7 @@ training:
   gradient_clip_norm: 1.0
   save_best_by: valid/loss_total
   auto_reduce_batch_size: true
-  min_batch_size: 32
+  min_batch_size: 16
   device: auto
 
 loss_weights:

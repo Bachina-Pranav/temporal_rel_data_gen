@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import json
 import math
 import time
@@ -400,6 +401,45 @@ def build_lstm_model(
 
 def train_lstm_from_config(config: ConditionalTABDLMConfig, device: str | None = None) -> Path:
     training = config.raw.get("training", {})
+    requested_batch_size = int(training.get("batch_size", 256))
+    auto_reduce = bool(training.get("auto_reduce_batch_size", False))
+    batch_sizes = (
+        candidate_train_batch_sizes(requested_batch_size, int(training.get("min_batch_size", requested_batch_size)))
+        if auto_reduce
+        else [requested_batch_size]
+    )
+    for attempt_idx, batch_size in enumerate(batch_sizes):
+        retry_message = None
+        try:
+            return _train_lstm_from_config_once(
+                config,
+                device=device,
+                batch_size_override=batch_size,
+                requested_batch_size=requested_batch_size,
+                auto_reduce_batch_size=auto_reduce,
+            )
+        except RuntimeError as exc:
+            if not (auto_reduce and is_cuda_oom(exc) and attempt_idx < len(batch_sizes) - 1):
+                raise
+            next_batch_size = batch_sizes[attempt_idx + 1]
+            retry_message = (
+                f"CUDA OOM while training LSTM attribute generator at batch_size={batch_size}; "
+                f"retrying with batch_size={next_batch_size}."
+            )
+        if retry_message is not None:
+            clear_cuda_after_oom()
+            print(retry_message, flush=True)
+    raise RuntimeError("LSTM training failed before producing a checkpoint")
+
+
+def _train_lstm_from_config_once(
+    config: ConditionalTABDLMConfig,
+    device: str | None = None,
+    batch_size_override: int | None = None,
+    requested_batch_size: int | None = None,
+    auto_reduce_batch_size: bool = False,
+) -> Path:
+    training = config.raw.get("training", {})
     seed = int(training.get("seed", 42))
     set_seed(seed)
     output_dir = ensure_dir(config.output_dir)
@@ -419,7 +459,7 @@ def train_lstm_from_config(config: ConditionalTABDLMConfig, device: str | None =
     num_hash_buckets = int(config.raw.get("id_encoding", {}).get("num_buckets", 262144))
     train_dataset = ConditionalTABDLMDataset(train_frame, config.schema, categorical_vocabs, tokenizer, num_hash_buckets)
     valid_dataset = ConditionalTABDLMDataset(valid_frame, config.schema, categorical_vocabs, tokenizer, num_hash_buckets)
-    batch_size = int(training.get("batch_size", 256))
+    batch_size = int(batch_size_override if batch_size_override is not None else training.get("batch_size", 256))
     num_workers = int(training.get("num_workers", 0))
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, collate_fn=make_lstm_collate_fn)
     valid_loader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=make_lstm_collate_fn)
@@ -517,8 +557,48 @@ def train_lstm_from_config(config: ConditionalTABDLMConfig, device: str | None =
         if patience > 0 and without_improvement >= patience:
             print(f"Early stopping at epoch={epoch}; best_valid_total_loss={best_valid:.6g}")
             break
+    save_json(
+        {
+            "train_batch_size_requested": int(requested_batch_size if requested_batch_size is not None else batch_size),
+            "train_batch_size_used": int(batch_size),
+            "auto_reduce_batch_size": bool(auto_reduce_batch_size),
+            "min_batch_size": int(training.get("min_batch_size", batch_size)),
+            "epochs_completed": int(epoch),
+            "best_valid_total_loss": float(best_valid),
+            "device": str(device),
+            "mixed_precision_used": bool(use_amp),
+        },
+        metadata_dir / "training_runtime.json",
+    )
     print(f"Wrote best checkpoint to {best_path}")
     return best_path
+
+
+def candidate_train_batch_sizes(initial_batch_size: int, min_batch_size: int) -> list[int]:
+    initial = max(1, int(initial_batch_size))
+    floor = min(initial, max(1, int(min_batch_size)))
+    sizes: list[int] = []
+    current = initial
+    while current >= floor:
+        sizes.append(current)
+        if current == floor:
+            break
+        current = max(floor, current // 2)
+    return sizes
+
+
+def is_cuda_oom(error: RuntimeError) -> bool:
+    return isinstance(error, torch.cuda.OutOfMemoryError) or "CUDA out of memory" in str(error)
+
+
+def clear_cuda_after_oom() -> None:
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        try:
+            torch.cuda.ipc_collect()
+        except RuntimeError:
+            pass
 
 
 def run_lstm_epoch(
