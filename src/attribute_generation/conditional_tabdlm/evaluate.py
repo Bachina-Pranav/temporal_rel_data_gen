@@ -63,10 +63,19 @@ def evaluate_from_config(
             "temporal_filter_mode",
             "graph_uses_future_events",
             "graph_uses_target_attributes",
+            "graph_uses_clean_target_attributes",
+            "graph_uses_clean_future_attributes",
             "real_graph_used_at_sampling",
             "synthetic_graph_history_source",
             "history_source_sampling",
             "sampling_chronological",
+            "joint_generation",
+            "review_text_generated_jointly",
+            "review_text_separate_stage",
+            "review_text_max_tokens",
+            "review_text_length_cap_source",
+            "review_text_truncation_rate_train",
+            "review_text_coverage_rate_train",
             "graph_attribute_input_mode",
             "graph_attr_inputs",
             "include_summary_tokens_in_graph",
@@ -124,7 +133,8 @@ def evaluate_frames(
     )
     rating_eval_col = eval_column(real, rating_col)
     verified_eval_col = eval_column(real, verified_col)
-    summary_col = schema.text_targets[0] if schema.text_targets else None
+    summary_col = "summary" if "summary" in schema.text_targets else (schema.text_targets[0] if schema.text_targets else None)
+    review_text_col = "review_text" if "review_text" in schema.text_targets else None
     timestamp_col = schema.datetime_columns[0]
     customer_col = schema.foreign_key_columns[0]
     product_col = schema.foreign_key_columns[1] if len(schema.foreign_key_columns) > 1 else schema.foreign_key_columns[0]
@@ -168,32 +178,43 @@ def evaluate_frames(
         metrics["temporal"].update(monthly_numeric_metrics(real, synthetic, timestamp_col, rating_eval_col, "monthly_rating_mean"))
     if verified_col and verified_eval_col:
         metrics["temporal"].update(monthly_numeric_metrics(real, synthetic, timestamp_col, verified_eval_col, "monthly_verified_rate"))
-    if summary_col:
-        real_len = summary_lengths(real[summary_col])
-        syn_len = summary_lengths(synthetic[summary_col])
+    for text_col in schema.text_targets:
+        if text_col not in real or text_col not in synthetic:
+            continue
+        real_len = summary_lengths(real[text_col])
+        syn_len = summary_lengths(synthetic[text_col])
+        metric_name = "summary" if text_col == summary_col else text_col
         metrics["temporal"].update(
             monthly_series_metrics(
-                real.assign(_summary_length=real_len),
-                synthetic.assign(_summary_length=syn_len),
+                real.assign(_text_length=real_len),
+                synthetic.assign(_text_length=syn_len),
                 timestamp_col,
-                "_summary_length",
-                "monthly_summary_length",
+                "_text_length",
+                f"monthly_{metric_name}_length",
             )
         )
-        metrics["text"].update(text_metrics(real[summary_col], synthetic[summary_col]))
+        metrics["text"].update(text_metrics(real[text_col], synthetic[text_col], prefix=metric_name))
         metrics["length_diagnostics"].update(
-            summary_length_diagnostics(
-                real[summary_col],
-                synthetic[summary_col],
+            text_length_diagnostics(
+                real[text_col],
+                synthetic[text_col],
                 config,
+                text_col,
                 debug_examples_path=debug_examples_path,
             )
         )
-        metrics["text_privacy"].update(text_privacy_metrics(real[summary_col], synthetic[summary_col]))
+        sample_size = int(config.raw.get("evaluation", {}).get("review_text_privacy_sample_size", 2000 if text_col == "review_text" else 5000))
+        metrics["text_privacy"].update(text_privacy_metrics(real[text_col], synthetic[text_col], prefix=metric_name, sample_size=sample_size))
     if rating_col and verified_col and rating_eval_col and verified_eval_col:
         metrics["joint"].update(joint_rating_verified_metrics(real, synthetic, rating_eval_col, verified_eval_col))
     if summary_col and rating_col and rating_eval_col:
-        metrics["text_consistency"].update(text_consistency_metrics(real, synthetic, summary_col, rating_eval_col, verified_eval_col))
+        metrics["text_consistency"].update(text_consistency_metrics(real, synthetic, summary_col, rating_eval_col, verified_eval_col, metric_text_name="text"))
+    if review_text_col and rating_col and rating_eval_col:
+        metrics["text_consistency"].update(
+            text_consistency_metrics(real, synthetic, review_text_col, rating_eval_col, verified_eval_col, metric_text_name="review_text")
+        )
+    if summary_col and review_text_col and summary_col in synthetic and review_text_col in synthetic:
+        metrics["text_consistency"].update(summary_review_text_similarity_metrics(synthetic[summary_col], synthetic[review_text_col]))
     if rating_col and rating_eval_col:
         metrics["conditional_fidelity"].update(top_entity_mae(real, synthetic, product_col, rating_eval_col, "product_rating", numeric=True))
         metrics["conditional_fidelity"].update(top_entity_mae(real, synthetic, customer_col, rating_eval_col, "customer_rating", numeric=True))
@@ -343,80 +364,128 @@ def summary_length_diagnostics(
     config: ConditionalTABDLMConfig,
     debug_examples_path: str | Path | None = None,
 ) -> dict[str, Any]:
+    return text_length_diagnostics(real_text, synthetic_text, config, "summary", debug_examples_path=debug_examples_path)
+
+
+def text_length_diagnostics(
+    real_text: pd.Series,
+    synthetic_text: pd.Series,
+    config: ConditionalTABDLMConfig,
+    text_column: str,
+    debug_examples_path: str | Path | None = None,
+) -> dict[str, Any]:
     real_len = summary_lengths(real_text)
     syn_len = summary_lengths(synthetic_text)
-    buckets = config.schema.summary_length_buckets or {
-        "len_0": (0, 0),
-        "len_1_2": (1, 2),
-        "len_3_5": (3, 5),
-        "len_6_10": (6, 10),
-        "len_11_16": (11, 16),
-        "len_17_32": (17, 32),
-    }
+    bucket_column = length_bucket_column_for_text(config.schema, text_column)
+    if bucket_column is None:
+        buckets = {}
+    else:
+        buckets = config.schema.buckets_for_length_bucket(bucket_column)
+    if not buckets and text_column == "summary":
+        buckets = {
+            "len_0": (0, 0),
+            "len_1_2": (1, 2),
+            "len_3_5": (3, 5),
+            "len_6_10": (6, 10),
+            "len_11_16": (11, 16),
+            "len_17_32": (17, 32),
+        }
     real_buckets = real_len.map(lambda length: summary_length_bucket_name(int(length), buckets))
     syn_buckets = syn_len.map(lambda length: summary_length_bucket_name(int(length), buckets))
-    max_tokens = int(config.schema.text_max_lengths.get(config.schema.text_targets[0], 32)) if config.schema.text_targets else 32
+    max_tokens = int(config.schema.text_max_lengths.get(text_column, 32))
     max_content = max(0, max_tokens - 2)
+    prefix = "summary" if text_column == "summary" else text_column
     diagnostics = {
-        "summary_length_mean_real": float(real_len.mean()) if len(real_len) else None,
-        "summary_length_mean_synthetic": float(syn_len.mean()) if len(syn_len) else None,
-        "summary_length_median_real": float(real_len.median()) if len(real_len) else None,
-        "summary_length_median_synthetic": float(syn_len.median()) if len(syn_len) else None,
-        "summary_length_p90_real": float(real_len.quantile(0.9)) if len(real_len) else None,
-        "summary_length_p90_synthetic": float(syn_len.quantile(0.9)) if len(syn_len) else None,
-        "summary_length_ks": ks_statistic(real_len, syn_len),
-        "summary_length_bucket_distribution_real": normalized_value_counts(real_buckets),
-        "summary_length_bucket_distribution_synthetic": normalized_value_counts(syn_buckets),
-        "summary_length_bucket_l1": distribution_l1(real_buckets, syn_buckets),
-        "summary_length_bucket_js": js_divergence(real_buckets, syn_buckets),
-        "generated_to_max_length_rate": float((syn_len >= max_content).mean()) if len(syn_len) else None,
+        f"{prefix}_length_mean_real": float(real_len.mean()) if len(real_len) else None,
+        f"{prefix}_length_mean_synthetic": float(syn_len.mean()) if len(syn_len) else None,
+        f"{prefix}_length_median_real": float(real_len.median()) if len(real_len) else None,
+        f"{prefix}_length_median_synthetic": float(syn_len.median()) if len(syn_len) else None,
+        f"{prefix}_length_p90_real": float(real_len.quantile(0.9)) if len(real_len) else None,
+        f"{prefix}_length_p90_synthetic": float(syn_len.quantile(0.9)) if len(syn_len) else None,
+        f"{prefix}_length_p95_real": float(real_len.quantile(0.95)) if len(real_len) else None,
+        f"{prefix}_length_p95_synthetic": float(syn_len.quantile(0.95)) if len(syn_len) else None,
+        f"{prefix}_length_p99_real": float(real_len.quantile(0.99)) if len(real_len) else None,
+        f"{prefix}_length_p99_synthetic": float(syn_len.quantile(0.99)) if len(syn_len) else None,
+        f"{prefix}_length_ks": ks_statistic(real_len, syn_len),
+        f"{prefix}_length_bucket_distribution_real": normalized_value_counts(real_buckets),
+        f"{prefix}_length_bucket_distribution_synthetic": normalized_value_counts(syn_buckets),
+        f"{prefix}_length_bucket_l1": distribution_l1(real_buckets, syn_buckets),
+        f"{prefix}_length_bucket_js": js_divergence(real_buckets, syn_buckets),
+        f"{prefix}_generated_to_max_length_rate": float((syn_len >= max_content).mean()) if len(syn_len) else None,
     }
-    diagnostics.update(debug_eos_diagnostics(debug_examples_path))
+    if prefix == "summary":
+        diagnostics["generated_to_max_length_rate"] = diagnostics["summary_generated_to_max_length_rate"]
+    diagnostics.update(debug_eos_diagnostics(debug_examples_path, text_column=text_column, prefix=prefix))
     if debug_examples_path is not None:
-        summary_metrics_path = Path(debug_examples_path).parent / "summary_length_decoding_metrics.json"
-        if summary_metrics_path.exists():
-            with summary_metrics_path.open() as handle:
+        metrics_name = "summary_length_decoding_metrics.json" if text_column == "summary" else f"{text_column}_length_decoding_metrics.json"
+        metrics_path = Path(debug_examples_path).parent / metrics_name
+        if metrics_path.exists():
+            with metrics_path.open() as handle:
                 diagnostics.update(json.load(handle))
+    if text_column == "review_text":
+        review_meta = config.raw.get("review_text", {})
+        diagnostics["review_text_truncation_rate_train"] = review_meta.get("truncation_rate_train")
+        diagnostics["review_text_coverage_rate_train"] = review_meta.get("coverage_rate_train")
     return diagnostics
+
+
+def length_bucket_column_for_text(schema: Any, text_column: str) -> str | None:
+    for column in getattr(schema, "length_bucket_targets", ()):
+        try:
+            if schema.text_column_for_length_bucket(column) == text_column:
+                return column
+        except (KeyError, IndexError):
+            continue
+    return None
 
 
 def normalized_value_counts(series: pd.Series) -> dict[str, float]:
     return {str(key): float(value) for key, value in series.value_counts(normalize=True).sort_index().items()}
 
 
-def debug_eos_diagnostics(debug_examples_path: str | Path | None) -> dict[str, Any]:
+def debug_eos_diagnostics(debug_examples_path: str | Path | None, text_column: str = "summary", prefix: str = "summary") -> dict[str, Any]:
     if debug_examples_path is None or not Path(debug_examples_path).exists():
-        return {
-            "eos_missing_rate": None,
-            "pad_after_eos_violation_rate": None,
-            "mean_eos_position": None,
-            "eos_position_distribution": {},
-        }
+        return with_summary_eos_aliases({
+            f"{prefix}_eos_missing_rate": None,
+            f"{prefix}_pad_after_eos_violation_rate": None,
+            f"{prefix}_mean_eos_position": None,
+            f"{prefix}_eos_position_distribution": {},
+        }, prefix)
     examples = load_debug_examples(debug_examples_path)
+    examples = [row for row in examples if row.get("text_column", "summary") == text_column]
     if not examples:
-        return {
-            "eos_missing_rate": None,
-            "pad_after_eos_violation_rate": None,
-            "mean_eos_position": None,
-            "eos_position_distribution": {},
-        }
+        return with_summary_eos_aliases({
+            f"{prefix}_eos_missing_rate": None,
+            f"{prefix}_pad_after_eos_violation_rate": None,
+            f"{prefix}_mean_eos_position": None,
+            f"{prefix}_eos_position_distribution": {},
+        }, prefix)
     eos_positions = [row.get("eos_position") for row in examples]
     missing = [pos is None for pos in eos_positions]
     violations = []
     for row in examples:
-        tokens = row.get("raw_summary_tokens") or []
+        tokens = row.get("raw_tokens") or row.get("raw_summary_tokens") or row.get("raw_review_text_tokens") or []
         if "[EOS]" not in tokens:
             violations.append(False)
             continue
         eos_idx = tokens.index("[EOS]")
         violations.append(any(token != "[PAD]" for token in tokens[eos_idx + 1 :]))
     observed = [int(pos) for pos in eos_positions if pos is not None]
-    return {
-        "eos_missing_rate": float(np.mean(missing)),
-        "pad_after_eos_violation_rate": float(np.mean(violations)),
-        "mean_eos_position": float(np.mean(observed)) if observed else None,
-        "eos_position_distribution": {str(key): float(value) for key, value in pd.Series(observed).value_counts(normalize=True).sort_index().items()},
-    }
+    return with_summary_eos_aliases({
+        f"{prefix}_eos_missing_rate": float(np.mean(missing)),
+        f"{prefix}_pad_after_eos_violation_rate": float(np.mean(violations)),
+        f"{prefix}_mean_eos_position": float(np.mean(observed)) if observed else None,
+        f"{prefix}_eos_position_distribution": {str(key): float(value) for key, value in pd.Series(observed).value_counts(normalize=True).sort_index().items()},
+    }, prefix)
+
+
+def with_summary_eos_aliases(metrics: dict[str, Any], prefix: str) -> dict[str, Any]:
+    if prefix == "summary":
+        metrics["eos_missing_rate"] = metrics["summary_eos_missing_rate"]
+        metrics["pad_after_eos_violation_rate"] = metrics["summary_pad_after_eos_violation_rate"]
+        metrics["mean_eos_position"] = metrics["summary_mean_eos_position"]
+        metrics["eos_position_distribution"] = metrics["summary_eos_position_distribution"]
+    return metrics
 
 
 def load_debug_examples(path: str | Path) -> list[dict[str, Any]]:
@@ -572,36 +641,52 @@ def grouped_rate_mae(
     return float(np.mean(np.abs(r.reindex(index).to_numpy(dtype=float) - s.reindex(index).to_numpy(dtype=float))))
 
 
-def text_metrics(real_text: pd.Series, synthetic_text: pd.Series) -> dict[str, Any]:
+def text_metrics(real_text: pd.Series, synthetic_text: pd.Series, prefix: str = "summary") -> dict[str, Any]:
     syn_tokens = [tokenize(text) for text in synthetic_text]
     flat = [token for row in syn_tokens for token in row]
     bigrams = [tuple(row[idx : idx + 2]) for row in syn_tokens for idx in range(max(0, len(row) - 1))]
     top_real = set(real_text.map(normalize_text).value_counts().head(100).index)
     top_syn = set(synthetic_text.map(normalize_text).value_counts().head(100).index)
-    return {
-        "distinct_1": float(len(set(flat)) / max(len(flat), 1)),
-        "distinct_2": float(len(set(bigrams)) / max(len(bigrams), 1)),
-        "summary_length_ks": ks_statistic(summary_lengths(real_text), summary_lengths(synthetic_text)),
-        "unique_summary_rate": float(synthetic_text.map(normalize_text).nunique() / max(len(synthetic_text), 1)),
-        "top_100_summary_overlap_rate": float(len(top_real.intersection(top_syn)) / max(len(top_real), 1)),
+    metric = {
+        f"{prefix}_distinct_1": float(len(set(flat)) / max(len(flat), 1)),
+        f"{prefix}_distinct_2": float(len(set(bigrams)) / max(len(bigrams), 1)),
+        f"{prefix}_length_ks": ks_statistic(summary_lengths(real_text), summary_lengths(synthetic_text)),
+        f"{prefix}_unique_rate": float(synthetic_text.map(normalize_text).nunique() / max(len(synthetic_text), 1)),
+        f"{prefix}_top_100_overlap_rate": float(len(top_real.intersection(top_syn)) / max(len(top_real), 1)),
     }
+    if prefix == "summary":
+        metric.update(
+            {
+                "distinct_1": metric["summary_distinct_1"],
+                "distinct_2": metric["summary_distinct_2"],
+                "summary_length_ks": metric["summary_length_ks"],
+                "unique_summary_rate": metric["summary_unique_rate"],
+                "top_100_summary_overlap_rate": metric["summary_top_100_overlap_rate"],
+            }
+        )
+    return metric
 
 
-def text_privacy_metrics(real_text: pd.Series, synthetic_text: pd.Series, sample_size: int = 5000) -> dict[str, Any]:
+def text_privacy_metrics(real_text: pd.Series, synthetic_text: pd.Series, prefix: str = "summary", sample_size: int = 5000) -> dict[str, Any]:
     real_norm = real_text.map(normalize_text)
     syn_norm = synthetic_text.map(normalize_text)
     metrics = {
-        "exact_summary_train_overlap_rate": float(syn_norm.isin(set(real_norm)).mean()) if len(syn_norm) else None,
-        "nearest_neighbor_rougeL_mean": None,
-        "nearest_neighbor_token_jaccard_mean": None,
-        "nearest_neighbor_sample_size": int(min(sample_size, len(syn_norm), len(real_norm))),
+        f"{prefix}_exact_train_overlap_rate": float(syn_norm.isin(set(real_norm)).mean()) if len(syn_norm) else None,
+        f"{prefix}_nearest_neighbor_rougeL_mean": None,
+        f"{prefix}_nearest_neighbor_token_jaccard_mean": None,
+        f"{prefix}_nearest_neighbor_sample_size": int(min(sample_size, len(syn_norm), len(real_norm))),
     }
+    if prefix == "summary":
+        metrics["exact_summary_train_overlap_rate"] = metrics["summary_exact_train_overlap_rate"]
+        metrics["nearest_neighbor_rougeL_mean"] = metrics["summary_nearest_neighbor_rougeL_mean"]
+        metrics["nearest_neighbor_token_jaccard_mean"] = metrics["summary_nearest_neighbor_token_jaccard_mean"]
+        metrics["nearest_neighbor_sample_size"] = metrics["summary_nearest_neighbor_sample_size"]
     try:
         from sklearn.feature_extraction.text import TfidfVectorizer
         from sklearn.neighbors import NearestNeighbors
     except Exception:
         return metrics
-    n = metrics["nearest_neighbor_sample_size"]
+    n = metrics[f"{prefix}_nearest_neighbor_sample_size"]
     if n <= 0:
         return metrics
     real_sample = real_norm.sample(n=n, random_state=17).tolist()
@@ -617,8 +702,11 @@ def text_privacy_metrics(real_text: pd.Series, synthetic_text: pd.Series, sample
         real = real_sample[int(idx)]
         rouge.append(rouge_l_f1(tokenize(syn), tokenize(real)))
         jaccard.append(token_jaccard(tokenize(syn), tokenize(real)))
-    metrics["nearest_neighbor_rougeL_mean"] = float(np.mean(rouge))
-    metrics["nearest_neighbor_token_jaccard_mean"] = float(np.mean(jaccard))
+    metrics[f"{prefix}_nearest_neighbor_rougeL_mean"] = float(np.mean(rouge))
+    metrics[f"{prefix}_nearest_neighbor_token_jaccard_mean"] = float(np.mean(jaccard))
+    if prefix == "summary":
+        metrics["nearest_neighbor_rougeL_mean"] = metrics["summary_nearest_neighbor_rougeL_mean"]
+        metrics["nearest_neighbor_token_jaccard_mean"] = metrics["summary_nearest_neighbor_token_jaccard_mean"]
     return metrics
 
 
@@ -629,6 +717,7 @@ def text_consistency_metrics(
     rating_col: str,
     verified_col: str | None,
     max_train_rows: int = 100000,
+    metric_text_name: str = "text",
 ) -> dict[str, Any]:
     metrics: dict[str, Any] = {}
     try:
@@ -648,7 +737,9 @@ def text_consistency_metrics(
             TfidfVectorizer(max_features=50000, ngram_range=(1, 2)),
             LogisticRegression(max_iter=1000, n_jobs=1),
         )
-        metrics["rating_text_predictor_converged"] = fit_text_classifier(
+        rating_converged_key = f"rating_{metric_text_name}_predictor_converged"
+        rating_accuracy_key = f"rating_{metric_text_name}_consistency_accuracy"
+        metrics[rating_converged_key] = fit_text_classifier(
             clf,
             train[summary_col].map(normalize_text),
             normalized_label_strings(train[rating_col]),
@@ -657,11 +748,15 @@ def text_consistency_metrics(
         if len(eval_frame):
             pred = clf.predict(eval_frame[summary_col].map(normalize_text))
             pred_dist = pd.Series(pred).value_counts(normalize=True)
-            metrics["predicted_rating_distribution"] = {
+            metrics[f"{metric_text_name}_predicted_rating_distribution"] = {
                 str(rating): float(pred_dist.reindex([str(rating)], fill_value=0.0).iloc[0])
                 for rating in RATING_SUPPORT
             }
-            metrics["rating_text_consistency_accuracy"] = float(accuracy_score(normalized_label_strings(eval_frame[rating_col]), pred))
+            metrics[rating_accuracy_key] = float(accuracy_score(normalized_label_strings(eval_frame[rating_col]), pred))
+            if metric_text_name == "text":
+                metrics["rating_text_predictor_converged"] = metrics[rating_converged_key]
+                metrics["predicted_rating_distribution"] = metrics[f"{metric_text_name}_predicted_rating_distribution"]
+                metrics["rating_text_consistency_accuracy"] = metrics[rating_accuracy_key]
     if verified_col and verified_col in real and verified_col in synthetic:
         train_verified = real.dropna(subset=[summary_col, verified_col])
         if len(train_verified) > max_train_rows:
@@ -675,7 +770,9 @@ def text_consistency_metrics(
                 TfidfVectorizer(max_features=50000, ngram_range=(1, 2)),
                 LogisticRegression(max_iter=1000, n_jobs=1),
             )
-            metrics["verified_text_predictor_converged"] = fit_text_classifier(
+            verified_converged_key = f"verified_{metric_text_name}_predictor_converged"
+            verified_auc_key = f"verified_{metric_text_name}_predictor_auc"
+            metrics[verified_converged_key] = fit_text_classifier(
                 clf,
                 train_verified[summary_col].map(normalize_text),
                 y,
@@ -689,8 +786,26 @@ def text_consistency_metrics(
                 syn_y = syn_y.loc[valid_eval].astype(int)
                 prob = clf.predict_proba(eval_verified[summary_col].map(normalize_text))[:, 1] if len(eval_verified) else np.array([])
                 if syn_y.nunique() > 1:
-                    metrics["verified_text_predictor_auc"] = float(roc_auc_score(syn_y, prob))
+                    metrics[verified_auc_key] = float(roc_auc_score(syn_y, prob))
+                    if metric_text_name == "text":
+                        metrics["verified_text_predictor_converged"] = metrics[verified_converged_key]
+                        metrics["verified_text_predictor_auc"] = metrics[verified_auc_key]
     return metrics
+
+
+def summary_review_text_similarity_metrics(summary: pd.Series, review_text: pd.Series) -> dict[str, Any]:
+    rows = [
+        (tokenize(left), tokenize(right))
+        for left, right in zip(summary.fillna(""), review_text.fillna(""))
+    ]
+    rouge = [rouge_l_f1(left, right) for left, right in rows]
+    jaccard = [token_jaccard(left, right) for left, right in rows]
+    exact = [normalize_text(left) == normalize_text(right) for left, right in zip(summary.fillna(""), review_text.fillna(""))]
+    return {
+        "summary_review_text_rougeL_mean": float(np.mean(rouge)) if rouge else None,
+        "summary_review_text_token_jaccard_mean": float(np.mean(jaccard)) if jaccard else None,
+        "summary_review_text_exact_match_rate": float(np.mean(exact)) if exact else None,
+    }
 
 
 def normalized_label_strings(series: pd.Series) -> pd.Series:

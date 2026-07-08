@@ -76,7 +76,17 @@ def prepare_rel_amazon_data(config: ConditionalTABDLMConfig) -> PreparedData:
         max_tokens = int(schema.text_max_lengths[column])
         tokenizer_metadata[f"{column}_max_tokens"] = max_tokens
         tokenizer_metadata[f"{column}_max_content_tokens"] = tokenizer.max_content_tokens(max_tokens)
+        tokenizer_metadata[f"{column}_special_tokens"] = {
+            "bos": f"{column.upper()}_BOS",
+            "eos": f"{column.upper()}_EOS",
+            "pad": f"{column.upper()}_PAD",
+            "mask": f"{column.upper()}_MASK",
+        }
     save_json(tokenizer_metadata, output_dir / "tokenizer_metadata.json")
+    auto_meta = config.raw.get("_auto_text_length_metadata", {}).get("review_text")
+    if auto_meta:
+        metadata_dir = ensure_dir(config.output_dir / "metadata")
+        save_json(auto_meta, metadata_dir / "review_text_length_stats.json")
 
     return PreparedData(
         train_path=output_dir / "train.parquet",
@@ -188,15 +198,16 @@ class ConditionalTABDLMDataset(Dataset):
         }
 
     def auxiliary_value(self, row: pd.Series, column: str) -> str:
-        if column != "summary_length_bucket":
+        if column not in {"summary_length_bucket", "review_text_length_bucket"}:
             raise KeyError(f"Unsupported auxiliary categorical target: {column}")
         if not self.schema.text_targets:
             return "len_0"
-        summary_col = self.schema.text_targets[0]
-        max_tokens = self.schema.text_max_lengths[summary_col]
-        ids, _ = self.text_tokenizer.encode(row[summary_col], max_tokens)
+        text_col = self.schema.text_column_for_length_bucket(column)
+        max_tokens = self.schema.text_max_lengths[text_col]
+        buckets = self.schema.buckets_for_length_bucket(column)
+        ids, _ = self.text_tokenizer.encode(row[text_col], max_tokens)
         content_length = self.text_tokenizer.content_length(ids)
-        return summary_length_bucket_name(content_length, self.schema.summary_length_buckets)
+        return summary_length_bucket_name(content_length, buckets)
 
 
 def make_collate_fn(
@@ -317,14 +328,15 @@ def auxiliary_target_values(
     tokenizer: SimpleTextTokenizer,
     column: str,
 ) -> list[str]:
-    if column != "summary_length_bucket":
+    if column not in {"summary_length_bucket", "review_text_length_bucket"}:
         raise KeyError(f"Unsupported auxiliary categorical target: {column}")
     if not schema.text_targets:
         return ["len_0"] * len(frame)
-    summary_col = schema.text_targets[0]
-    max_tokens = schema.text_max_lengths[summary_col]
+    text_col = schema.text_column_for_length_bucket(column)
+    max_tokens = schema.text_max_lengths[text_col]
+    buckets = schema.buckets_for_length_bucket(column)
     values = []
-    for text in frame[summary_col]:
+    for text in frame[text_col]:
         ids, _ = tokenizer.encode(text, max_tokens)
-        values.append(summary_length_bucket_name(tokenizer.content_length(ids), schema.summary_length_buckets))
+        values.append(summary_length_bucket_name(tokenizer.content_length(ids), buckets))
     return values

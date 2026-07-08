@@ -143,15 +143,17 @@ def train_from_config(config: ConditionalTABDLMConfig, device: str | None = None
         weight_decay=float(training.get("weight_decay", 0.01)),
     )
     loss_weights = dict(config.raw.get("loss_weights", {}))
-    summary_token_loss_weights = dict(config.raw.get("summary_token_loss_weights", {}))
-    length_class_weights = compute_summary_length_class_weights(
+    text_token_loss_weights = text_token_loss_weights_by_column(config)
+    length_class_weights = compute_length_class_weights(
         train_frame,
         config,
         categorical_vocabs,
         text_tokenizer,
     )
     if length_class_weights is not None:
-        save_json(length_class_weights["json"], metadata_dir / "summary_length_bucket_weights.json")
+        for column, payload in length_class_weights["json"].items():
+            save_json(payload, metadata_dir / f"{column}_weights.json")
+    write_model_metadata(config, metadata_dir)
     use_amp = bool(training.get("mixed_precision", True)) and device.startswith("cuda")
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     log_path = output_dir / "train_log.jsonl"
@@ -176,8 +178,8 @@ def train_from_config(config: ConditionalTABDLMConfig, device: str | None = None
             use_amp,
             loss_weights,
             text_tokenizer,
-            summary_token_loss_weights,
-            length_class_weights["tensor"].to(device) if length_class_weights is not None else None,
+            text_token_loss_weights,
+            length_weight_tensors_to_device(length_class_weights, device),
             graph_encoder=graph_encoder,
             graph_history_index=train_history_index,
             graph_deterministic=False,
@@ -193,8 +195,8 @@ def train_from_config(config: ConditionalTABDLMConfig, device: str | None = None
             use_amp,
             loss_weights,
             text_tokenizer,
-            summary_token_loss_weights,
-            length_class_weights["tensor"].to(device) if length_class_weights is not None else None,
+            text_token_loss_weights,
+            length_weight_tensors_to_device(length_class_weights, device),
             graph_encoder=graph_encoder,
             graph_history_index=valid_history_index,
             graph_deterministic=True,
@@ -202,7 +204,7 @@ def train_from_config(config: ConditionalTABDLMConfig, device: str | None = None
             graph_attr_store=valid_attr_store,
             config=config,
         )
-        length_calibration = compute_summary_length_calibration(
+        length_calibration = compute_length_calibration(
             model,
             valid_loader,
             config,
@@ -240,7 +242,7 @@ def train_from_config(config: ConditionalTABDLMConfig, device: str | None = None
             epoch,
             valid_metrics,
             length_calibration=length_calibration,
-            summary_length_bucket_weights=length_class_weights["json"] if length_class_weights is not None else None,
+            length_bucket_weights=length_class_weights["json"] if length_class_weights is not None else None,
             graph_encoder=graph_encoder,
         )
         if improved:
@@ -256,7 +258,7 @@ def train_from_config(config: ConditionalTABDLMConfig, device: str | None = None
                 epoch,
                 valid_metrics,
                 length_calibration=length_calibration,
-                summary_length_bucket_weights=length_class_weights["json"] if length_class_weights is not None else None,
+                length_bucket_weights=length_class_weights["json"] if length_class_weights is not None else None,
                 graph_encoder=graph_encoder,
             )
         else:
@@ -325,8 +327,8 @@ def run_epoch(
     use_amp: bool,
     loss_weights: dict[str, float] | None = None,
     text_tokenizer: SimpleTextTokenizer | None = None,
-    summary_token_loss_weights: dict[str, float] | None = None,
-    summary_length_class_weights: torch.Tensor | None = None,
+    text_token_loss_weights: dict[str, dict[str, float]] | None = None,
+    length_class_weights: dict[str, torch.Tensor] | None = None,
     graph_encoder: TemporalStructureOnlyGraphEncoder | None = None,
     graph_history_index: Any | None = None,
     graph_deterministic: bool = True,
@@ -387,8 +389,8 @@ def run_epoch(
                 model.schema,
                 loss_weights or {},
                 text_tokenizer=text_tokenizer,
-                summary_token_loss_weights=summary_token_loss_weights or {},
-                summary_length_class_weights=summary_length_class_weights,
+                text_token_loss_weights=text_token_loss_weights or {},
+                length_class_weights=length_class_weights or {},
             )
             aux_loss = graph_component.get("auxiliary_neighbor_denoising_loss_tensor")
             if aux_loss is not None:
@@ -463,8 +465,8 @@ def denoising_loss(
     schema,
     loss_weights: dict[str, float] | None = None,
     text_tokenizer: SimpleTextTokenizer | None = None,
-    summary_token_loss_weights: dict[str, float] | None = None,
-    summary_length_class_weights: torch.Tensor | None = None,
+    text_token_loss_weights: dict[str, dict[str, float]] | None = None,
+    length_class_weights: dict[str, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, dict[str, dict[str, float | int]]]:
     return _denoising_loss_impl(
         logits,
@@ -472,8 +474,8 @@ def denoising_loss(
         schema,
         loss_weights or {},
         text_tokenizer=text_tokenizer,
-        summary_token_loss_weights=summary_token_loss_weights or {},
-        summary_length_class_weights=summary_length_class_weights,
+        text_token_loss_weights=text_token_loss_weights or {},
+        length_class_weights=length_class_weights or {},
     )
 
 
@@ -483,31 +485,32 @@ def _denoising_loss_impl(
     schema,
     loss_weights: dict[str, float],
     text_tokenizer: SimpleTextTokenizer | None = None,
-    summary_token_loss_weights: dict[str, float] | None = None,
-    summary_length_class_weights: torch.Tensor | None = None,
+    text_token_loss_weights: dict[str, dict[str, float]] | None = None,
+    length_class_weights: dict[str, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, dict[str, dict[str, float | int]]]:
     losses: list[torch.Tensor] = []
     component: dict[str, dict[str, float | int]] = {}
-    cat_labels = batch["categorical_labels"]
-    for idx, column in enumerate(schema.model_categorical_targets):
-        labels = cat_labels[:, idx]
-        mask = labels != -100
-        count = int(mask.sum().detach().cpu())
-        if count == 0:
-            continue
-        class_weights = summary_length_class_weights if column == "summary_length_bucket" else None
-        loss_sum = F.cross_entropy(
-            logits["categorical"][column],
-            labels,
-            ignore_index=-100,
-            reduction="sum",
-            weight=class_weights,
-        )
-        mean_loss = loss_sum / max(count, 1)
-        losses.append(float(component_weight(column, loss_weights)) * mean_loss)
-        pred = logits["categorical"][column].argmax(dim=-1)
-        correct = int((pred[mask] == labels[mask]).sum().detach().cpu())
-        component[column] = {"loss_sum": float(loss_sum.detach().cpu()), "count": count, "correct": correct}
+    cat_labels = batch.get("categorical_labels")
+    if cat_labels is not None:
+        for idx, column in enumerate(schema.model_categorical_targets):
+            labels = cat_labels[:, idx]
+            mask = labels != -100
+            count = int(mask.sum().detach().cpu())
+            if count == 0:
+                continue
+            class_weights = (length_class_weights or {}).get(column)
+            loss_sum = F.cross_entropy(
+                logits["categorical"][column],
+                labels,
+                ignore_index=-100,
+                reduction="sum",
+                weight=class_weights,
+            )
+            mean_loss = loss_sum / max(count, 1)
+            losses.append(float(component_weight(column, loss_weights)) * mean_loss)
+            pred = logits["categorical"][column].argmax(dim=-1)
+            correct = int((pred[mask] == labels[mask]).sum().detach().cpu())
+            component[column] = {"loss_sum": float(loss_sum.detach().cpu()), "count": count, "correct": correct}
 
     for column in schema.text_targets:
         labels = batch["text_labels"][column]
@@ -519,7 +522,7 @@ def _denoising_loss_impl(
                 logits["text"][column],
                 labels,
                 text_tokenizer,
-                summary_token_loss_weights or {},
+                (text_token_loss_weights or {}).get(column, {}),
             )
             count = int(max(float(denom.detach().cpu()), 1.0))
             for subkey, stats in subcomponents.items():
@@ -547,8 +550,8 @@ def component_metric_name(column: str) -> str:
         return "auxiliary_neighbor_denoising"
     if str(column).startswith("aux_neighbor_"):
         return "loss_aux_neighbor_" + str(column)[len("aux_neighbor_") :]
-    if column == "summary_length_bucket":
-        return "summary_length"
+    if str(column).endswith("_length_bucket"):
+        return str(column)[: -len("_bucket")]
     for suffix in ["_pad_component", "_eos_component", "_content_component"]:
         if str(column).endswith(suffix):
             return str(column)
@@ -625,19 +628,76 @@ def weighted_summary_token_loss(
     return loss_sum, denom, subcomponents
 
 
+def text_token_loss_weights_by_column(config: ConditionalTABDLMConfig) -> dict[str, dict[str, float]]:
+    weights: dict[str, dict[str, float]] = {}
+    summary_default = dict(config.raw.get("summary_token_loss_weights", {}))
+    for column in config.schema.text_targets:
+        if column == "review_text":
+            weights[column] = dict(config.raw.get("review_text_token_loss_weights", summary_default))
+        elif column == "summary":
+            weights[column] = summary_default
+        else:
+            weights[column] = dict(config.raw.get(f"{column}_token_loss_weights", summary_default))
+    return weights
+
+
+def length_weight_tensors_to_device(
+    weights: dict[str, Any] | None,
+    device: str,
+) -> dict[str, torch.Tensor] | None:
+    if weights is None:
+        return None
+    return {column: tensor.to(device) for column, tensor in weights.get("tensor", {}).items()}
+
+
 def compute_summary_length_class_weights(
     train_frame: pd.DataFrame,
     config: ConditionalTABDLMConfig,
     categorical_vocabs: dict[str, CategoryVocab],
     tokenizer: SimpleTextTokenizer,
 ) -> dict[str, Any] | None:
-    if "summary_length_bucket" not in config.schema.auxiliary_categorical_targets:
+    all_weights = compute_length_class_weights(train_frame, config, categorical_vocabs, tokenizer)
+    if not all_weights or "summary_length_bucket" not in all_weights["tensor"]:
         return None
-    length_cfg = config.raw.get("summary_length_loss", {})
+    return {
+        "tensor": all_weights["tensor"]["summary_length_bucket"],
+        "json": all_weights["json"]["summary_length_bucket"],
+    }
+
+
+def compute_length_class_weights(
+    train_frame: pd.DataFrame,
+    config: ConditionalTABDLMConfig,
+    categorical_vocabs: dict[str, CategoryVocab],
+    tokenizer: SimpleTextTokenizer,
+) -> dict[str, Any] | None:
+    tensors: dict[str, torch.Tensor] = {}
+    payloads: dict[str, Any] = {}
+    for column in config.schema.length_bucket_targets:
+        weights = compute_single_length_class_weights(train_frame, config, categorical_vocabs, tokenizer, column)
+        if weights is None:
+            continue
+        tensors[column] = weights["tensor"]
+        payloads[column] = weights["json"]
+    if not tensors:
+        return None
+    return {"tensor": tensors, "json": payloads}
+
+
+def compute_single_length_class_weights(
+    train_frame: pd.DataFrame,
+    config: ConditionalTABDLMConfig,
+    categorical_vocabs: dict[str, CategoryVocab],
+    tokenizer: SimpleTextTokenizer,
+    column: str,
+) -> dict[str, Any] | None:
+    if column not in config.schema.auxiliary_categorical_targets:
+        return None
+    length_cfg = config.raw.get(length_loss_config_name(column), {})
     if not bool(length_cfg.get("class_balanced", False)):
         return None
-    vocab = categorical_vocabs["summary_length_bucket"]
-    values = auxiliary_target_values(train_frame, config.schema, tokenizer, "summary_length_bucket")
+    vocab = categorical_vocabs[column]
+    values = auxiliary_target_values(train_frame, config.schema, tokenizer, column)
     ids = np.asarray([vocab.encode(value) for value in values], dtype=np.int64)
     counts = np.bincount(ids, minlength=vocab.size).astype(float)
     total = max(float(counts.sum()), 1.0)
@@ -657,6 +717,7 @@ def compute_summary_length_class_weights(
     id_to_token = vocab.id_to_token
     payload = {
         "class_balanced": True,
+        "column": column,
         "class_weight_power": power,
         "min_class_weight": float(length_cfg.get("min_class_weight", 0.5)),
         "max_class_weight": float(length_cfg.get("max_class_weight", 5.0)),
@@ -684,15 +745,54 @@ def compute_summary_length_calibration(
     graph_row_id_offset: int = 0,
     graph_attr_store: GraphAttributeStore | None = None,
 ) -> dict[str, Any] | None:
-    if "summary_length_bucket" not in config.schema.model_categorical_targets:
+    calibration = compute_length_calibration(
+        model,
+        loader,
+        config,
+        categorical_vocabs,
+        tokenizer,
+        device,
+        use_amp,
+        graph_encoder=graph_encoder,
+        graph_history_index=graph_history_index,
+        graph_row_id_offset=graph_row_id_offset,
+        graph_attr_store=graph_attr_store,
+    )
+    if calibration is None:
         return None
-    length_cfg = config.raw.get("summary_length", {})
-    if not bool(length_cfg.get("calibrate_length_bucket_sampling", False)):
+    return calibration.get("summary_length_bucket", calibration)
+
+
+@torch.no_grad()
+def compute_length_calibration(
+    model: ConditionalTABDLM,
+    loader: DataLoader,
+    config: ConditionalTABDLMConfig,
+    categorical_vocabs: dict[str, CategoryVocab],
+    tokenizer: SimpleTextTokenizer,
+    device: str,
+    use_amp: bool,
+    graph_encoder: TemporalStructureOnlyGraphEncoder | None = None,
+    graph_history_index: Any | None = None,
+    graph_row_id_offset: int = 0,
+    graph_attr_store: GraphAttributeStore | None = None,
+) -> dict[str, Any] | None:
+    length_columns = [
+        column
+        for column in config.schema.length_bucket_targets
+        if bool(config.raw.get(length_config_name(column), {}).get("calibrate_length_bucket_sampling", False))
+    ]
+    if not length_columns:
         return None
-    length_idx = config.schema.model_categorical_targets.index("summary_length_bucket")
-    vocab = categorical_vocabs["summary_length_bucket"]
-    real_counts = torch.zeros(vocab.size, dtype=torch.float64, device=device)
-    model_probs = torch.zeros(vocab.size, dtype=torch.float64, device=device)
+    length_indices = {column: config.schema.model_categorical_targets.index(column) for column in length_columns}
+    real_counts = {
+        column: torch.zeros(categorical_vocabs[column].size, dtype=torch.float64, device=device)
+        for column in length_columns
+    }
+    model_probs = {
+        column: torch.zeros(categorical_vocabs[column].size, dtype=torch.float64, device=device)
+        for column in length_columns
+    }
     total = 0
     was_training = model.training
     model.eval()
@@ -723,29 +823,49 @@ def compute_summary_length_calibration(
                 diffusion_t=torch.ones(batch["foreign_key_ids"].shape[0], dtype=torch.float32, device=device),
                 graph_context=graph_context,
             )
-        labels = batch["categorical_clean_ids"][:, length_idx]
-        real_counts += torch.bincount(labels, minlength=vocab.size).to(device=device, dtype=torch.float64)
-        model_probs += torch.softmax(logits["categorical"]["summary_length_bucket"].float(), dim=-1).sum(dim=0).to(torch.float64)
-        total += int(labels.numel())
+        batch_total = batch["categorical_clean_ids"].shape[0]
+        for column in length_columns:
+            vocab = categorical_vocabs[column]
+            labels = batch["categorical_clean_ids"][:, length_indices[column]]
+            real_counts[column] += torch.bincount(labels, minlength=vocab.size).to(device=device, dtype=torch.float64)
+            model_probs[column] += torch.softmax(logits["categorical"][column].float(), dim=-1).sum(dim=0).to(torch.float64)
+        total += int(batch_total)
     if was_training:
         model.train()
         if graph_encoder is not None:
             graph_encoder.train()
     if total <= 0:
         return None
-    eps = float(length_cfg.get("calibration_epsilon", 1e-6))
-    real_dist = (real_counts / max(float(real_counts.sum().item()), 1.0)).detach().cpu().numpy()
-    model_dist = (model_probs / max(float(total), 1.0)).detach().cpu().numpy()
-    ratio = real_dist / np.clip(model_dist, eps, None)
-    strength = float(length_cfg.get("calibration_strength", 1.0))
-    id_to_token = vocab.id_to_token
-    return {
-        "real_valid_bucket_distribution": {id_to_token[idx]: float(real_dist[idx]) for idx in range(vocab.size)},
-        "model_valid_bucket_distribution": {id_to_token[idx]: float(model_dist[idx]) for idx in range(vocab.size)},
-        "calibration_ratio": {id_to_token[idx]: float(ratio[idx]) for idx in range(vocab.size)},
-        "calibration_strength": strength,
-        "calibration_epsilon": eps,
-    }
+    output: dict[str, Any] = {}
+    for column in length_columns:
+        length_cfg = config.raw.get(length_config_name(column), {})
+        vocab = categorical_vocabs[column]
+        eps = float(length_cfg.get("calibration_epsilon", 1e-6))
+        real_dist = (real_counts[column] / max(float(real_counts[column].sum().item()), 1.0)).detach().cpu().numpy()
+        model_dist = (model_probs[column] / max(float(total), 1.0)).detach().cpu().numpy()
+        ratio = real_dist / np.clip(model_dist, eps, None)
+        strength = float(length_cfg.get("calibration_strength", 1.0))
+        id_to_token = vocab.id_to_token
+        output[column] = {
+            "real_valid_bucket_distribution": {id_to_token[idx]: float(real_dist[idx]) for idx in range(vocab.size)},
+            "model_valid_bucket_distribution": {id_to_token[idx]: float(model_dist[idx]) for idx in range(vocab.size)},
+            "calibration_ratio": {id_to_token[idx]: float(ratio[idx]) for idx in range(vocab.size)},
+            "calibration_strength": strength,
+            "calibration_epsilon": eps,
+        }
+    return output
+
+
+def length_config_name(column: str) -> str:
+    if column == "summary_length_bucket":
+        return "summary_length"
+    if column == "review_text_length_bucket":
+        return "review_text_length"
+    return str(column).replace("_bucket", "")
+
+
+def length_loss_config_name(column: str) -> str:
+    return f"{length_config_name(column)}_loss"
 
 
 def initial_masked_categorical_inputs(
@@ -775,6 +895,65 @@ def initial_masked_text_inputs(
     return text_input, text_attention
 
 
+def write_model_metadata(config: ConditionalTABDLMConfig, metadata_dir: str | Path) -> None:
+    schema = config.schema
+    graph_flags = graph_metadata(config.raw, real_graph_used_at_sampling=False)
+    auto_review = config.raw.get("_auto_text_length_metadata", {}).get("review_text", {})
+    summary_col = "summary" if "summary" in schema.text_targets else (schema.text_targets[0] if schema.text_targets else None)
+    review_col = "review_text" if "review_text" in schema.text_targets else None
+    metadata: dict[str, Any] = {
+        "experiment_name": config.raw.get("experiment_name", Path(config.output_dir).name),
+        "base_model": "v2_structure_only_temporal_graph",
+        "graph_conditioning_mode": graph_flags.get("graph_conditioning_mode", "structure_only_temporal"),
+        "condition_columns": list(schema.condition_columns),
+        "target_columns": {
+            "categorical": list(schema.categorical_targets),
+            "numerical": list(schema.numerical_targets),
+            "text": list(schema.text_targets),
+        },
+        "auxiliary_targets": list(schema.auxiliary_categorical_targets),
+        "joint_generation": True,
+        "review_text_generated_jointly": review_col is not None,
+        "review_text_separate_stage": False,
+        "temporal_filter_enabled": True,
+        "temporal_filter_mode": "past_only",
+        "graph_uses_future_events": False,
+        "graph_uses_target_attributes": False,
+        "graph_uses_clean_target_attributes": False,
+        "graph_uses_clean_future_attributes": False,
+        "real_graph_used_at_sampling": False,
+        "synthetic_graph_history_source": "synthetic_spine",
+        "summary_length_bucket_edges": {
+            name: list(bounds) for name, bounds in schema.summary_length_buckets.items()
+        },
+        "review_text_length_bucket_edges": {
+            name: list(bounds) for name, bounds in schema.review_text_length_buckets.items()
+        },
+    }
+    metadata.update(graph_flags)
+    metadata.update(
+        {
+            "graph_uses_clean_target_attributes": False,
+            "graph_uses_clean_future_attributes": False,
+            "synthetic_graph_history_source": "synthetic_spine",
+        }
+    )
+    if summary_col is not None:
+        metadata["summary_max_tokens"] = int(schema.text_max_lengths[summary_col])
+    if review_col is not None:
+        metadata["review_text_max_tokens"] = int(schema.text_max_lengths[review_col])
+        metadata["review_text_max_tokens_strategy"] = config.raw.get("review_text", {}).get("max_tokens_strategy")
+        metadata["review_text_length_cap_source"] = config.raw.get("review_text", {}).get("length_cap_source")
+        metadata["review_text_length_stats_real"] = config.raw.get("review_text", {}).get("length_stats_real")
+        metadata["review_text_truncation_rate_train"] = config.raw.get("review_text", {}).get("truncation_rate_train")
+        metadata["review_text_coverage_rate_train"] = config.raw.get("review_text", {}).get("coverage_rate_train")
+    if auto_review:
+        metadata.update(auto_review)
+    save_json(metadata, Path(metadata_dir) / "model_metadata.json")
+    if auto_review:
+        save_json(auto_review, Path(metadata_dir) / "review_text_length_stats.json")
+
+
 def save_checkpoint(
     path: str | Path,
     model: ConditionalTABDLM,
@@ -784,7 +963,7 @@ def save_checkpoint(
     epoch: int,
     valid_metrics: dict[str, float],
     length_calibration: dict[str, Any] | None = None,
-    summary_length_bucket_weights: dict[str, Any] | None = None,
+    length_bucket_weights: dict[str, Any] | None = None,
     graph_encoder: TemporalStructureOnlyGraphEncoder | None = None,
 ) -> None:
     path = Path(path)
@@ -800,7 +979,9 @@ def save_checkpoint(
             "epoch": int(epoch),
             "valid_metrics": valid_metrics,
             "summary_length_calibration": length_calibration,
-            "summary_length_bucket_weights": summary_length_bucket_weights,
+            "length_calibration": length_calibration,
+            "summary_length_bucket_weights": length_bucket_weights,
+            "length_bucket_weights": length_bucket_weights,
             "graph_encoder_state_dict": graph_encoder.state_dict() if graph_encoder is not None else None,
             "graph_encoder_config": graph_encoder.to_config() if graph_encoder is not None else None,
             "graph_conditioning_metadata": graph_metadata(config.raw, real_graph_used_at_sampling=False),

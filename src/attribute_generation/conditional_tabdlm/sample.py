@@ -117,6 +117,7 @@ def sample_from_config(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output.to_csv(output_path, index=False)
     metadata = {
+        "experiment_name": ckpt_config.raw.get("experiment_name", Path(ckpt_config.output_dir).name),
         "checkpoint_path": str(checkpoint_path),
         "synthetic_spine_path": str(spine_path),
         "output_path": str(output_path),
@@ -125,13 +126,28 @@ def sample_from_config(
         "temperature": temperature,
         "top_p": top_p,
         "seed": seed,
-        "target_columns": list(ckpt_config.schema.target_columns),
+        "condition_columns": list(ckpt_config.schema.condition_columns),
+        "target_columns": {
+            "categorical": list(ckpt_config.schema.categorical_targets),
+            "numerical": list(ckpt_config.schema.numerical_targets),
+            "text": list(ckpt_config.schema.text_targets),
+        },
         "auxiliary_categorical_targets": list(ckpt_config.schema.auxiliary_categorical_targets),
+        "joint_generation": True,
+        "review_text_generated_jointly": "review_text" in ckpt_config.schema.text_targets,
+        "review_text_separate_stage": False,
         "uses_summary_length_bucket": bool(ckpt_config.schema.summary_length_enabled),
+        "uses_review_text_length_bucket": "review_text_length_bucket" in ckpt_config.schema.auxiliary_categorical_targets,
         "force_eos_after_sampled_length": ckpt_config.schema.force_eos_after_sampled_length,
         "force_pad_after_eos": bool(ckpt_config.schema.force_pad_after_eos),
         "length_calibration_disabled": bool(disable_length_calibration),
         "repair_invalid_categoricals": bool(repair_invalid_categoricals),
+        "summary_max_tokens": int(ckpt_config.schema.text_max_lengths.get("summary", 0)) if "summary" in ckpt_config.schema.text_targets else None,
+        "review_text_max_tokens": int(ckpt_config.schema.text_max_lengths.get("review_text", 0)) if "review_text" in ckpt_config.schema.text_targets else None,
+        "review_text_max_tokens_strategy": ckpt_config.raw.get("review_text", {}).get("max_tokens_strategy"),
+        "review_text_length_cap_source": ckpt_config.raw.get("review_text", {}).get("length_cap_source"),
+        "review_text_truncation_rate_train": ckpt_config.raw.get("review_text", {}).get("truncation_rate_train"),
+        "review_text_coverage_rate_train": ckpt_config.raw.get("review_text", {}).get("coverage_rate_train"),
         "valid_categorical_values": {
             column: valid_category_values(column, vocabs[column])
             for column in ckpt_config.schema.categorical_targets
@@ -145,6 +161,8 @@ def sample_from_config(
         metadata.update(
             {
                 "synthetic_graph_history_source": "synthetic_spine",
+                "graph_uses_clean_target_attributes": False,
+                "graph_uses_clean_future_attributes": False,
                 "graph_history_rows": int(len(spine)),
                 "sampling_chronological": graph_mode(ckpt_config.raw) == "temporal_attribute_denoising",
                 "history_source_sampling": "generated_past_synthetic_attributes"
@@ -223,8 +241,14 @@ def sample_attributes(
     sampling_cfg = config.raw.get("sampling", {})
     num_hash_buckets = int(id_cfg.get("num_buckets", 262144))
     timesteps = int(diffusion.get("timesteps", 50))
-    repetition_penalty = float(sampling_cfg.get("summary_content_repetition_penalty", 1.0))
-    min_content_tokens = int(sampling_cfg.get("min_summary_content_tokens", 0))
+    repetition_penalties = {
+        column: float(sampling_cfg.get(f"{column}_content_repetition_penalty", sampling_cfg.get("summary_content_repetition_penalty", 1.0)))
+        for column in schema.text_targets
+    }
+    min_content_tokens = {
+        column: int(sampling_cfg.get(f"min_{column}_content_tokens", sampling_cfg.get("min_summary_content_tokens", 0)))
+        for column in schema.text_targets
+    }
     calibration = None if disable_length_calibration else config.raw.get("_summary_length_calibration")
     rng = random.Random(int(seed))
     result: dict[str, list[str] | list[dict[str, Any]]] = {
@@ -295,11 +319,12 @@ def sample_attributes(
                 remaining = cat_remaining[:, idx]
                 if not bool(remaining.any()):
                     continue
-                if column == "summary_length_bucket":
+                if column in schema.length_bucket_targets:
                     sampled = sample_length_bucket_logits(
                         logits["categorical"][column],
+                        column,
                         categorical_vocabs[column],
-                        calibration,
+                        length_calibration_for_column(calibration, column),
                         schema,
                         temperature=temperature,
                     )
@@ -348,7 +373,7 @@ def sample_attributes(
             diffusion_t=final_t,
             graph_context=graph_context,
         )
-        length_debug_rows = enforce_summary_length_constraints(
+        length_debug_rows = enforce_length_constraints(
             schema=schema,
             categorical_vocabs=categorical_vocabs,
             text_tokenizer=text_tokenizer,
@@ -358,7 +383,7 @@ def sample_attributes(
             rng=rng,
             temperature=temperature,
             top_p=top_p,
-            repetition_penalty=repetition_penalty,
+            repetition_penalties=repetition_penalties,
             min_content_tokens=min_content_tokens,
         )
 
@@ -373,24 +398,31 @@ def sample_attributes(
         for column in schema.text_targets:
             decoded = [text_tokenizer.decode(row) for row in text_input[column].detach().cpu().tolist()]
             result[column].extend(decoded)  # type: ignore[arg-type]
-            for local_idx, (row_index, decoded_summary) in enumerate(zip(batch_frame.index.tolist(), decoded)):
+            for local_idx, (row_index, decoded_text) in enumerate(zip(batch_frame.index.tolist(), decoded)):
                 if len(debug_examples) >= 200:
                     break
                 ids = text_input[column][local_idx].detach().cpu().tolist()
                 raw_tokens = [text_tokenizer.inv_vocab.get(int(idx), text_tokenizer.unk_token) for idx in ids]
                 eos_position = next((idx for idx, token_id in enumerate(ids) if int(token_id) == text_tokenizer.eos_id), None)
+                length_bucket_col = length_bucket_column_for_text(schema, column)
                 example = {
+                    "text_column": column,
                     "customer_id": batch_frame.iloc[local_idx].get(schema.foreign_key_columns[0]),
                     "product_id": batch_frame.iloc[local_idx].get(schema.foreign_key_columns[1]) if len(schema.foreign_key_columns) > 1 else None,
                     "review_time": str(batch_frame.iloc[local_idx].get(schema.datetime_columns[0])),
                     "rating": decoded_cats.get("rating", [None] * len(batch_frame))[local_idx],
                     "verified": decoded_cats.get("verified", [None] * len(batch_frame))[local_idx],
+                    f"{column}_length_bucket": decoded_cats.get(length_bucket_col, [None] * len(batch_frame))[local_idx] if length_bucket_col else None,
                     "summary_length_bucket": decoded_cats.get("summary_length_bucket", [None] * len(batch_frame))[local_idx],
-                    "decoded_summary": decoded_summary,
-                    "raw_summary_tokens": raw_tokens,
+                    "review_text_length_bucket": decoded_cats.get("review_text_length_bucket", [None] * len(batch_frame))[local_idx],
+                    f"decoded_{column}": decoded_text,
+                    "decoded_summary": decoded_text if column == "summary" else None,
+                    "raw_tokens": raw_tokens,
+                    "raw_summary_tokens": raw_tokens if column == "summary" else None,
+                    "raw_review_text_tokens": raw_tokens if column == "review_text" else None,
                     "eos_position": eos_position,
                     "content_length": text_tokenizer.content_length(ids),
-                    **length_debug_rows[local_idx],
+                    **length_debug_rows[local_idx].get(column, {}),
                 }
                 debug_examples.append(example)
         if attr_sampling and generated_attr_store is not None:
@@ -417,53 +449,88 @@ def enforce_summary_length_constraints(
     repetition_penalty: float = 1.0,
     min_content_tokens: int = 0,
 ) -> list[dict[str, Any]]:
+    rows = enforce_length_constraints(
+        schema=schema,
+        categorical_vocabs=categorical_vocabs,
+        text_tokenizer=text_tokenizer,
+        cat_input=cat_input,
+        text_input=text_input,
+        text_logits=text_logits,
+        rng=rng,
+        temperature=temperature,
+        top_p=top_p,
+        repetition_penalties={column: repetition_penalty for column in schema.text_targets},
+        min_content_tokens={column: min_content_tokens for column in schema.text_targets},
+    )
     if not schema.text_targets:
         return []
-    length_targets: list[int] | None = None
-    length_buckets: list[str] | None = None
-    if (
-        schema.summary_length_enabled
-        and schema.use_length_bucket_in_sampling
-        and "summary_length_bucket" in schema.model_categorical_targets
-        and "summary_length_bucket" in categorical_vocabs
-    ):
-        length_idx = schema.model_categorical_targets.index("summary_length_bucket")
-        length_vocab = categorical_vocabs["summary_length_bucket"]
-        bucket_names = [length_vocab.decode(idx) for idx in cat_input[:, length_idx].detach().cpu().tolist()]
-        length_buckets = bucket_names
-        first_text_col = schema.text_targets[0]
-        max_content = text_tokenizer.max_content_tokens(schema.text_max_lengths[first_text_col])
-        length_targets = [
-            sample_length_from_bucket(name, schema.summary_length_buckets, max_content, rng)
-            for name in bucket_names
-        ]
+    first = schema.text_targets[0]
+    return [row.get(first, {}) for row in rows]
+
+
+def enforce_length_constraints(
+    schema: ConditionalTABDLMSchema,
+    categorical_vocabs: dict[str, CategoryVocab],
+    text_tokenizer: SimpleTextTokenizer,
+    cat_input: torch.Tensor,
+    text_input: dict[str, torch.Tensor],
+    text_logits: dict[str, torch.Tensor],
+    rng: random.Random,
+    temperature: float,
+    top_p: float,
+    repetition_penalties: dict[str, float] | None = None,
+    min_content_tokens: dict[str, int] | None = None,
+) -> list[dict[str, dict[str, Any]]]:
+    if not schema.text_targets:
+        return []
+    repetition_penalties = repetition_penalties or {}
+    min_content_tokens = min_content_tokens or {}
+    debug_by_row: list[dict[str, dict[str, Any]]] = [{} for _ in range(cat_input.shape[0])]
 
     for column in schema.text_targets:
         sequences = text_input[column]
         logits = text_logits[column]
         max_len = sequences.shape[1]
         max_content = text_tokenizer.max_content_tokens(max_len)
-        debug_rows: list[dict[str, Any]] = []
+        bucket_column = length_bucket_column_for_text(schema, column)
+        length_targets: list[int] | None = None
+        length_buckets: list[str] | None = None
+        buckets: dict[str, tuple[int, int]] = {}
+        if (
+            schema.use_length_bucket_in_sampling
+            and bucket_column is not None
+            and bucket_column in schema.model_categorical_targets
+            and bucket_column in categorical_vocabs
+        ):
+            length_idx = schema.model_categorical_targets.index(bucket_column)
+            length_vocab = categorical_vocabs[bucket_column]
+            bucket_names = [length_vocab.decode(idx) for idx in cat_input[:, length_idx].detach().cpu().tolist()]
+            length_buckets = bucket_names
+            buckets = schema.buckets_for_length_bucket(bucket_column)
+            length_targets = [
+                sample_length_from_bucket(name, buckets, max_content, rng)
+                for name in bucket_names
+            ]
         for row_idx in range(sequences.shape[0]):
             target_len = length_targets[row_idx] if length_targets is not None else None
             bucket_name = length_buckets[row_idx] if length_buckets else None
-            bucket_bounds = schema.summary_length_buckets.get(str(bucket_name), (None, None)) if bucket_name is not None else (None, None)
+            bucket_bounds = buckets.get(str(bucket_name), (None, None)) if bucket_name is not None else (None, None)
             sequences[row_idx, 0] = text_tokenizer.bos_id
             if target_len is not None and schema.force_eos_after_sampled_length:
                 target_len = int(max(0, min(target_len, max_content)))
                 mode = str(schema.force_eos_after_sampled_length).lower()
                 if mode == "soft":
-                    low, high = schema.summary_length_buckets.get(str(bucket_name), (target_len, target_len))
+                    low, high = buckets.get(str(bucket_name), (target_len, target_len))
                     enforce_soft_length(
                         sequences[row_idx],
                         logits[row_idx],
                         text_tokenizer,
-                        low=max(int(low), int(min_content_tokens)),
+                        low=max(int(low), int(min_content_tokens.get(column, 0))),
                         high=min(int(high), max_content),
                         rng=rng,
                         temperature=temperature,
                         top_p=top_p,
-                        repetition_penalty=repetition_penalty,
+                        repetition_penalty=float(repetition_penalties.get(column, 1.0)),
                     )
                 else:
                     eos_pos = min(target_len + 1, max_len - 1)
@@ -476,7 +543,7 @@ def enforce_summary_length_constraints(
                                 temperature=temperature,
                                 top_p=top_p,
                                 previous_ids=sequences[row_idx, 1:pos].detach().cpu().tolist(),
-                                repetition_penalty=repetition_penalty,
+                                repetition_penalty=float(repetition_penalties.get(column, 1.0)),
                             )
                     sequences[row_idx, eos_pos] = text_tokenizer.eos_id
                     if schema.force_pad_after_eos and eos_pos + 1 < max_len:
@@ -491,28 +558,26 @@ def enforce_summary_length_constraints(
             target_bucket_respected = None
             if low is not None and high is not None:
                 target_bucket_respected = int(int(low) <= int(decoded_length) <= int(high))
-            debug_rows.append(
-                {
-                    "target_content_length": target_len,
-                    "target_bucket_low": low,
-                    "target_bucket_high": high,
-                    "target_bucket_respected": target_bucket_respected,
-                    "decoded_length_bucket": decoded_length_bucket(decoded_length, schema),
-                }
-            )
-        return debug_rows
-    return [{} for _ in range(cat_input.shape[0])]
+            debug_by_row[row_idx][column] = {
+                "target_content_length": target_len,
+                "target_bucket_low": low,
+                "target_bucket_high": high,
+                "target_bucket_respected": target_bucket_respected,
+                "decoded_length_bucket": decoded_length_bucket(decoded_length, schema, bucket_column),
+            }
+    return debug_by_row
 
 
 def sample_length_bucket_logits(
     logits: torch.Tensor,
+    column: str,
     vocab: CategoryVocab,
     calibration: dict[str, Any] | None,
     schema: ConditionalTABDLMSchema,
     temperature: float,
 ) -> torch.Tensor:
-    logits = mask_invalid_category_logits(logits, "summary_length_bucket", vocab)
-    probs = calibrated_length_probs(logits, vocab, calibration, schema)
+    logits = mask_invalid_category_logits(logits, column, vocab)
+    probs = calibrated_length_probs(logits, vocab, calibration, schema, column=column)
     if temperature != 1.0:
         logits = torch.log(probs.clamp_min(1e-12)) / max(float(temperature), 1e-6)
         probs = torch.softmax(logits, dim=-1)
@@ -534,9 +599,10 @@ def calibrated_length_probs(
     vocab: CategoryVocab,
     calibration: dict[str, Any] | None,
     schema: ConditionalTABDLMSchema,
+    column: str = "summary_length_bucket",
 ) -> torch.Tensor:
     probs = torch.softmax(torch.nan_to_num(logits.float(), nan=0.0), dim=-1)
-    if bool(schema.summary_length_enabled) and calibration:
+    if column in schema.length_bucket_targets and calibration:
         ratio = calibration.get("calibration_ratio", {})
         strength = float(calibration.get("calibration_strength", 1.0))
         factors = torch.ones(vocab.size, dtype=probs.dtype, device=probs.device)
@@ -592,10 +658,35 @@ def enforce_soft_length(
         sequence[eos_pos + 1 :] = tokenizer.pad_id
 
 
-def decoded_length_bucket(content_length: int, schema: ConditionalTABDLMSchema) -> str | None:
-    for name, (low, high) in schema.summary_length_buckets.items():
+def decoded_length_bucket(content_length: int, schema: ConditionalTABDLMSchema, column: str | None = "summary_length_bucket") -> str | None:
+    if column is None:
+        return None
+    for name, (low, high) in schema.buckets_for_length_bucket(column).items():
         if int(low) <= int(content_length) <= int(high):
             return str(name)
+    return None
+
+
+def length_bucket_for_calibration(calibration: dict[str, Any] | None, column: str) -> dict[str, Any] | None:
+    return length_calibration_for_column(calibration, column)
+
+
+def length_calibration_for_column(calibration: dict[str, Any] | None, column: str) -> dict[str, Any] | None:
+    if not calibration:
+        return None
+    if "calibration_ratio" in calibration:
+        return calibration
+    value = calibration.get(column)
+    return value if isinstance(value, dict) else None
+
+
+def length_bucket_column_for_text(schema: ConditionalTABDLMSchema, text_column: str) -> str | None:
+    for column in schema.length_bucket_targets:
+        try:
+            if schema.text_column_for_length_bucket(column) == text_column:
+                return column
+        except (KeyError, IndexError):
+            continue
     return None
 
 
@@ -626,12 +717,13 @@ def write_debug_outputs(attrs: dict[str, Any], debug_dir: str | Path) -> None:
         for row in examples:
             json.dump(jsonable(row), handle, sort_keys=True)
             handle.write("\n")
-    if "summary_length_bucket" in attrs:
-        counts = pd.Series(attrs["summary_length_bucket"]).value_counts().sort_index()
-        counts.rename_axis("summary_length_bucket").reset_index(name="count").to_csv(
-            debug_dir / "summary_length_histogram.csv",
-            index=False,
-        )
+    for column in ["summary_length_bucket", "review_text_length_bucket"]:
+        if column in attrs:
+            counts = pd.Series(attrs[column]).value_counts().sort_index()
+            counts.rename_axis(column).reset_index(name="count").to_csv(
+                debug_dir / f"{column}_histogram.csv",
+                index=False,
+            )
     if "_length_calibration" in attrs:
         with (debug_dir / "length_calibration.json").open("w") as handle:
             json.dump(jsonable(attrs["_length_calibration"]), handle, indent=2, sort_keys=True)
@@ -641,15 +733,26 @@ def write_debug_outputs(attrs: dict[str, Any], debug_dir: str | Path) -> None:
         top = summaries.value_counts().head(100).rename_axis("summary").reset_index(name="count")
         top["rate"] = top["count"] / max(len(summaries), 1)
         top.to_csv(debug_dir / "top_generated_summaries.csv", index=False)
+    if "review_text" in attrs:
+        reviews = pd.Series(attrs["review_text"]).fillna("").astype(str)
+        top = reviews.value_counts().head(100).rename_axis("review_text").reset_index(name="count")
+        top["rate"] = top["count"] / max(len(reviews), 1)
+        top.to_csv(debug_dir / "top_generated_review_texts.csv", index=False)
     if examples:
-        metrics = decoding_metrics_from_examples(examples)
+        metrics = decoding_metrics_from_examples([row for row in examples if row.get("text_column") in (None, "summary")])
         with (debug_dir / "summary_length_decoding_metrics.json").open("w") as handle:
             json.dump(jsonable(metrics), handle, indent=2, sort_keys=True)
             handle.write("\n")
+        review_examples = [row for row in examples if row.get("text_column") == "review_text"]
+        if review_examples:
+            review_metrics = decoding_metrics_from_examples(review_examples, bucket_column="review_text_length_bucket")
+            with (debug_dir / "review_text_length_decoding_metrics.json").open("w") as handle:
+                json.dump(jsonable(review_metrics), handle, indent=2, sort_keys=True)
+                handle.write("\n")
 
 
-def decoding_metrics_from_examples(examples: list[dict[str, Any]]) -> dict[str, Any]:
-    sampled = [row.get("summary_length_bucket") for row in examples if row.get("summary_length_bucket") is not None]
+def decoding_metrics_from_examples(examples: list[dict[str, Any]], bucket_column: str = "summary_length_bucket") -> dict[str, Any]:
+    sampled = [row.get(bucket_column) for row in examples if row.get(bucket_column) is not None]
     decoded = [row.get("decoded_length_bucket") for row in examples if row.get("decoded_length_bucket") is not None]
     respected = [row.get("target_bucket_respected") for row in examples if row.get("target_bucket_respected") is not None]
     errors = []
