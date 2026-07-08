@@ -1,0 +1,217 @@
+experiment_name: conditional_tabdlm_exp5_lstm_joint_full_review_text
+dataset_name: amazon-toy
+
+paths:
+  train_data_path: data/original/rel-amazon-toy/review.csv
+  synthetic_spine_path: outputs/amazon-toy/time_biased_block_stub_matching_kernel_main/synthetic_review.csv
+  output_dir: outputs/amazon-toy/conditional_tabdlm_exp5_lstm_joint_full_review_text
+
+columns:
+  condition:
+    foreign_keys:
+      - customer_id
+      - product_id
+    datetimes:
+      - review_time
+  target:
+    categorical:
+      - rating
+      - verified
+    numerical: []
+    text:
+      - summary
+      - review_text
+
+auxiliary_targets:
+  categorical:
+    - summary_length_bucket
+    - review_text_length_bucket
+
+graph_conditioning:
+  enabled: true
+  mode: structure_only_temporal
+  node_types:
+    - customer
+    - product
+    - review_event
+  event_node_type: review_event
+  temporal_filter:
+    enabled: true
+    mode: past_only
+    timestamp_column: review_time
+    allow_same_timestamp_events: false
+    same_timestamp_tiebreak: row_index
+    exclude_target_event_from_neighbors: true
+    max_history_events_per_customer: 50
+    max_history_events_per_product: 100
+    history_sampling_strategy: recent
+    recent_fraction_if_mixed: 0.7
+    deterministic_eval: true
+  foreign_key_edges:
+    - source_node_type: customer
+      source_column: customer_id
+      target_node_type: review_event
+      edge_type: customer_to_review
+    - source_node_type: product
+      source_column: product_id
+      target_node_type: review_event
+      edge_type: product_to_review
+  add_reverse_edges: true
+  allowed_node_features:
+    customer:
+      - node_type
+      - entity_hash_embedding
+    product:
+      - node_type
+      - entity_hash_embedding
+    review_event:
+      - node_type
+      - review_time
+      - customer_id_hash_embedding
+      - product_id_hash_embedding
+  forbidden_node_features:
+    - rating
+    - verified
+    - summary
+    - review_text
+  graph_uses_future_events: false
+  graph_uses_target_attributes: false
+  leakage_policy:
+    graph_uses_future_events: false
+    graph_uses_target_attributes: false
+    graph_uses_clean_target_attributes: false
+    graph_uses_clean_future_attributes: false
+    real_graph_used_at_sampling: false
+    synthetic_graph_history_source: synthetic_spine
+  graph_encoder:
+    type: temporal_structure_ego_encoder
+    hidden_dim: 256
+    output_dim: 256
+    num_layers: 2
+    dropout: 0.1
+    aggregator: mean
+    use_edge_type_embeddings: true
+    use_residual: true
+    normalize_output: true
+
+text:
+  max_length:
+    summary: 32
+    review_text: auto
+  special_tokens:
+    add_bos: true
+    add_eos: true
+    add_pad: true
+
+review_text:
+  max_tokens: auto
+  max_tokens_strategy: max_if_feasible_else_p99
+  max_feasible_tokens: 768
+  min_coverage_rate: 0.99
+
+summary_length:
+  enabled: true
+  use_length_bucket_in_sampling: true
+  calibrate_length_bucket_sampling: false
+  force_eos_after_sampled_length: true
+  force_pad_after_eos: true
+  buckets:
+    len_0: [0, 0]
+    len_1_2: [1, 2]
+    len_3_5: [3, 5]
+    len_6_10: [6, 10]
+    len_11_16: [11, 16]
+    len_17_32: [17, 32]
+
+review_text_length:
+  enabled: true
+  use_length_bucket_in_sampling: true
+  calibrate_length_bucket_sampling: false
+
+summary_length_loss:
+  class_balanced: true
+  class_weight_power: 0.5
+  max_class_weight: 5.0
+  min_class_weight: 0.5
+
+review_text_length_loss:
+  class_balanced: true
+  class_weight_power: 0.5
+  max_class_weight: 5.0
+  min_class_weight: 0.5
+
+tokenizer:
+  max_vocab_size: 30000
+  min_frequency: 1
+  lowercase: true
+
+id_encoding:
+  type: hash_embedding
+  num_buckets: 262144
+  embedding_dim: 128
+
+datetime_encoding:
+  type: continuous_time_fourier
+  embedding_dim: 64
+
+model:
+  family: joint_lstm_generator
+  row_hidden_dim: 384
+  latent_noise_dim: 128
+  categorical_context_dim: 48
+  dropout: 0.1
+  use_graph_context: true
+  graph_context_dim: 256
+
+text_decoder:
+  type: lstm
+  embedding_dim: 256
+  hidden_dim: 384
+  num_layers: 2
+  dropout: 0.1
+  tie_output_embeddings: false
+  teacher_forcing_ratio: 1.0
+  sampling_strategy: top_p
+  top_p: 0.95
+  temperature: 0.9
+
+training:
+  max_rows: null
+  batch_size: 256
+  epochs: 50
+  early_stopping_patience: 8
+  early_stopping_min_delta: 0.0001
+  lr: 0.0005
+  weight_decay: 0.01
+  seed: 42
+  num_workers: 4
+  mixed_precision: true
+  gradient_clip_norm: 1.0
+  save_best_by: valid/loss_total
+  auto_reduce_batch_size: true
+  min_batch_size: 32
+  device: auto
+
+loss_weights:
+  rating: 3.0
+  verified: 3.0
+  summary_length: 2.0
+  review_text_length: 2.0
+  summary_text: 1.0
+  review_text: 1.0
+
+sampling:
+  num_rows: 50000
+  batch_size: auto
+  top_p: 0.95
+  temperature: 0.9
+  summary_repetition_penalty: 1.10
+  review_text_repetition_penalty: 1.05
+  min_summary_tokens: 1
+  min_review_text_tokens: 1
+  seed: 42
+  device: auto
+  mixed_precision: true
+
+evaluation:
+  review_text_privacy_sample_size: 2000

@@ -215,6 +215,13 @@ def evaluate_frames(
         )
     if summary_col and review_text_col and summary_col in synthetic and review_text_col in synthetic:
         metrics["text_consistency"].update(summary_review_text_similarity_metrics(synthetic[summary_col], synthetic[review_text_col]))
+        if summary_col in real and review_text_col in real:
+            metrics["text_consistency"].update(
+                prefixed_summary_review_text_similarity_metrics(real[summary_col], real[review_text_col], prefix="real")
+            )
+            metrics["text_consistency"].update(
+                prefixed_summary_review_text_similarity_metrics(synthetic[summary_col], synthetic[review_text_col], prefix="synthetic")
+            )
     if rating_col and rating_eval_col:
         metrics["conditional_fidelity"].update(top_entity_mae(real, synthetic, product_col, rating_eval_col, "product_rating", numeric=True))
         metrics["conditional_fidelity"].update(top_entity_mae(real, synthetic, customer_col, rating_eval_col, "customer_rating", numeric=True))
@@ -794,6 +801,14 @@ def text_consistency_metrics(
 
 
 def summary_review_text_similarity_metrics(summary: pd.Series, review_text: pd.Series) -> dict[str, Any]:
+    return prefixed_summary_review_text_similarity_metrics(summary, review_text, prefix=None)
+
+
+def prefixed_summary_review_text_similarity_metrics(
+    summary: pd.Series,
+    review_text: pd.Series,
+    prefix: str | None = None,
+) -> dict[str, Any]:
     rows = [
         (tokenize(left), tokenize(right))
         for left, right in zip(summary.fillna(""), review_text.fillna(""))
@@ -801,10 +816,11 @@ def summary_review_text_similarity_metrics(summary: pd.Series, review_text: pd.S
     rouge = [rouge_l_f1(left, right) for left, right in rows]
     jaccard = [token_jaccard(left, right) for left, right in rows]
     exact = [normalize_text(left) == normalize_text(right) for left, right in zip(summary.fillna(""), review_text.fillna(""))]
+    key_prefix = "summary_review_text" if prefix is None else f"{prefix}_summary_review_text"
     return {
-        "summary_review_text_rougeL_mean": float(np.mean(rouge)) if rouge else None,
-        "summary_review_text_token_jaccard_mean": float(np.mean(jaccard)) if jaccard else None,
-        "summary_review_text_exact_match_rate": float(np.mean(exact)) if exact else None,
+        f"{key_prefix}_rougeL_mean": float(np.mean(rouge)) if rouge else None,
+        f"{key_prefix}_token_jaccard_mean": float(np.mean(jaccard)) if jaccard else None,
+        f"{key_prefix}_exact_match_rate": float(np.mean(exact)) if exact else None,
     }
 
 
