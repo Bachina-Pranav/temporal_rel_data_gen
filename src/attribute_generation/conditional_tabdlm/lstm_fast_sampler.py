@@ -75,10 +75,33 @@ class FastSamplerOptions:
     exact_train_overlap_blocking_enabled: bool = False
     summary_exact_blocking_enabled: bool = True
     review_text_exact_blocking_enabled: bool = True
+    length_preserving_exact_blocking_enabled: bool = False
+    dependency_aware_text_decoding_enabled: bool = True
+    text_field_policy: list[dict[str, Any]] | None = None
+    field_exact_blocking_enabled: dict[str, bool] | None = None
+    field_max_resample_attempts: dict[str, int] | None = None
+    privacy_fallback_extra_temperature_attempts: int = 2
+    privacy_fallback_temperature_multiplier: float = 1.15
+    generated_candidate_cache_enabled: bool = True
+    allow_privacy_bucket_change: bool = False
     max_summary_resample_attempts: int = 0
     max_review_text_resample_attempts: int = 0
     train_text_sets: dict[str, set[str]] | None = None
     privacy_counters: dict[str, int] | None = None
+    generated_candidate_cache: dict[str, dict[str, list[dict[str, Any]]]] | None = None
+    text_field_names: list[str] | None = None
+
+
+@dataclass(frozen=True)
+class TextFieldPolicy:
+    name: str
+    target_column: str
+    length_bucket_column: str | None = None
+    exact_train_overlap_blocking: bool = True
+    max_resample_attempts: int = 0
+    preserve_length_bucket: bool = True
+    conditions_on: tuple[str, ...] = ()
+    downstream_dependents: tuple[str, ...] = ()
 
 
 @dataclass
@@ -179,6 +202,11 @@ def sample_lstm_fast_from_config(
         "review_text": float(sampling.get("review_text_repetition_penalty", 1.05)),
     }
     hydrate_privacy_options(options, ckpt_config)
+    text_field_policies = text_field_policies_from_config(ckpt_config, options.text_field_policy)
+    if options.dependency_aware_text_decoding_enabled:
+        text_field_policies = topological_text_field_order(text_field_policies)
+    options.text_field_names = [policy.target_column for policy in text_field_policies]
+    initialize_privacy_counters(options, options.text_field_names)
 
     initial_batch_size = resolve_initial_batch_size(batch_size, sampling, device, options)
     min_batch_size = int(sampling.get("min_batch_size", 32))
@@ -250,6 +278,7 @@ def sample_lstm_fast_from_config(
                     min_tokens=min_tokens,
                     repetition_penalty=repetition,
                     options=options,
+                    text_field_policies=text_field_policies,
                 )
         except RuntimeError as exc:
             if not (options.auto_batch_size and is_cuda_oom(exc) and batch_size_used > min_batch_size):
@@ -355,6 +384,7 @@ def sample_lstm_fast_batch(
     min_tokens: dict[str, int],
     repetition_penalty: dict[str, float],
     options: FastSamplerOptions,
+    text_field_policies: list[TextFieldPolicy] | None = None,
 ) -> BatchSample:
     if options.disable_fast_path or options.decode_mode == "naive":
         return sample_lstm_naive_batch(
@@ -410,11 +440,15 @@ def sample_lstm_fast_batch(
     context = model.categorical_context(row, categorical_ids)
     text_ids: dict[str, torch.Tensor] = {}
     text_lengths: dict[str, list[int]] = {}
-    summary_repr = None
-    for column in schema.text_targets:
-        bucket_column = length_bucket_column_for_text(schema, column)
+    policies = text_field_policies or [default_text_field_policy(schema, column) for column in schema.text_targets]
+    policy_by_column = {policy.target_column: policy for policy in policies}
+    summary_repr_by_field: dict[str, torch.Tensor] = {}
+    for policy in policies:
+        column = policy.target_column
+        bucket_column = policy.length_bucket_column or length_bucket_column_for_text(schema, column)
         bucket_names = decoded_cats.get(bucket_column, [None] * len(frame)) if bucket_column else [None] * len(frame)
         timing_name = "summary_decoding_seconds" if column == "summary" else f"{column}_decoding_seconds"
+        summary_repr_for_column = summary_repr_by_field.get("summary") if column == "review_text" else None
         with profiler.timer(timing_name):
             ids = generate_text_column_fast(
                 model,
@@ -429,12 +463,31 @@ def sample_lstm_fast_batch(
                 active_row_masking=options.active_row_masking,
                 length_bucketed=options.length_bucketed_decoding and options.decode_mode == "bucketed",
                 no_repeat_ngram_size=no_repeat_ngram_size_for_column(options, column),
-                summary_repr=summary_repr,
+                summary_repr=summary_repr_for_column,
+            )
+            ids = apply_length_preserving_exact_blocking_to_ids(
+                ids,
+                model=model,
+                column=column,
+                policy=policy_by_column[column],
+                context=context,
+                bucket_names=bucket_names,
+                tokenizer=tokenizer,
+                train_set=(options.train_text_sets or {}).get(column, set()),
+                temperature=float(text_temperatures.get(column, temperature)),
+                top_p=float(text_top_ps.get(column, top_p)),
+                min_content_tokens=int(min_tokens.get(column, 0)),
+                repetition_penalty=float(repetition_penalty.get(column, 1.0)),
+                active_row_masking=options.active_row_masking,
+                length_bucketed=options.length_bucketed_decoding and options.decode_mode == "bucketed",
+                no_repeat_ngram_size=no_repeat_ngram_size_for_column(options, column),
+                summary_repr=summary_repr_for_column,
+                options=options,
             )
         text_ids[column] = ids
         text_lengths[column] = content_lengths_from_tensor(tokenizer, ids)
         if column == "summary" and getattr(model, "review_text_conditioned_on_summary", False):
-            summary_repr = model.summary_representation_from_ids(context, ids)
+            summary_repr_by_field[column] = model.summary_representation_from_ids(context, ids)
     return BatchSample(frame=frame, categorical=decoded_cats, text_ids=text_ids, text={}, text_lengths=text_lengths)
 
 
@@ -677,7 +730,7 @@ def materialize_batch_output(
                 output[column] = batch.text[column]
             else:
                 output[column] = [tokenizer.decode(row_ids) for row_ids in batch.text_ids[column].detach().cpu().tolist()]
-            if options.exact_train_overlap_blocking_enabled:
+            if options.exact_train_overlap_blocking_enabled and not options.length_preserving_exact_blocking_enabled:
                 output[column] = block_exact_train_overlaps(
                     output[column].astype(str).tolist(),
                     column,
@@ -790,6 +843,217 @@ def sample_categorical_fast(
     return sample_from_logits(constrained, temperature=temperature, top_p=top_p)
 
 
+def apply_length_preserving_exact_blocking_to_ids(
+    ids: torch.Tensor,
+    *,
+    model: JointLSTMRelationalAttributeGenerator,
+    column: str,
+    policy: TextFieldPolicy,
+    context: torch.Tensor,
+    bucket_names: list[Any],
+    tokenizer: SimpleTextTokenizer,
+    train_set: set[str],
+    temperature: float,
+    top_p: float,
+    min_content_tokens: int,
+    repetition_penalty: float,
+    active_row_masking: bool,
+    length_bucketed: bool,
+    no_repeat_ngram_size: int,
+    summary_repr: torch.Tensor | None,
+    options: FastSamplerOptions,
+) -> torch.Tensor:
+    if (
+        not options.length_preserving_exact_blocking_enabled
+        or not exact_blocking_enabled_for_column(options, column)
+        or not bool(policy.exact_train_overlap_blocking)
+        or not train_set
+    ):
+        return ids
+
+    output = ids.clone()
+    counters = ensure_privacy_counters(options)
+    texts = [tokenizer.decode(row_ids) for row_ids in output.detach().cpu().tolist()]
+    active_positions = [idx for idx, text in enumerate(texts) if normalize_privacy_text(text) in train_set]
+    remember_non_overlapping_generated_candidates(options, column, bucket_names, texts, output, train_set, tokenizer)
+    if not active_positions:
+        update_length_bucket_preservation_counts(options, column, output, bucket_names, tokenizer, model.schema, min_content_tokens)
+        return output
+
+    counters[f"{column}_exact_overlap_candidates"] += int(len(active_positions))
+    max_attempts = max(0, max_resample_attempts_for_field(options, policy))
+    extra_attempts = max(0, int(options.privacy_fallback_extra_temperature_attempts))
+    total_attempts = max_attempts + extra_attempts
+    if total_attempts <= 0:
+        total_attempts = 1
+    unresolved = list(active_positions)
+
+    for attempt in range(total_attempts):
+        if not unresolved:
+            break
+        attempt_temperature = float(temperature)
+        if attempt >= max_attempts:
+            attempt_temperature *= float(options.privacy_fallback_temperature_multiplier)
+        index = torch.tensor(unresolved, dtype=torch.long, device=context.device)
+        candidate_ids = generate_text_column_fast(
+            model,
+            column,
+            context.index_select(0, index),
+            [bucket_names[idx] for idx in unresolved],
+            tokenizer,
+            temperature=attempt_temperature,
+            top_p=top_p,
+            min_content_tokens=min_content_tokens,
+            repetition_penalty=repetition_penalty,
+            active_row_masking=active_row_masking,
+            length_bucketed=length_bucketed,
+            no_repeat_ngram_size=no_repeat_ngram_size,
+            summary_repr=summary_repr.index_select(0, index) if summary_repr is not None else None,
+        )
+        candidate_texts = [tokenizer.decode(row_ids) for row_ids in candidate_ids.detach().cpu().tolist()]
+        next_unresolved: list[int] = []
+        for local_idx, row_idx in enumerate(unresolved):
+            counters[f"{column}_resample_attempts_total"] += 1
+            candidate_text = candidate_texts[local_idx]
+            if normalize_privacy_text(candidate_text) in train_set:
+                next_unresolved.append(row_idx)
+                continue
+            output[row_idx].copy_(candidate_ids[local_idx])
+            counters[f"{column}_exact_overlap_blocked"] += 1
+            remember_generated_candidate(
+                options,
+                column,
+                bucket_names[row_idx],
+                candidate_text,
+                candidate_ids[local_idx],
+                train_set,
+                tokenizer,
+            )
+        unresolved = next_unresolved
+
+    if unresolved and options.generated_candidate_cache_enabled:
+        still_unresolved: list[int] = []
+        for row_idx in unresolved:
+            cached = cached_generated_candidate(options, column, bucket_names[row_idx])
+            if cached is None:
+                still_unresolved.append(row_idx)
+                continue
+            output[row_idx].copy_(torch.tensor(cached["ids"], dtype=torch.long, device=output.device))
+            counters[f"{column}_exact_overlap_blocked"] += 1
+            counters[f"{column}_fallback_cache_used"] += 1
+        unresolved = still_unresolved
+
+    if unresolved:
+        counters[f"{column}_exact_overlap_unresolved"] += int(len(unresolved))
+        counters[f"{column}_fallback_unresolved_accepted"] += int(len(unresolved))
+
+    update_length_bucket_preservation_counts(options, column, output, bucket_names, tokenizer, model.schema, min_content_tokens)
+    return output
+
+
+def update_length_bucket_preservation_counts(
+    options: FastSamplerOptions,
+    column: str,
+    ids: torch.Tensor,
+    bucket_names: list[Any],
+    tokenizer: SimpleTextTokenizer,
+    schema: ConditionalTABDLMSchema,
+    min_content_tokens: int,
+) -> None:
+    counters = ensure_privacy_counters(options)
+    max_len = int(schema.text_max_lengths[column])
+    max_content = tokenizer.max_content_tokens(max_len)
+    lows, highs = length_bounds_for_generation(schema, column, bucket_names, max_content, min_content_tokens)
+    lengths = content_lengths_from_tensor(tokenizer, ids)
+    preserved = 0
+    changed = 0
+    for length, low, high in zip(lengths, lows, highs):
+        if int(low) <= int(length) <= int(high):
+            preserved += 1
+        else:
+            changed += 1
+    counters[f"{column}_length_bucket_preserved_count"] += int(preserved)
+    counters[f"{column}_length_bucket_changed_count"] += int(changed)
+
+
+def remember_non_overlapping_generated_candidates(
+    options: FastSamplerOptions,
+    column: str,
+    bucket_names: list[Any],
+    texts: list[str],
+    ids: torch.Tensor,
+    train_set: set[str],
+    tokenizer: SimpleTextTokenizer,
+) -> None:
+    if not options.generated_candidate_cache_enabled:
+        return
+    for row_idx, text in enumerate(texts):
+        remember_generated_candidate(options, column, bucket_names[row_idx], text, ids[row_idx], train_set, tokenizer)
+
+
+def remember_generated_candidate(
+    options: FastSamplerOptions,
+    column: str,
+    bucket_name: Any,
+    text: str,
+    ids: torch.Tensor,
+    train_set: set[str],
+    tokenizer: SimpleTextTokenizer,
+) -> None:
+    if not options.generated_candidate_cache_enabled:
+        return
+    normalized = normalize_privacy_text(text)
+    if not normalized or normalized in train_set:
+        return
+    cache = ensure_generated_candidate_cache(options)
+    field_cache = cache.setdefault(column, {})
+    bucket_key = length_bucket_cache_key(bucket_name)
+    bucket_cache = field_cache.setdefault(bucket_key, [])
+    if any(row.get("normalized") == normalized for row in bucket_cache):
+        return
+    bucket_cache.append(
+        {
+            "text": text,
+            "normalized": normalized,
+            "ids": [int(token) for token in ids.detach().cpu().tolist()],
+        }
+    )
+    if len(bucket_cache) > 64:
+        del bucket_cache[:-64]
+
+
+def cached_generated_candidate(options: FastSamplerOptions, column: str, bucket_name: Any) -> dict[str, Any] | None:
+    cache = ensure_generated_candidate_cache(options)
+    bucket_cache = cache.get(column, {}).get(length_bucket_cache_key(bucket_name), [])
+    if not bucket_cache:
+        return None
+    return bucket_cache[0]
+
+
+def ensure_generated_candidate_cache(options: FastSamplerOptions) -> dict[str, dict[str, list[dict[str, Any]]]]:
+    if options.generated_candidate_cache is None:
+        options.generated_candidate_cache = {}
+    return options.generated_candidate_cache
+
+
+def length_bucket_cache_key(bucket_name: Any) -> str:
+    if bucket_name is None or (isinstance(bucket_name, float) and math.isnan(bucket_name)):
+        return "__none__"
+    return str(bucket_name)
+
+
+def max_resample_attempts_for_field(options: FastSamplerOptions, policy: TextFieldPolicy) -> int:
+    if options.field_max_resample_attempts and policy.target_column in options.field_max_resample_attempts:
+        return int(options.field_max_resample_attempts[policy.target_column])
+    if int(policy.max_resample_attempts or 0) > 0:
+        return int(policy.max_resample_attempts)
+    if policy.target_column == "summary":
+        return int(options.max_summary_resample_attempts or 0)
+    if policy.target_column == "review_text":
+        return int(options.max_review_text_resample_attempts or 0)
+    return 3
+
+
 def apply_no_repeat_ngram_blocking(
     logits: torch.Tensor,
     previous_ids: torch.Tensor,
@@ -870,6 +1134,8 @@ def block_exact_train_overlaps(texts: list[str], column: str, options: FastSampl
 def exact_blocking_enabled_for_column(options: FastSamplerOptions, column: str) -> bool:
     if not options.exact_train_overlap_blocking_enabled:
         return False
+    if options.field_exact_blocking_enabled and column in options.field_exact_blocking_enabled:
+        return bool(options.field_exact_blocking_enabled[column])
     if column == "summary":
         return bool(options.summary_exact_blocking_enabled)
     if column == "review_text":
@@ -905,19 +1171,51 @@ def build_train_text_sets(config: ConditionalTABDLMConfig, columns: list[str]) -
 
 def ensure_privacy_counters(options: FastSamplerOptions) -> dict[str, int]:
     if options.privacy_counters is None:
-        options.privacy_counters = {
-            "summary_exact_overlap_candidates": 0,
-            "summary_exact_overlap_blocked": 0,
-            "summary_exact_overlap_unresolved": 0,
-            "review_text_exact_overlap_candidates": 0,
-            "review_text_exact_overlap_blocked": 0,
-            "review_text_exact_overlap_unresolved": 0,
-        }
+        options.privacy_counters = {}
+    initialize_privacy_counters(options, privacy_counter_fields(options))
+    return options.privacy_counters
+
+
+def privacy_counter_fields(options: FastSamplerOptions) -> list[str]:
+    fields = list(options.text_field_names or [])
+    fields.extend((options.train_text_sets or {}).keys())
+    fields.extend(["summary", "review_text"])
+    return sorted({field for field in fields if field})
+
+
+def initialize_privacy_counters(options: FastSamplerOptions, fields: list[str]) -> dict[str, int]:
+    if options.privacy_counters is None:
+        options.privacy_counters = {}
+    for field in fields:
+        options.privacy_counters.setdefault(f"{field}_exact_overlap_candidates", 0)
+        options.privacy_counters.setdefault(f"{field}_exact_overlap_blocked", 0)
+        options.privacy_counters.setdefault(f"{field}_exact_overlap_unresolved", 0)
+        options.privacy_counters.setdefault(f"{field}_resample_attempts_total", 0)
+        options.privacy_counters.setdefault(f"{field}_fallback_cache_used", 0)
+        options.privacy_counters.setdefault(f"{field}_fallback_unresolved_accepted", 0)
+        options.privacy_counters.setdefault(f"{field}_length_bucket_preserved_count", 0)
+        options.privacy_counters.setdefault(f"{field}_length_bucket_changed_count", 0)
     return options.privacy_counters
 
 
 def hydrate_privacy_options(options: FastSamplerOptions, config: ConditionalTABDLMConfig) -> None:
     sampling = config.raw.get("sampling", {})
+    policies = text_field_policies_from_config(config, options.text_field_policy)
+    options.text_field_names = [policy.target_column for policy in policies]
+    if options.field_exact_blocking_enabled is None:
+        options.field_exact_blocking_enabled = {
+            policy.target_column: bool(policy.exact_train_overlap_blocking)
+            for policy in policies
+        }
+        if "summary" in options.field_exact_blocking_enabled:
+            options.field_exact_blocking_enabled["summary"] = bool(options.summary_exact_blocking_enabled)
+        if "review_text" in options.field_exact_blocking_enabled:
+            options.field_exact_blocking_enabled["review_text"] = bool(options.review_text_exact_blocking_enabled)
+    if options.field_max_resample_attempts is None:
+        options.field_max_resample_attempts = {
+            policy.target_column: int(policy.max_resample_attempts or 0)
+            for policy in policies
+        }
     if options.use_config_privacy_controls:
         no_repeat = sampling.get("no_repeat_ngram", {})
         if bool(no_repeat.get("enabled", False)):
@@ -949,12 +1247,12 @@ def hydrate_privacy_options(options: FastSamplerOptions, config: ConditionalTABD
     if options.exact_train_overlap_blocking_enabled and options.train_text_sets is None:
         columns = [column for column in config.schema.text_targets if exact_blocking_enabled_for_column(options, column)]
         options.train_text_sets = build_train_text_sets(config, columns)
-    ensure_privacy_counters(options)
+    initialize_privacy_counters(options, options.text_field_names or [])
 
 
 def privacy_summary_fields(options: FastSamplerOptions) -> dict[str, Any]:
     counters = ensure_privacy_counters(options)
-    return {
+    fields = {
         **counters,
         "no_repeat_ngram_enabled": bool(options.no_repeat_ngram_enabled),
         "summary_no_repeat_ngram_enabled": bool(no_repeat_ngram_size_for_column(options, "summary")),
@@ -964,7 +1262,118 @@ def privacy_summary_fields(options: FastSamplerOptions) -> dict[str, Any]:
         "exact_train_overlap_blocking_enabled": bool(options.exact_train_overlap_blocking_enabled),
         "summary_exact_blocking_enabled": bool(exact_blocking_enabled_for_column(options, "summary")),
         "review_text_exact_blocking_enabled": bool(exact_blocking_enabled_for_column(options, "review_text")),
+        "length_preserving_exact_blocking_enabled": bool(options.length_preserving_exact_blocking_enabled),
+        "dependency_aware_text_decoding_enabled": bool(options.dependency_aware_text_decoding_enabled),
+        "text_fields_with_privacy_blocking": [
+            field for field in (options.text_field_names or []) if exact_blocking_enabled_for_column(options, field)
+        ],
     }
+    for field in privacy_counter_fields(options):
+        candidates = int(counters.get(f"{field}_exact_overlap_candidates", 0))
+        attempts = int(counters.get(f"{field}_resample_attempts_total", 0))
+        fields[f"{field}_resample_attempts_mean"] = float(attempts / candidates) if candidates else 0.0
+    return fields
+
+
+def text_field_policies_from_config(
+    config: ConditionalTABDLMConfig,
+    explicit_policy: list[dict[str, Any]] | None = None,
+) -> list[TextFieldPolicy]:
+    raw_fields = explicit_policy
+    if raw_fields is None:
+        raw_fields = config.raw.get("text_fields")
+    if raw_fields:
+        return [parse_text_field_policy(item, config.schema) for item in raw_fields]
+    policies = [default_text_field_policy(config.schema, column) for column in config.schema.text_targets]
+    if (
+        bool(config.raw.get("review_text_decoder", {}).get("condition_on_summary", False))
+        and "summary" in config.schema.text_targets
+        and "review_text" in config.schema.text_targets
+    ):
+        updated: list[TextFieldPolicy] = []
+        for policy in policies:
+            if policy.target_column == "summary":
+                updated.append(
+                    TextFieldPolicy(
+                        **{
+                            **policy.__dict__,
+                            "downstream_dependents": tuple(sorted(set(policy.downstream_dependents + ("review_text",)))),
+                        }
+                    )
+                )
+            elif policy.target_column == "review_text":
+                updated.append(
+                    TextFieldPolicy(
+                        **{
+                            **policy.__dict__,
+                            "conditions_on": tuple(sorted(set(policy.conditions_on + ("summary",)))),
+                        }
+                    )
+                )
+            else:
+                updated.append(policy)
+        policies = updated
+    return policies
+
+
+def parse_text_field_policy(raw: dict[str, Any], schema: ConditionalTABDLMSchema) -> TextFieldPolicy:
+    name = str(raw.get("name") or raw.get("target_column"))
+    target_column = str(raw.get("target_column") or name)
+    privacy = dict(raw.get("privacy", {}) or {})
+    dependencies = dict(raw.get("dependencies", {}) or {})
+    return TextFieldPolicy(
+        name=name,
+        target_column=target_column,
+        length_bucket_column=raw.get("length_bucket_column") or length_bucket_column_for_text(schema, target_column),
+        exact_train_overlap_blocking=bool(privacy.get("exact_train_overlap_blocking", True)),
+        max_resample_attempts=int(privacy.get("max_resample_attempts", default_max_resample_attempts(target_column))),
+        preserve_length_bucket=bool(privacy.get("preserve_length_bucket", True)),
+        conditions_on=tuple(str(item) for item in dependencies.get("conditions_on", []) or []),
+        downstream_dependents=tuple(str(item) for item in dependencies.get("downstream_dependents", []) or []),
+    )
+
+
+def default_text_field_policy(schema: ConditionalTABDLMSchema, column: str) -> TextFieldPolicy:
+    return TextFieldPolicy(
+        name=str(column),
+        target_column=str(column),
+        length_bucket_column=length_bucket_column_for_text(schema, column),
+        exact_train_overlap_blocking=True,
+        max_resample_attempts=default_max_resample_attempts(column),
+        preserve_length_bucket=True,
+    )
+
+
+def default_max_resample_attempts(column: str) -> int:
+    if column == "summary":
+        return 5
+    if column == "review_text":
+        return 3
+    return 3
+
+
+def topological_text_field_order(policies: list[TextFieldPolicy]) -> list[TextFieldPolicy]:
+    by_target = {policy.target_column: policy for policy in policies}
+    name_to_target = {policy.name: policy.target_column for policy in policies}
+    dependencies = {
+        policy.target_column: {
+            name_to_target.get(dep, dep)
+            for dep in policy.conditions_on
+            if name_to_target.get(dep, dep) in by_target
+        }
+        for policy in policies
+    }
+    ordered: list[TextFieldPolicy] = []
+    remaining = set(by_target)
+    while remaining:
+        ready = sorted(field for field in remaining if not dependencies[field].intersection(remaining))
+        if not ready:
+            cycle = ", ".join(sorted(remaining))
+            raise ValueError(f"Cycle in text field dependencies: {cycle}")
+        for field in ready:
+            ordered.append(by_target[field])
+            remaining.remove(field)
+    return ordered
 
 
 def sampling_scalar(sampling: dict[str, Any], key: str, column: str, default: float) -> float:
