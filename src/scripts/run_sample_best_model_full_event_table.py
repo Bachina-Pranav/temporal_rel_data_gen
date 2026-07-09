@@ -13,7 +13,7 @@ from typing import Any, Callable
 import pandas as pd
 
 
-if __package__ is None:
+if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
@@ -29,6 +29,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", required=True)
     parser.add_argument("--profile-output", required=True)
     parser.add_argument("--num-rows", default="auto")
+    parser.add_argument("--dataset-name", default=None)
     parser.add_argument("--batch-size", default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--seed", type=int, default=None)
@@ -108,17 +109,28 @@ def run_full_sampling(
     )
     elapsed = time.perf_counter() - start
     generated_rows = count_rows(sampled_path) if Path(sampled_path).exists() else None
+    rows_per_second = float(generated_rows / elapsed) if generated_rows is not None and elapsed > 0 else None
     write_runtime_metadata(
         profile_output,
         {
+            "dataset_name": getattr(args, "dataset_name", None),
             "num_requested_rows": int(num_rows),
             "num_generated_rows": int(generated_rows) if generated_rows is not None else None,
             "real_table_row_count": int(real_rows),
             "full_table_sampling": True,
             "model_variant": MODEL_VARIANT,
+            "architecture_changed": False,
             "length_preserving_exact_blocking_enabled": bool(args.length_preserving_exact_blocking),
+            "exact_train_overlap_blocking_enabled": bool(args.length_preserving_exact_blocking),
             "review_text_no_repeat_ngram_enabled": False if args.disable_review_text_ngram_blocking else None,
             "runtime_seconds_wall_clock": float(elapsed),
+            "total_sampling_seconds": float(elapsed),
+            "rows_per_second": rows_per_second,
+            "projected_hours_for_10m_rows": float(10_000_000.0 / rows_per_second / 3600.0) if rows_per_second else None,
+            "peak_gpu_memory_mb": None,
+            "mixed_precision_used": bool(args.mixed_precision),
+            "auto_batch_size_used": bool(args.auto_batch_size),
+            "write_chunk_size": int(args.write_chunk_size),
             "output": str(sampled_path),
             "synthetic_spine": str(args.synthetic_spine),
             "checkpoint": str(args.checkpoint),

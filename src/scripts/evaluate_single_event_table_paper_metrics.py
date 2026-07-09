@@ -15,7 +15,7 @@ from typing import Any
 import pandas as pd
 
 
-if __package__ is None:
+if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from attribute_generation.conditional_tabdlm.evaluate import evaluate_from_config as legacy_evaluate_from_config  # noqa: E402
