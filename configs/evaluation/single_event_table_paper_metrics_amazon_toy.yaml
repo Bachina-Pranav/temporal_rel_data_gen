@@ -1,0 +1,80 @@
+dataset_name: amazon_toy
+evaluation_level: single_event_table
+
+real_table_path: data/original/rel-amazon-toy/review.csv
+synthetic_table_path: outputs/amazon-toy/conditional_tabdlm_exp5_3_lstm_length_preserving_privacy_sampler/runs/v51_length_preserving_exact_block/synthetic_review_attrs_fast.csv
+
+legacy_evaluator:
+  enabled: true
+  config_path: configs/attribute_generation/conditional_tabdlm_amazon_toy_exp5_1_lstm_privacy_alignment.yaml
+
+table:
+  name: review
+  primary_key: null
+  columns:
+    customer_id:
+      type: foreign_key
+      references:
+        table: customer
+        column: customer_id
+      parent_table_path: data/original/rel-amazon-toy/customer.csv
+      nullable: false
+    product_id:
+      type: foreign_key
+      references:
+        table: product
+        column: product_id
+      parent_table_path: data/original/rel-amazon-toy/product.csv
+      nullable: false
+    review_time:
+      type: datetime
+      nullable: false
+    rating:
+      type: categorical
+      valid_values: [1, 2, 3, 4, 5, "1", "2", "3", "4", "5"]
+      nullable: false
+    verified:
+      type: categorical
+      valid_values: [0, 1, "0", "1", true, false, "True", "False", "true", "false"]
+      nullable: false
+    summary:
+      type: text
+      nullable: false
+    review_text:
+      type: text
+      nullable: false
+
+evaluation:
+  random_seed: 42
+  sample_size: null
+  max_rows_for_c2st: 100000
+  temporal:
+    timestamp_columns:
+      - review_time
+    binning:
+      modes:
+        - adaptive
+        - daily
+        - weekly
+        - monthly
+      adaptive_target_bins: 50
+    entity_inter_event:
+      enabled: true
+      entity_columns:
+        - customer_id
+        - product_id
+  text:
+    embedding_model: sentence-transformers/all-MiniLM-L6-v2
+    cache_embeddings: true
+    max_text_rows: 50000
+    text_columns:
+      - summary
+      - review_text
+  c2st:
+    enabled: true
+    classifiers:
+      - logistic_regression
+      - random_forest
+      - gradient_boosting
+    n_splits: 5
+    metric: auc
