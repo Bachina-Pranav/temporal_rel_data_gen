@@ -60,10 +60,21 @@ class FastSamplerOptions:
     detokenize_after_generation: bool = True
     write_chunk_size: int = 10000
     seed: int | None = None
+    use_config_privacy_controls: bool = True
+    categorical_temperature: float | None = None
+    categorical_top_p: float | None = None
+    summary_temperature: float | None = None
+    review_text_temperature: float | None = None
+    summary_top_p: float | None = None
+    review_text_top_p: float | None = None
     no_repeat_ngram_enabled: bool = False
+    summary_no_repeat_ngram_enabled: bool | None = None
+    review_text_no_repeat_ngram_enabled: bool | None = None
     summary_no_repeat_ngram_size: int = 0
     review_text_no_repeat_ngram_size: int = 0
     exact_train_overlap_blocking_enabled: bool = False
+    summary_exact_blocking_enabled: bool = True
+    review_text_exact_blocking_enabled: bool = True
     max_summary_resample_attempts: int = 0
     max_review_text_resample_attempts: int = 0
     train_text_sets: dict[str, set[str]] | None = None
@@ -129,15 +140,35 @@ def sample_lstm_fast_from_config(
     use_amp, dtype = resolve_autocast(device, options.mixed_precision)
     id_cfg = ckpt_config.raw.get("id_encoding", {})
     num_hash_buckets = int(id_cfg.get("num_buckets", 262144))
-    temperature = sampling_scalar(sampling, "temperature", "categorical", 0.9)
-    top_p = sampling_scalar(sampling, "top_p", "categorical", 0.95)
+    temperature = options.categorical_temperature
+    if temperature is None:
+        temperature = sampling_scalar(sampling, "temperature", "categorical", 0.9)
+    top_p = options.categorical_top_p
+    if top_p is None:
+        top_p = sampling_scalar(sampling, "top_p", "categorical", 0.95)
     text_temperatures = {
-        "summary": sampling_scalar(sampling, "temperature", "summary", temperature),
-        "review_text": sampling_scalar(sampling, "temperature", "review_text", temperature),
+        "summary": (
+            float(options.summary_temperature)
+            if options.summary_temperature is not None
+            else sampling_scalar(sampling, "temperature", "summary", float(temperature))
+        ),
+        "review_text": (
+            float(options.review_text_temperature)
+            if options.review_text_temperature is not None
+            else sampling_scalar(sampling, "temperature", "review_text", float(temperature))
+        ),
     }
     text_top_ps = {
-        "summary": sampling_scalar(sampling, "top_p", "summary", top_p),
-        "review_text": sampling_scalar(sampling, "top_p", "review_text", top_p),
+        "summary": (
+            float(options.summary_top_p)
+            if options.summary_top_p is not None
+            else sampling_scalar(sampling, "top_p", "summary", float(top_p))
+        ),
+        "review_text": (
+            float(options.review_text_top_p)
+            if options.review_text_top_p is not None
+            else sampling_scalar(sampling, "top_p", "review_text", float(top_p))
+        ),
     }
     min_tokens = {
         "summary": int(sampling.get("min_summary_tokens", 1)),
@@ -793,13 +824,19 @@ def no_repeat_ngram_size_for_column(options: FastSamplerOptions, column: str) ->
     if not options.no_repeat_ngram_enabled:
         return 0
     if column == "summary":
+        if options.summary_no_repeat_ngram_enabled is False:
+            return 0
         return int(options.summary_no_repeat_ngram_size or 0)
     if column == "review_text":
+        if options.review_text_no_repeat_ngram_enabled is False:
+            return 0
         return int(options.review_text_no_repeat_ngram_size or 0)
     return 0
 
 
 def block_exact_train_overlaps(texts: list[str], column: str, options: FastSamplerOptions) -> list[str]:
+    if not exact_blocking_enabled_for_column(options, column):
+        return texts
     train_sets = options.train_text_sets or {}
     train_set = train_sets.get(column, set())
     if not train_set:
@@ -830,6 +867,16 @@ def block_exact_train_overlaps(texts: list[str], column: str, options: FastSampl
     return output
 
 
+def exact_blocking_enabled_for_column(options: FastSamplerOptions, column: str) -> bool:
+    if not options.exact_train_overlap_blocking_enabled:
+        return False
+    if column == "summary":
+        return bool(options.summary_exact_blocking_enabled)
+    if column == "review_text":
+        return bool(options.review_text_exact_blocking_enabled)
+    return True
+
+
 def perturb_exact_overlap_text(text: str, attempt: int) -> str:
     suffixes = ["overall", "in practice", "after use", "for me", "as expected"]
     base = str(text).strip()
@@ -844,6 +891,8 @@ def normalize_privacy_text(text: Any) -> str:
 
 
 def build_train_text_sets(config: ConditionalTABDLMConfig, columns: list[str]) -> dict[str, set[str]]:
+    if not columns:
+        return {}
     path = config.train_data_path
     if not path.exists():
         return {column: set() for column in columns}
@@ -869,19 +918,37 @@ def ensure_privacy_counters(options: FastSamplerOptions) -> dict[str, int]:
 
 def hydrate_privacy_options(options: FastSamplerOptions, config: ConditionalTABDLMConfig) -> None:
     sampling = config.raw.get("sampling", {})
-    no_repeat = sampling.get("no_repeat_ngram", {})
-    if bool(no_repeat.get("enabled", False)):
-        options.no_repeat_ngram_enabled = True
-        options.summary_no_repeat_ngram_size = int(no_repeat.get("summary_ngram_size", options.summary_no_repeat_ngram_size or 0))
-        options.review_text_no_repeat_ngram_size = int(no_repeat.get("review_text_ngram_size", options.review_text_no_repeat_ngram_size or 0))
-    overlap = sampling.get("exact_train_overlap_blocking", {})
-    if bool(overlap.get("enabled", False)):
-        options.exact_train_overlap_blocking_enabled = True
-        attempts = overlap.get("max_resample_attempts", {})
-        options.max_summary_resample_attempts = int(attempts.get("summary", options.max_summary_resample_attempts or 0))
-        options.max_review_text_resample_attempts = int(attempts.get("review_text", options.max_review_text_resample_attempts or 0))
+    if options.use_config_privacy_controls:
+        no_repeat = sampling.get("no_repeat_ngram", {})
+        if bool(no_repeat.get("enabled", False)):
+            options.no_repeat_ngram_enabled = True
+            options.summary_no_repeat_ngram_enabled = bool(
+                no_repeat.get("summary_enabled", no_repeat.get("summary_no_repeat_ngram_enabled", True))
+            )
+            options.review_text_no_repeat_ngram_enabled = bool(
+                no_repeat.get("review_text_enabled", no_repeat.get("review_text_no_repeat_ngram_enabled", True))
+            )
+            options.summary_no_repeat_ngram_size = int(no_repeat.get("summary_ngram_size", options.summary_no_repeat_ngram_size or 0))
+            options.review_text_no_repeat_ngram_size = int(no_repeat.get("review_text_ngram_size", options.review_text_no_repeat_ngram_size or 0))
+        overlap = sampling.get("exact_train_overlap_blocking", {})
+        if bool(overlap.get("enabled", False)):
+            options.exact_train_overlap_blocking_enabled = True
+            options.summary_exact_blocking_enabled = bool(
+                overlap.get("summary_enabled", overlap.get("summary_exact_blocking_enabled", options.summary_exact_blocking_enabled))
+            )
+            options.review_text_exact_blocking_enabled = bool(
+                overlap.get("review_text_enabled", overlap.get("review_text_exact_blocking_enabled", options.review_text_exact_blocking_enabled))
+            )
+            attempts = overlap.get("max_resample_attempts", {})
+            options.max_summary_resample_attempts = int(attempts.get("summary", options.max_summary_resample_attempts or 0))
+            options.max_review_text_resample_attempts = int(attempts.get("review_text", options.max_review_text_resample_attempts or 0))
+    if options.summary_no_repeat_ngram_enabled is None:
+        options.summary_no_repeat_ngram_enabled = bool(options.no_repeat_ngram_enabled and options.summary_no_repeat_ngram_size)
+    if options.review_text_no_repeat_ngram_enabled is None:
+        options.review_text_no_repeat_ngram_enabled = bool(options.no_repeat_ngram_enabled and options.review_text_no_repeat_ngram_size)
     if options.exact_train_overlap_blocking_enabled and options.train_text_sets is None:
-        options.train_text_sets = build_train_text_sets(config, list(config.schema.text_targets))
+        columns = [column for column in config.schema.text_targets if exact_blocking_enabled_for_column(options, column)]
+        options.train_text_sets = build_train_text_sets(config, columns)
     ensure_privacy_counters(options)
 
 
@@ -890,9 +957,13 @@ def privacy_summary_fields(options: FastSamplerOptions) -> dict[str, Any]:
     return {
         **counters,
         "no_repeat_ngram_enabled": bool(options.no_repeat_ngram_enabled),
+        "summary_no_repeat_ngram_enabled": bool(no_repeat_ngram_size_for_column(options, "summary")),
+        "review_text_no_repeat_ngram_enabled": bool(no_repeat_ngram_size_for_column(options, "review_text")),
         "summary_no_repeat_ngram_size": int(options.summary_no_repeat_ngram_size or 0),
         "review_text_no_repeat_ngram_size": int(options.review_text_no_repeat_ngram_size or 0),
         "exact_train_overlap_blocking_enabled": bool(options.exact_train_overlap_blocking_enabled),
+        "summary_exact_blocking_enabled": bool(exact_blocking_enabled_for_column(options, "summary")),
+        "review_text_exact_blocking_enabled": bool(exact_blocking_enabled_for_column(options, "review_text")),
     }
 
 
