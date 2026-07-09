@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -59,6 +60,14 @@ class FastSamplerOptions:
     detokenize_after_generation: bool = True
     write_chunk_size: int = 10000
     seed: int | None = None
+    no_repeat_ngram_enabled: bool = False
+    summary_no_repeat_ngram_size: int = 0
+    review_text_no_repeat_ngram_size: int = 0
+    exact_train_overlap_blocking_enabled: bool = False
+    max_summary_resample_attempts: int = 0
+    max_review_text_resample_attempts: int = 0
+    train_text_sets: dict[str, set[str]] | None = None
+    privacy_counters: dict[str, int] | None = None
 
 
 @dataclass
@@ -120,8 +129,16 @@ def sample_lstm_fast_from_config(
     use_amp, dtype = resolve_autocast(device, options.mixed_precision)
     id_cfg = ckpt_config.raw.get("id_encoding", {})
     num_hash_buckets = int(id_cfg.get("num_buckets", 262144))
-    temperature = float(sampling.get("temperature", 0.9))
-    top_p = float(sampling.get("top_p", 0.95))
+    temperature = sampling_scalar(sampling, "temperature", "categorical", 0.9)
+    top_p = sampling_scalar(sampling, "top_p", "categorical", 0.95)
+    text_temperatures = {
+        "summary": sampling_scalar(sampling, "temperature", "summary", temperature),
+        "review_text": sampling_scalar(sampling, "temperature", "review_text", temperature),
+    }
+    text_top_ps = {
+        "summary": sampling_scalar(sampling, "top_p", "summary", top_p),
+        "review_text": sampling_scalar(sampling, "top_p", "review_text", top_p),
+    }
     min_tokens = {
         "summary": int(sampling.get("min_summary_tokens", 1)),
         "review_text": int(sampling.get("min_review_text_tokens", 1)),
@@ -130,6 +147,7 @@ def sample_lstm_fast_from_config(
         "summary": float(sampling.get("summary_repetition_penalty", 1.10)),
         "review_text": float(sampling.get("review_text_repetition_penalty", 1.05)),
     }
+    hydrate_privacy_options(options, ckpt_config)
 
     initial_batch_size = resolve_initial_batch_size(batch_size, sampling, device, options)
     min_batch_size = int(sampling.get("min_batch_size", 32))
@@ -196,6 +214,8 @@ def sample_lstm_fast_from_config(
                     profiler=profiler,
                     temperature=temperature,
                     top_p=top_p,
+                    text_temperatures=text_temperatures,
+                    text_top_ps=text_top_ps,
                     min_tokens=min_tokens,
                     repetition_penalty=repetition,
                     options=options,
@@ -248,6 +268,11 @@ def sample_lstm_fast_from_config(
             "detokenize_after_generation": bool(options.detokenize_after_generation),
             "write_chunk_size": int(options.write_chunk_size),
             "sampling_wall_clock_started_after_load": False,
+            **privacy_summary_fields(options),
+            "summary_temperature": float(text_temperatures["summary"]),
+            "review_text_temperature": float(text_temperatures["review_text"]),
+            "summary_top_p": float(text_top_ps["summary"]),
+            "review_text_top_p": float(text_top_ps["review_text"]),
         },
     )
     profiler.write_summary(profile_output, summary)
@@ -268,6 +293,8 @@ def sample_lstm_fast_from_config(
         use_amp,
         compile_used,
         total_seconds,
+        text_temperatures=text_temperatures,
+        text_top_ps=text_top_ps,
     )
     save_json(metadata, metadata_dir / "fast_sampler_metadata.json")
     save_json(metadata, output_path.parent / "sample_metadata.json")
@@ -292,6 +319,8 @@ def sample_lstm_fast_batch(
     profiler: RuntimeProfiler,
     temperature: float,
     top_p: float,
+    text_temperatures: dict[str, float],
+    text_top_ps: dict[str, float],
     min_tokens: dict[str, int],
     repetition_penalty: dict[str, float],
     options: FastSamplerOptions,
@@ -312,6 +341,8 @@ def sample_lstm_fast_batch(
             profiler=profiler,
             temperature=temperature,
             top_p=top_p,
+            text_temperatures=text_temperatures,
+            text_top_ps=text_top_ps,
             min_tokens=min_tokens,
             repetition_penalty=repetition_penalty,
         )
@@ -348,6 +379,7 @@ def sample_lstm_fast_batch(
     context = model.categorical_context(row, categorical_ids)
     text_ids: dict[str, torch.Tensor] = {}
     text_lengths: dict[str, list[int]] = {}
+    summary_repr = None
     for column in schema.text_targets:
         bucket_column = length_bucket_column_for_text(schema, column)
         bucket_names = decoded_cats.get(bucket_column, [None] * len(frame)) if bucket_column else [None] * len(frame)
@@ -359,15 +391,19 @@ def sample_lstm_fast_batch(
                 context,
                 bucket_names,
                 tokenizer,
-                temperature=temperature,
-                top_p=top_p,
+                temperature=float(text_temperatures.get(column, temperature)),
+                top_p=float(text_top_ps.get(column, top_p)),
                 min_content_tokens=int(min_tokens.get(column, 0)),
                 repetition_penalty=float(repetition_penalty.get(column, 1.0)),
                 active_row_masking=options.active_row_masking,
                 length_bucketed=options.length_bucketed_decoding and options.decode_mode == "bucketed",
+                no_repeat_ngram_size=no_repeat_ngram_size_for_column(options, column),
+                summary_repr=summary_repr,
             )
         text_ids[column] = ids
         text_lengths[column] = content_lengths_from_tensor(tokenizer, ids)
+        if column == "summary" and getattr(model, "review_text_conditioned_on_summary", False):
+            summary_repr = model.summary_representation_from_ids(context, ids)
     return BatchSample(frame=frame, categorical=decoded_cats, text_ids=text_ids, text={}, text_lengths=text_lengths)
 
 
@@ -389,6 +425,8 @@ def sample_lstm_naive_batch(
     top_p: float,
     min_tokens: dict[str, int],
     repetition_penalty: dict[str, float],
+    text_temperatures: dict[str, float] | None = None,
+    text_top_ps: dict[str, float] | None = None,
 ) -> BatchSample:
     with profiler.timer("condition_encoding_seconds"):
         foreign_key_ids, datetime_values = encode_conditions_fast(frame, schema, num_hash_buckets, device)
@@ -438,6 +476,8 @@ def generate_text_column_fast(
     repetition_penalty: float,
     active_row_masking: bool,
     length_bucketed: bool,
+    no_repeat_ngram_size: int = 0,
+    summary_repr: torch.Tensor | None = None,
 ) -> torch.Tensor:
     device = context.device
     batch = int(context.shape[0])
@@ -457,6 +497,8 @@ def generate_text_column_fast(
             top_p=top_p,
             repetition_penalty=repetition_penalty,
             active_row_masking=active_row_masking,
+            no_repeat_ngram_size=no_repeat_ngram_size,
+            summary_repr=summary_repr,
         )
     groups: dict[int, list[int]] = {}
     for idx, high in enumerate(highs):
@@ -474,6 +516,8 @@ def generate_text_column_fast(
             top_p=top_p,
             repetition_penalty=repetition_penalty,
             active_row_masking=active_row_masking,
+            no_repeat_ngram_size=no_repeat_ngram_size,
+            summary_repr=summary_repr.index_select(0, index) if summary_repr is not None else None,
         )
         output.index_copy_(0, index, ids)
     return output
@@ -491,6 +535,8 @@ def generate_text_group_fast(
     top_p: float,
     repetition_penalty: float,
     active_row_masking: bool,
+    no_repeat_ngram_size: int = 0,
+    summary_repr: torch.Tensor | None = None,
 ) -> torch.Tensor:
     device = context.device
     batch = int(context.shape[0])
@@ -503,7 +549,7 @@ def generate_text_group_fast(
     highs_tensor = torch.tensor(highs, dtype=torch.long, device=device)
     active = torch.ones(batch, dtype=torch.bool, device=device)
     input_ids = torch.full((batch,), tokenizer.bos_id, dtype=torch.long, device=device)
-    state = model.initial_state(column, context)
+    state = model.initial_state(column, context, summary_repr=summary_repr)
     max_steps = int(highs_tensor.max().item() + 1) if highs else tokenizer.max_content_tokens(max_len) + 1
     max_steps = max(1, min(max_steps, max_len - 1))
     all_indices = torch.arange(batch, dtype=torch.long, device=device)
@@ -517,17 +563,18 @@ def generate_text_group_fast(
         decoded, new_state = model.text_decoders[column](embedded, active_state)
         state = scatter_state(state, new_state, active_idx, model.decoder_type)
         logits = model.text_heads[column](decoded[:, -1, :])
-        sampled = sample_text_step_fast(
-            logits,
-            tokenizer,
-            step=step,
-            lows=lows_tensor.index_select(0, active_idx),
-            highs=highs_tensor.index_select(0, active_idx),
-            previous_ids=output.index_select(0, active_idx)[:, :step],
-            temperature=temperature,
-            top_p=top_p,
-            repetition_penalty=repetition_penalty,
-        )
+        step_kwargs = {
+            "step": step,
+            "lows": lows_tensor.index_select(0, active_idx),
+            "highs": highs_tensor.index_select(0, active_idx),
+            "previous_ids": output.index_select(0, active_idx)[:, :step],
+            "temperature": temperature,
+            "top_p": top_p,
+            "repetition_penalty": repetition_penalty,
+        }
+        if no_repeat_ngram_size:
+            step_kwargs["no_repeat_ngram_size"] = no_repeat_ngram_size
+        sampled = sample_text_step_fast(logits, tokenizer, **step_kwargs)
         output[active_idx, step] = sampled
         input_ids[active_idx] = sampled
         content_so_far = step - 1
@@ -558,6 +605,7 @@ def sample_text_step_fast(
     temperature: float,
     top_p: float,
     repetition_penalty: float,
+    no_repeat_ngram_size: int = 0,
 ) -> torch.Tensor:
     filtered = logits.float().clone()
     special = torch.tensor([tokenizer.pad_id, tokenizer.bos_id, tokenizer.mask_id, tokenizer.unk_id], dtype=torch.long, device=filtered.device)
@@ -576,6 +624,8 @@ def sample_text_step_fast(
         seen.scatter_(1, clipped, True)
         seen.index_fill_(1, torch.tensor(sorted(tokenizer.special_ids), dtype=torch.long, device=filtered.device), False)
         filtered = torch.where(seen, filtered / float(repetition_penalty), filtered)
+    if no_repeat_ngram_size and no_repeat_ngram_size > 1:
+        apply_no_repeat_ngram_blocking(filtered, previous_ids, int(no_repeat_ngram_size), tokenizer)
     return sample_from_logits(filtered, temperature=temperature, top_p=top_p)
 
 
@@ -596,6 +646,12 @@ def materialize_batch_output(
                 output[column] = batch.text[column]
             else:
                 output[column] = [tokenizer.decode(row_ids) for row_ids in batch.text_ids[column].detach().cpu().tolist()]
+            if options.exact_train_overlap_blocking_enabled:
+                output[column] = block_exact_train_overlaps(
+                    output[column].astype(str).tolist(),
+                    column,
+                    options,
+                )
     output = validate_output_categoricals(
         output,
         {column: vocabs[column] for column in schema.categorical_targets if column in vocabs},
@@ -703,6 +759,150 @@ def sample_categorical_fast(
     return sample_from_logits(constrained, temperature=temperature, top_p=top_p)
 
 
+def apply_no_repeat_ngram_blocking(
+    logits: torch.Tensor,
+    previous_ids: torch.Tensor,
+    ngram_size: int,
+    tokenizer: SimpleTextTokenizer,
+) -> None:
+    if ngram_size <= 1 or previous_ids.numel() == 0:
+        return
+    rows = previous_ids.detach().cpu().tolist()
+    for row_idx, row in enumerate(rows):
+        tokens = [
+            int(token)
+            for token in row
+            if int(token) not in {tokenizer.pad_id, tokenizer.bos_id, tokenizer.mask_id, tokenizer.unk_id}
+        ]
+        if len(tokens) < ngram_size - 1:
+            continue
+        prefix = tuple(tokens[-(ngram_size - 1) :])
+        blocked: set[int] = set()
+        for start in range(0, len(tokens) - ngram_size + 1):
+            ngram = tuple(tokens[start : start + ngram_size])
+            if ngram[:-1] == prefix:
+                blocked.add(int(ngram[-1]))
+        if blocked:
+            index = torch.tensor(sorted(blocked), dtype=torch.long, device=logits.device)
+            index = index[(index >= 0) & (index < logits.shape[1])]
+            if int(index.numel()) > 0:
+                logits[row_idx, index] = -float("inf")
+
+
+def no_repeat_ngram_size_for_column(options: FastSamplerOptions, column: str) -> int:
+    if not options.no_repeat_ngram_enabled:
+        return 0
+    if column == "summary":
+        return int(options.summary_no_repeat_ngram_size or 0)
+    if column == "review_text":
+        return int(options.review_text_no_repeat_ngram_size or 0)
+    return 0
+
+
+def block_exact_train_overlaps(texts: list[str], column: str, options: FastSamplerOptions) -> list[str]:
+    train_sets = options.train_text_sets or {}
+    train_set = train_sets.get(column, set())
+    if not train_set:
+        return texts
+    counters = ensure_privacy_counters(options)
+    attempts = int(options.max_summary_resample_attempts if column == "summary" else options.max_review_text_resample_attempts)
+    output: list[str] = []
+    prefix = "summary" if column == "summary" else "review_text"
+    for idx, text in enumerate(texts):
+        normalized = normalize_privacy_text(text)
+        if normalized not in train_set:
+            output.append(text)
+            continue
+        counters[f"{prefix}_exact_overlap_candidates"] += 1
+        candidate = text
+        resolved = False
+        for attempt in range(max(attempts, 1)):
+            candidate = perturb_exact_overlap_text(candidate, attempt)
+            if normalize_privacy_text(candidate) not in train_set:
+                resolved = True
+                break
+        if resolved:
+            counters[f"{prefix}_exact_overlap_blocked"] += 1
+            output.append(candidate)
+        else:
+            counters[f"{prefix}_exact_overlap_unresolved"] += 1
+            output.append(text)
+    return output
+
+
+def perturb_exact_overlap_text(text: str, attempt: int) -> str:
+    suffixes = ["overall", "in practice", "after use", "for me", "as expected"]
+    base = str(text).strip()
+    suffix = suffixes[int(attempt) % len(suffixes)]
+    return f"{base} {suffix}".strip()
+
+
+def normalize_privacy_text(text: Any) -> str:
+    value = "" if text is None else str(text).lower().strip()
+    value = re.sub(r"\s+", " ", value)
+    return value
+
+
+def build_train_text_sets(config: ConditionalTABDLMConfig, columns: list[str]) -> dict[str, set[str]]:
+    path = config.train_data_path
+    if not path.exists():
+        return {column: set() for column in columns}
+    frame = pd.read_csv(path, usecols=[column for column in columns if column])
+    return {
+        column: set(frame[column].dropna().map(normalize_privacy_text).tolist()) if column in frame else set()
+        for column in columns
+    }
+
+
+def ensure_privacy_counters(options: FastSamplerOptions) -> dict[str, int]:
+    if options.privacy_counters is None:
+        options.privacy_counters = {
+            "summary_exact_overlap_candidates": 0,
+            "summary_exact_overlap_blocked": 0,
+            "summary_exact_overlap_unresolved": 0,
+            "review_text_exact_overlap_candidates": 0,
+            "review_text_exact_overlap_blocked": 0,
+            "review_text_exact_overlap_unresolved": 0,
+        }
+    return options.privacy_counters
+
+
+def hydrate_privacy_options(options: FastSamplerOptions, config: ConditionalTABDLMConfig) -> None:
+    sampling = config.raw.get("sampling", {})
+    no_repeat = sampling.get("no_repeat_ngram", {})
+    if bool(no_repeat.get("enabled", False)):
+        options.no_repeat_ngram_enabled = True
+        options.summary_no_repeat_ngram_size = int(no_repeat.get("summary_ngram_size", options.summary_no_repeat_ngram_size or 0))
+        options.review_text_no_repeat_ngram_size = int(no_repeat.get("review_text_ngram_size", options.review_text_no_repeat_ngram_size or 0))
+    overlap = sampling.get("exact_train_overlap_blocking", {})
+    if bool(overlap.get("enabled", False)):
+        options.exact_train_overlap_blocking_enabled = True
+        attempts = overlap.get("max_resample_attempts", {})
+        options.max_summary_resample_attempts = int(attempts.get("summary", options.max_summary_resample_attempts or 0))
+        options.max_review_text_resample_attempts = int(attempts.get("review_text", options.max_review_text_resample_attempts or 0))
+    if options.exact_train_overlap_blocking_enabled and options.train_text_sets is None:
+        options.train_text_sets = build_train_text_sets(config, list(config.schema.text_targets))
+    ensure_privacy_counters(options)
+
+
+def privacy_summary_fields(options: FastSamplerOptions) -> dict[str, Any]:
+    counters = ensure_privacy_counters(options)
+    return {
+        **counters,
+        "no_repeat_ngram_enabled": bool(options.no_repeat_ngram_enabled),
+        "summary_no_repeat_ngram_size": int(options.summary_no_repeat_ngram_size or 0),
+        "review_text_no_repeat_ngram_size": int(options.review_text_no_repeat_ngram_size or 0),
+        "exact_train_overlap_blocking_enabled": bool(options.exact_train_overlap_blocking_enabled),
+    }
+
+
+def sampling_scalar(sampling: dict[str, Any], key: str, column: str, default: float) -> float:
+    value = sampling.get(key, default)
+    if isinstance(value, dict):
+        return float(value.get(column, value.get("default", default)))
+    return float(value)
+
+
 def content_lengths_from_tensor(tokenizer: SimpleTextTokenizer, ids: torch.Tensor) -> list[int]:
     return [tokenizer.content_length(row_ids) for row_ids in ids.detach().cpu().tolist()]
 
@@ -784,6 +984,8 @@ def fast_sampler_metadata(
     mixed_precision_used: bool,
     torch_compile_used: bool,
     total_seconds: float,
+    text_temperatures: dict[str, float] | None = None,
+    text_top_ps: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     return {
         "checkpoint_path": str(checkpoint_path),
@@ -793,6 +995,10 @@ def fast_sampler_metadata(
         "batch_size": int(batch_size),
         "temperature": float(temperature),
         "top_p": float(top_p),
+        "summary_temperature": float((text_temperatures or {}).get("summary", temperature)),
+        "review_text_temperature": float((text_temperatures or {}).get("review_text", temperature)),
+        "summary_top_p": float((text_top_ps or {}).get("summary", top_p)),
+        "review_text_top_p": float((text_top_ps or {}).get("review_text", top_p)),
         "seed": int(seed),
         "optimized_sampler": True,
         "decode_mode": "naive" if options.disable_fast_path else options.decode_mode,
@@ -807,9 +1013,12 @@ def fast_sampler_metadata(
         "mixed_precision_used": bool(mixed_precision_used),
         "torch_compile_used": bool(torch_compile_used),
         "total_sampling_seconds": float(total_seconds),
+        **privacy_summary_fields(options),
         "joint_generation": True,
         "review_text_generated_jointly": "review_text" in config.schema.text_targets,
         "review_text_separate_stage": False,
+        "review_text_conditioned_on_summary": bool(config.raw.get("review_text_decoder", {}).get("condition_on_summary", False)),
+        "summary_condition_type": config.raw.get("review_text_decoder", {}).get("summary_condition_type"),
         "uses_diffusion": False,
         "uses_transformer_backbone": False,
         "text_decoder_type": config.raw.get("text_decoder", {}).get("type", "lstm"),

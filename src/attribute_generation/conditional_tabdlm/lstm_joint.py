@@ -69,6 +69,12 @@ class JointLSTMRelationalAttributeGenerator(nn.Module):
         dropout: float = 0.1,
         decoder_type: str = "lstm",
         use_graph_context: bool = True,
+        review_text_conditioned_on_summary: bool = False,
+        summary_condition_type: str = "final_hidden_plus_mean_pool",
+        summary_condition_dim: int = 384,
+        summary_condition_dropout: float = 0.1,
+        decoder_input_token_dropout: dict[str, float] | None = None,
+        decoder_input_token_dropout_replacement: str = "UNK",
     ):
         super().__init__()
         self.schema = schema
@@ -87,6 +93,13 @@ class JointLSTMRelationalAttributeGenerator(nn.Module):
         self.use_graph_context = bool(use_graph_context)
         self.text_vocab_size = int(text_tokenizer.vocab_size)
         self.text_pad_id = int(text_tokenizer.pad_id)
+        self.review_text_conditioned_on_summary = bool(review_text_conditioned_on_summary)
+        self.summary_condition_type = str(summary_condition_type)
+        self.summary_condition_dim = int(summary_condition_dim)
+        self.summary_condition_dropout = float(summary_condition_dropout)
+        self.decoder_input_token_dropout = dict(decoder_input_token_dropout or {})
+        self.decoder_input_token_dropout_replacement = str(decoder_input_token_dropout_replacement)
+        self.last_token_dropout_rates: dict[str, float] = {}
 
         self.foreign_key_embeddings = nn.ModuleList(
             [nn.Embedding(self.num_hash_buckets, self.id_embedding_dim) for _ in schema.foreign_key_columns]
@@ -127,6 +140,13 @@ class JointLSTMRelationalAttributeGenerator(nn.Module):
         self.text_heads = nn.ModuleDict()
         self.text_initializers = nn.ModuleDict()
         decoder_context_dim = self.row_hidden_dim + len(schema.model_categorical_targets) * self.categorical_context_dim
+        self.decoder_context_dim = int(decoder_context_dim)
+        self.summary_condition_projector = nn.Sequential(
+            nn.Linear(self.text_hidden_dim * 2, self.summary_condition_dim),
+            nn.GELU(),
+            nn.Dropout(self.summary_condition_dropout),
+            nn.LayerNorm(self.summary_condition_dim),
+        )
         state_multiplier = 2 if self.decoder_type == "lstm" else 1
         for column in schema.text_targets:
             if self.decoder_type == "gru":
@@ -146,8 +166,11 @@ class JointLSTMRelationalAttributeGenerator(nn.Module):
                     dropout=self.dropout if self.text_num_layers > 1 else 0.0,
                 )
             self.text_heads[column] = nn.Linear(self.text_hidden_dim, self.text_vocab_size)
+            initializer_context_dim = decoder_context_dim
+            if column == "review_text" and self.review_text_conditioned_on_summary:
+                initializer_context_dim += self.summary_condition_dim
             self.text_initializers[column] = nn.Sequential(
-                nn.Linear(decoder_context_dim, self.text_hidden_dim * self.text_num_layers * state_multiplier),
+                nn.Linear(initializer_context_dim, self.text_hidden_dim * self.text_num_layers * state_multiplier),
                 nn.Tanh(),
             )
 
@@ -188,8 +211,25 @@ class JointLSTMRelationalAttributeGenerator(nn.Module):
             pieces.append(self.categorical_context_embeddings[column](categorical_ids[:, idx]))
         return torch.cat(pieces, dim=1)
 
-    def initial_state(self, column: str, context: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor] | torch.Tensor:
-        projected = self.text_initializers[column](context)
+    def decoder_context(self, column: str, context: torch.Tensor, summary_repr: torch.Tensor | None = None) -> torch.Tensor:
+        if column == "review_text" and self.review_text_conditioned_on_summary:
+            if summary_repr is None:
+                summary_repr = torch.zeros(
+                    context.shape[0],
+                    self.summary_condition_dim,
+                    dtype=context.dtype,
+                    device=context.device,
+                )
+            return torch.cat([context, summary_repr.to(dtype=context.dtype)], dim=1)
+        return context
+
+    def initial_state(
+        self,
+        column: str,
+        context: torch.Tensor,
+        summary_repr: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor] | torch.Tensor:
+        projected = self.text_initializers[column](self.decoder_context(column, context, summary_repr=summary_repr))
         batch = int(context.shape[0])
         if self.decoder_type == "gru":
             return projected.view(batch, self.text_num_layers, self.text_hidden_dim).transpose(0, 1).contiguous()
@@ -197,6 +237,49 @@ class JointLSTMRelationalAttributeGenerator(nn.Module):
         hidden = projected[:, 0].transpose(0, 1).contiguous()
         cell = projected[:, 1].transpose(0, 1).contiguous()
         return hidden, cell
+
+    def apply_decoder_input_token_dropout(self, column: str, teacher: torch.Tensor) -> torch.Tensor:
+        rate = float(self.decoder_input_token_dropout.get(column, 0.0) or 0.0)
+        self.last_token_dropout_rates[column] = 0.0
+        if not self.training or rate <= 0.0 or teacher.numel() == 0:
+            return teacher
+        replacement = self.text_pad_id
+        if self.decoder_input_token_dropout_replacement.upper() == "MASK":
+            replacement = 2
+        elif self.decoder_input_token_dropout_replacement.upper() == "UNK":
+            replacement = 3
+        special_ids = {self.text_pad_id, 1, 2, 3, 4}
+        eligible = torch.ones_like(teacher, dtype=torch.bool)
+        for token_id in special_ids:
+            eligible &= teacher != int(token_id)
+        mask = (torch.rand_like(teacher.float()) < rate) & eligible
+        if bool(mask.any()):
+            teacher = teacher.clone()
+            teacher[mask] = int(replacement)
+        denom = max(int(eligible.sum().detach().cpu()), 1)
+        self.last_token_dropout_rates[column] = float(mask.sum().detach().cpu()) / float(denom)
+        return teacher
+
+    def summary_representation_from_output(
+        self,
+        summary_output: torch.Tensor,
+        summary_state: Any,
+        summary_input_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        if str(self.decoder_type) == "gru":
+            final_hidden = summary_state[-1]
+        else:
+            final_hidden = summary_state[0][-1]
+        mask = (summary_input_ids != self.text_pad_id).to(dtype=summary_output.dtype).unsqueeze(-1)
+        pooled = (summary_output * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
+        combined = torch.cat([final_hidden, pooled], dim=1)
+        return self.summary_condition_projector(combined)
+
+    def summary_representation_from_ids(self, context: torch.Tensor, summary_ids: torch.Tensor) -> torch.Tensor:
+        teacher = summary_ids[:, :-1].contiguous()
+        embedded = self.text_embedding(teacher)
+        output, state = self.text_decoders["summary"](embedded, self.initial_state("summary", context))
+        return self.summary_representation_from_output(output, state, teacher)
 
     def forward(
         self,
@@ -212,11 +295,15 @@ class JointLSTMRelationalAttributeGenerator(nn.Module):
         cat_logits = self.categorical_logits(row)
         context = self.categorical_context(row, categorical_ids)
         text_logits: dict[str, torch.Tensor] = {}
+        summary_repr = None
         for column in self.schema.text_targets:
             teacher = text_ids[column][:, :-1].contiguous()
-            embedded = self.text_embedding(teacher)
-            output, _ = self.text_decoders[column](embedded, self.initial_state(column, context))
+            teacher_input = self.apply_decoder_input_token_dropout(column, teacher)
+            embedded = self.text_embedding(teacher_input)
+            output, state = self.text_decoders[column](embedded, self.initial_state(column, context, summary_repr=summary_repr))
             text_logits[column] = self.text_heads[column](output)
+            if column == "summary" and self.review_text_conditioned_on_summary:
+                summary_repr = self.summary_representation_from_output(output, state, teacher)
         return {"categorical": cat_logits, "text": text_logits, "row_latent": row}
 
     @torch.no_grad()
@@ -250,6 +337,7 @@ class JointLSTMRelationalAttributeGenerator(nn.Module):
         text_ids: dict[str, torch.Tensor] = {}
         decoded_text: dict[str, list[str]] = {}
         lengths: dict[str, list[int]] = {}
+        summary_repr = None
         for column in self.schema.text_targets:
             bucket_column = length_bucket_column_for_text(self.schema, column)
             bucket_names = decoded_cats.get(bucket_column, [None] * int(foreign_key_ids.shape[0])) if bucket_column else [None] * int(foreign_key_ids.shape[0])
@@ -262,10 +350,13 @@ class JointLSTMRelationalAttributeGenerator(nn.Module):
                 top_p=top_p,
                 min_content_tokens=int(min_tokens.get(column, 0)),
                 repetition_penalty=float(repetition_penalty.get(column, 1.0)),
+                summary_repr=summary_repr,
             )
             text_ids[column] = ids
             decoded_text[column] = [tokenizer.decode(row_ids) for row_ids in ids.detach().cpu().tolist()]
             lengths[column] = [tokenizer.content_length(row_ids) for row_ids in ids.detach().cpu().tolist()]
+            if column == "summary" and self.review_text_conditioned_on_summary:
+                summary_repr = self.summary_representation_from_ids(context, ids)
         return {
             "categorical_ids": categorical_ids,
             "categorical": decoded_cats,
@@ -285,6 +376,7 @@ class JointLSTMRelationalAttributeGenerator(nn.Module):
         top_p: float,
         min_content_tokens: int,
         repetition_penalty: float,
+        summary_repr: torch.Tensor | None = None,
     ) -> torch.Tensor:
         device = context.device
         batch = int(context.shape[0])
@@ -295,7 +387,7 @@ class JointLSTMRelationalAttributeGenerator(nn.Module):
         output[:, 0] = tokenizer.bos_id
         active = torch.ones(batch, dtype=torch.bool, device=device)
         input_ids = torch.full((batch,), tokenizer.bos_id, dtype=torch.long, device=device)
-        state = self.initial_state(column, context)
+        state = self.initial_state(column, context, summary_repr=summary_repr)
         max_steps = int(max(highs) + 1) if highs else max_content + 1
         max_steps = max(1, min(max_steps, max_len - 1))
         for step in range(1, max_steps + 1):
@@ -354,6 +446,9 @@ class JointLSTMRelationalAttributeGenerator(nn.Module):
             "decoder_type": self.decoder_type,
             "use_graph_context": self.use_graph_context,
             "text_vocab_size": self.text_vocab_size,
+            "review_text_conditioned_on_summary": self.review_text_conditioned_on_summary,
+            "summary_condition_type": self.summary_condition_type,
+            "summary_condition_dim": self.summary_condition_dim,
         }
 
 
@@ -379,6 +474,14 @@ def build_lstm_model(
     id_cfg = config.raw.get("id_encoding", {})
     dt_cfg = config.raw.get("datetime_encoding", {})
     decoder_cfg = config.raw.get("text_decoder", {})
+    review_decoder_cfg = config.raw.get("review_text_decoder", {})
+    token_dropout_cfg = config.raw.get("training_regularization", {}).get("decoder_input_token_dropout", {})
+    token_dropout = {}
+    if bool(token_dropout_cfg.get("enabled", False)):
+        token_dropout = {
+            "summary": float(token_dropout_cfg.get("summary", 0.0) or 0.0),
+            "review_text": float(token_dropout_cfg.get("review_text", 0.0) or 0.0),
+        }
     return JointLSTMRelationalAttributeGenerator(
         schema=config.schema,
         categorical_vocabs=categorical_vocabs,
@@ -396,6 +499,12 @@ def build_lstm_model(
         dropout=float(model_cfg.get("dropout", decoder_cfg.get("dropout", 0.1))),
         decoder_type=str(decoder_cfg.get("type", "lstm")),
         use_graph_context=bool(model_cfg.get("use_graph_context", graph_conditioning_enabled(config.raw))),
+        review_text_conditioned_on_summary=bool(review_decoder_cfg.get("condition_on_summary", False)),
+        summary_condition_type=str(review_decoder_cfg.get("summary_condition_type", "final_hidden_plus_mean_pool")),
+        summary_condition_dim=int(review_decoder_cfg.get("summary_condition_dim", decoder_cfg.get("hidden_dim", 384))),
+        summary_condition_dropout=float(review_decoder_cfg.get("summary_condition_dropout", 0.1)),
+        decoder_input_token_dropout=token_dropout,
+        decoder_input_token_dropout_replacement=str(token_dropout_cfg.get("replacement", "UNK")),
     )
 
 
@@ -493,8 +602,11 @@ def _train_lstm_from_config_once(
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     clip_norm = float(training.get("gradient_clip_norm", 1.0))
     log_path = output_dir / "train_log.jsonl"
+    metrics_log_path = ensure_dir(output_dir / "logs") / "train_metrics.jsonl"
     if log_path.exists():
         log_path.unlink()
+    if metrics_log_path.exists():
+        metrics_log_path.unlink()
     best_valid = float("inf")
     best_path = checkpoint_dir / "best.pt"
     last_path = checkpoint_dir / "last.pt"
@@ -546,6 +658,7 @@ def _train_lstm_from_config_once(
             "epochs_without_improvement": 0 if improved else without_improvement + 1,
         }
         append_jsonl(log_path, row)
+        append_jsonl(metrics_log_path, row)
         print(json.dumps(row, sort_keys=True))
         save_lstm_checkpoint(last_path, model, config, categorical_vocabs, tokenizer, epoch, valid_metrics, graph_encoder=graph_encoder)
         if improved:
@@ -650,7 +763,7 @@ def run_lstm_epoch(
                 batch["text_ids"],
                 graph_context=graph_context,
             )
-            loss, component = lstm_joint_loss(logits, batch, model.schema, loss_weights, tokenizer, length_class_weights)
+            loss, component = lstm_joint_loss(logits, batch, model.schema, loss_weights, tokenizer, length_class_weights, config=config)
         if training:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -661,15 +774,27 @@ def run_lstm_epoch(
             totals[key] = totals.get(key, 0.0) + float(stats["loss_sum"])
             counts[key] = counts.get(key, 0.0) + float(stats["count"])
             corrects[key] = corrects.get(key, 0) + int(stats.get("correct", 0))
+        if training:
+            for column, rate in model.last_token_dropout_rates.items():
+                metric_key = f"token_dropout_{column}_rate"
+                totals[metric_key] = totals.get(metric_key, 0.0) + float(rate)
+                counts[metric_key] = counts.get(metric_key, 0.0) + 1.0
     metrics: dict[str, float] = {}
     total = 0.0
     for key in sorted(totals):
         count = max(float(counts.get(key, 0.0)), 1.0)
         value = float(totals[key] / count)
+        if key.startswith("token_dropout_"):
+            metrics[key] = value
+            continue
         metrics[f"{key}_loss"] = value
         total += float(loss_weights.get(key, 1.0)) * value
         if key in model.schema.model_categorical_targets:
             metrics[f"{key}_accuracy"] = float(corrects.get(key, 0) / count)
+    smoothing = text_label_smoothing_from_config(config)
+    for column, value in smoothing.items():
+        metric_key = "label_smoothing_summary" if column == "summary" else f"label_smoothing_{column}"
+        metrics[metric_key] = float(value)
     metrics["total_loss"] = float(total)
     return metrics
 
@@ -681,6 +806,7 @@ def lstm_joint_loss(
     loss_weights: dict[str, float],
     tokenizer: SimpleTextTokenizer,
     length_class_weights: dict[str, torch.Tensor] | None = None,
+    config: ConditionalTABDLMConfig | None = None,
 ) -> tuple[torch.Tensor, dict[str, dict[str, float | int]]]:
     losses: list[torch.Tensor] = []
     component: dict[str, dict[str, float | int]] = {}
@@ -705,6 +831,7 @@ def lstm_joint_loss(
             labels.reshape(-1),
             ignore_index=tokenizer.pad_id,
             reduction="sum",
+            label_smoothing=float(text_label_smoothing_for_column(config, column)),
         )
         key = "summary_text" if column == "summary" else column
         losses.append(float(loss_weights.get(key, loss_weights.get(column, 1.0))) * (ce / max(count, 1)))
@@ -713,6 +840,22 @@ def lstm_joint_loss(
         zero = batch["foreign_key_ids"].float().sum() * 0.0
         return zero, {}
     return torch.stack(losses).sum(), component
+
+
+def text_label_smoothing_from_config(config: ConditionalTABDLMConfig | None) -> dict[str, float]:
+    if config is None:
+        return {}
+    smoothing_cfg = config.raw.get("loss", {}).get("text_label_smoothing", {})
+    if not bool(smoothing_cfg.get("enabled", False)):
+        return {}
+    return {
+        "summary": float(smoothing_cfg.get("summary", 0.0) or 0.0),
+        "review_text": float(smoothing_cfg.get("review_text", 0.0) or 0.0),
+    }
+
+
+def text_label_smoothing_for_column(config: ConditionalTABDLMConfig | None, column: str) -> float:
+    return float(text_label_smoothing_from_config(config).get(column, 0.0))
 
 
 def metric_name_for_lstm(column: str) -> str:
@@ -899,10 +1042,20 @@ def sample_lstm_from_config(
 def write_lstm_model_metadata(config: ConditionalTABDLMConfig, metadata_dir: str | Path) -> None:
     graph_flags = graph_metadata(config.raw, real_graph_used_at_sampling=False)
     review_cfg = config.raw.get("review_text", {})
+    review_decoder_cfg = config.raw.get("review_text_decoder", {})
+    smoothing_cfg = config.raw.get("loss", {}).get("text_label_smoothing", {})
+    token_dropout_cfg = config.raw.get("training_regularization", {}).get("decoder_input_token_dropout", {})
+    no_repeat_cfg = config.raw.get("sampling", {}).get("no_repeat_ngram", {})
+    overlap_cfg = config.raw.get("sampling", {}).get("exact_train_overlap_blocking", {})
+    summary_temperature = sampling_value_for_metadata(config.raw.get("sampling", {}), "temperature", "summary", 0.9)
+    review_temperature = sampling_value_for_metadata(config.raw.get("sampling", {}), "temperature", "review_text", 0.9)
+    summary_top_p = sampling_value_for_metadata(config.raw.get("sampling", {}), "top_p", "summary", 0.95)
+    review_top_p = sampling_value_for_metadata(config.raw.get("sampling", {}), "top_p", "review_text", 0.95)
     auto_review = config.raw.get("_auto_text_length_metadata", {}).get("review_text", {})
     loss_weights = dict(config.raw.get("loss_weights", {}))
     metadata: dict[str, Any] = {
         "experiment_name": config.raw.get("experiment_name", Path(config.output_dir).name),
+        "base_experiment": config.raw.get("base_experiment"),
         "model_family": "joint_lstm_generator",
         "base_graph_model": "v2_structure_only_temporal_graph",
         "joint_generation": True,
@@ -911,6 +1064,8 @@ def write_lstm_model_metadata(config: ConditionalTABDLMConfig, metadata_dir: str
         "uses_diffusion": False,
         "uses_transformer_backbone": False,
         "text_decoder_type": config.raw.get("text_decoder", {}).get("type", "lstm"),
+        "review_text_conditioned_on_summary": bool(review_decoder_cfg.get("condition_on_summary", False)),
+        "summary_condition_type": review_decoder_cfg.get("summary_condition_type", "none"),
         "condition_columns": list(config.schema.condition_columns),
         "target_columns": {
             "categorical": list(config.schema.categorical_targets),
@@ -926,6 +1081,24 @@ def write_lstm_model_metadata(config: ConditionalTABDLMConfig, metadata_dir: str
             "review_text_length": float(loss_weights.get("review_text_length", 1.0)),
             "summary_text": float(loss_weights.get("summary_text", 1.0)),
             "review_text": float(loss_weights.get("review_text", 1.0)),
+        },
+        "regularization": {
+            "text_label_smoothing_enabled": bool(smoothing_cfg.get("enabled", False)),
+            "summary_label_smoothing": float(smoothing_cfg.get("summary", 0.0) or 0.0),
+            "review_text_label_smoothing": float(smoothing_cfg.get("review_text", 0.0) or 0.0),
+            "decoder_input_token_dropout_enabled": bool(token_dropout_cfg.get("enabled", False)),
+            "summary_token_dropout": float(token_dropout_cfg.get("summary", 0.0) or 0.0),
+            "review_text_token_dropout": float(token_dropout_cfg.get("review_text", 0.0) or 0.0),
+        },
+        "sampling_privacy_controls": {
+            "exact_train_overlap_blocking_enabled": bool(overlap_cfg.get("enabled", False)),
+            "no_repeat_ngram_enabled": bool(no_repeat_cfg.get("enabled", False)),
+            "summary_no_repeat_ngram_size": int(no_repeat_cfg.get("summary_ngram_size", 0) or 0),
+            "review_text_no_repeat_ngram_size": int(no_repeat_cfg.get("review_text_ngram_size", 0) or 0),
+            "summary_temperature": float(summary_temperature),
+            "review_text_temperature": float(review_temperature),
+            "summary_top_p": float(summary_top_p),
+            "review_text_top_p": float(review_top_p),
         },
         "graph_conditioning_mode": "structure_only_temporal",
         "temporal_filter_enabled": True,
@@ -950,6 +1123,13 @@ def write_lstm_model_metadata(config: ConditionalTABDLMConfig, metadata_dir: str
     save_json(metadata, Path(metadata_dir) / "model_metadata.json")
     if auto_review:
         save_json(auto_review, Path(metadata_dir) / "review_text_length_stats.json")
+
+
+def sampling_value_for_metadata(sampling: dict[str, Any], key: str, column: str, default: float) -> float:
+    value = sampling.get(key, default)
+    if isinstance(value, dict):
+        return float(value.get(column, value.get("default", default)))
+    return float(value)
 
 
 def runtime_metadata(
