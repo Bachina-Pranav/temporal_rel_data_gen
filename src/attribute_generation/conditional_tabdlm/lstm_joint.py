@@ -141,11 +141,15 @@ class JointLSTMRelationalAttributeGenerator(nn.Module):
         self.text_initializers = nn.ModuleDict()
         decoder_context_dim = self.row_hidden_dim + len(schema.model_categorical_targets) * self.categorical_context_dim
         self.decoder_context_dim = int(decoder_context_dim)
-        self.summary_condition_projector = nn.Sequential(
-            nn.Linear(self.text_hidden_dim * 2, self.summary_condition_dim),
-            nn.GELU(),
-            nn.Dropout(self.summary_condition_dropout),
-            nn.LayerNorm(self.summary_condition_dim),
+        self.summary_condition_projector = (
+            nn.Sequential(
+                nn.Linear(self.text_hidden_dim * 2, self.summary_condition_dim),
+                nn.GELU(),
+                nn.Dropout(self.summary_condition_dropout),
+                nn.LayerNorm(self.summary_condition_dim),
+            )
+            if self.review_text_conditioned_on_summary
+            else None
         )
         state_multiplier = 2 if self.decoder_type == "lstm" else 1
         for column in schema.text_targets:
@@ -266,6 +270,8 @@ class JointLSTMRelationalAttributeGenerator(nn.Module):
         summary_state: Any,
         summary_input_ids: torch.Tensor,
     ) -> torch.Tensor:
+        if self.summary_condition_projector is None:
+            raise RuntimeError("summary_condition_projector is unavailable when review_text_conditioned_on_summary is false")
         if str(self.decoder_type) == "gru":
             final_hidden = summary_state[-1]
         else:
