@@ -52,10 +52,10 @@ def audit_inputs(args: argparse.Namespace) -> dict[str, Any]:
         return {"paths": {key: str(value) for key, value in paths.items()}, "fatal_errors": fatal_errors, "warnings": []}
     real_rows = count_csv_rows(paths["real_table"])
     spine_rows = count_csv_rows(paths["synthetic_spine"])
-    real = pd.read_csv(paths["real_table"])
-    customer = pd.read_csv(paths["customer_table"])
-    product = pd.read_csv(paths["product_table"])
-    spine = pd.read_csv(paths["synthetic_spine"])
+    real = read_audit_csv(paths["real_table"])
+    customer = read_audit_csv(paths["customer_table"])
+    product = read_audit_csv(paths["product_table"])
+    spine = read_audit_csv(paths["synthetic_spine"])
     warnings: list[str] = []
     if spine_rows != real_rows:
         message = f"Synthetic spine row count ({spine_rows}) does not match real review row count ({real_rows})."
@@ -96,6 +96,10 @@ def table_profile(frame: pd.DataFrame) -> dict[str, Any]:
         "null_rates": {column: float(frame[column].isna().mean()) for column in frame.columns},
         "dtype_inference": {column: str(dtype) for column, dtype in frame.dtypes.items()},
     }
+
+
+def read_audit_csv(path: str | Path) -> pd.DataFrame:
+    return pd.read_csv(path, low_memory=False)
 
 
 def distribution(frame: pd.DataFrame, column: str) -> dict[str, Any]:
