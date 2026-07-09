@@ -7,7 +7,7 @@ from typing import Any
 
 import pandas as pd
 
-from .utils import datetime_series, is_null_like, normalize_value, numeric_series
+from .utils import canonical_valid_values, canonicalize_categorical_series, datetime_series, is_null_like, normalize_value, numeric_series
 
 
 def constraint_violation_metrics(synthetic: pd.DataFrame, table_config: dict[str, Any]) -> dict[str, Any]:
@@ -60,8 +60,8 @@ def constraint_violation_metrics(synthetic: pd.DataFrame, table_config: dict[str
             valid_values = cfg.get("valid_values")
             if valid_values is not None:
                 checked.append("categorical_domain")
-                valid = {normalize_value(value) for value in valid_values}
-                mask = ~values.map(normalize_value).isin(valid) & ~values.map(is_null_like)
+                valid = canonical_valid_values(cfg)
+                mask = ~canonicalize_categorical_series(values, cfg).isin(valid) & ~values.map(is_null_like)
                 violation_mask |= mask
                 per_constraint_counts["categorical_domain"] += int(mask.sum())
                 total_checked += num_rows
@@ -135,4 +135,3 @@ def load_parent_values(column_config: dict[str, Any]) -> set[str] | None:
         return None
     parent = pd.read_csv(parent_path, usecols=[ref_col])
     return set(parent[ref_col].map(normalize_value))
-

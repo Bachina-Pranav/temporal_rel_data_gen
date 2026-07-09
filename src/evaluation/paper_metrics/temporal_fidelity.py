@@ -7,7 +7,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from .utils import datetime_numeric, datetime_series, ks_distance, safe_corr, wasserstein_1d
+from .utils import datetime_numeric, datetime_series, datetime_wasserstein_summary, ks_distance, safe_corr
 
 
 def temporal_metrics(real: pd.DataFrame, synthetic: pd.DataFrame, config: dict[str, Any]) -> tuple[dict[str, Any], pd.DataFrame]:
@@ -45,7 +45,8 @@ def binned_time_metric(real_ts: pd.Series, syn_ts: pd.Series, mode: str, target_
     if len(real_ts) == 0 or len(syn_ts) == 0:
         return empty_time_metric(0)
     if mode == "adaptive":
-        bins = np.linspace(real_ts.min().value, real_ts.max().value, max(2, int(target_bins) + 1))
+        span = max(float(real_ts.max().value - real_ts.min().value), 1.0)
+        bins = np.linspace(float(real_ts.min().value), float(real_ts.min().value) + span, max(2, int(target_bins) + 1))
         real_counts, _ = np.histogram(datetime_numeric(real_ts), bins=bins)
         syn_counts, _ = np.histogram(datetime_numeric(syn_ts), bins=bins)
     else:
@@ -63,9 +64,14 @@ def count_distribution_metric(real_counts: np.ndarray, syn_counts: np.ndarray, r
     syn_total = max(float(syn_counts.sum()), 1.0)
     rp = real_counts.astype(float) / real_total
     sp = syn_counts.astype(float) / syn_total
+    wasserstein = datetime_wasserstein_summary(real_ts, syn_ts)
     return {
         "total_variation_distance": float(0.5 * np.abs(rp - sp).sum()),
-        "wasserstein_distance": wasserstein_1d(datetime_numeric(real_ts), datetime_numeric(syn_ts)),
+        "wasserstein_distance": wasserstein["normalized_wasserstein"],
+        "normalized_wasserstein": wasserstein["normalized_wasserstein"],
+        "wasserstein_days": wasserstein["wasserstein_days"],
+        "wasserstein_weeks": wasserstein["wasserstein_weeks"],
+        "wasserstein_months_approx": wasserstein["wasserstein_months_approx"],
         "count_correlation": safe_corr(real_counts, syn_counts),
         "count_mae_normalized": float(np.mean(np.abs(rp - sp))) if len(rp) else None,
         "num_bins": int(len(real_counts)),
@@ -76,6 +82,10 @@ def empty_time_metric(num_bins: int) -> dict[str, Any]:
     return {
         "total_variation_distance": None,
         "wasserstein_distance": None,
+        "normalized_wasserstein": None,
+        "wasserstein_days": None,
+        "wasserstein_weeks": None,
+        "wasserstein_months_approx": None,
         "count_correlation": None,
         "count_mae_normalized": None,
         "num_bins": int(num_bins),

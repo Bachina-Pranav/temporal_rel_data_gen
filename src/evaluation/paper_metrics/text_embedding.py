@@ -43,7 +43,10 @@ def text_embedding_c2st_metrics(real: pd.DataFrame, synthetic: pd.DataFrame, con
             "classifier": best_name,
             "num_real": int(len(real_emb)),
             "num_synthetic": int(len(syn_emb)),
+            "balanced_eval_n_real": int(len(real_emb)),
+            "balanced_eval_n_synthetic": int(len(syn_emb)),
             "embedding_model": model_name,
+            "feature_names": [f"embedding_dim_{idx}" for idx in range(real_emb.shape[1])] if real_emb.ndim == 2 else [],
             "per_classifier": results,
         }
     errors = [item["error"] for item in per_column.values() if item.get("error") is not None]

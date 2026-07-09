@@ -39,6 +39,7 @@ def test_paper_metrics_report_outputs_and_separate_legacy_json(tmp_path):
         "per_temporal_metrics.csv",
         "c2st_report.json",
         "text_embedding_c2st_report.json",
+        "evaluator_warnings.json",
         "legacy_diagnostic_metrics.json",
     ]:
         assert (output_dir / name).exists()
@@ -91,4 +92,3 @@ def write_tiny_tables(tmp_path: Path):
     }
     (tmp_path / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
     return real_path, syn_path, config
-

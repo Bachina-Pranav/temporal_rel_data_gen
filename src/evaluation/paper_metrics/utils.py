@@ -92,6 +92,40 @@ def datetime_numeric(series: pd.Series) -> pd.Series:
     return pd.Series(numeric, index=series.index)
 
 
+def datetime_normalized(series: pd.Series, reference: pd.Series | None = None) -> pd.Series:
+    parsed = datetime_series(series)
+    ref = datetime_series(reference) if reference is not None else parsed
+    ref = ref.dropna()
+    if len(ref) == 0:
+        return pd.Series(np.nan, index=series.index, dtype=float)
+    ref_min = ref.min().value
+    ref_span = max(float(ref.max().value - ref_min), 1.0)
+    numeric = parsed.to_numpy(dtype="datetime64[ns]").astype("int64").astype(float)
+    out = (numeric - float(ref_min)) / ref_span
+    out[parsed.isna().to_numpy()] = np.nan
+    return pd.Series(out, index=series.index)
+
+
+def datetime_wasserstein_summary(real: pd.Series, synthetic: pd.Series) -> dict[str, float | None]:
+    real_parsed = datetime_series(real).dropna()
+    syn_parsed = datetime_series(synthetic).dropna()
+    if len(real_parsed) == 0 or len(syn_parsed) == 0:
+        return {
+            "normalized_wasserstein": None,
+            "wasserstein_days": None,
+            "wasserstein_weeks": None,
+            "wasserstein_months_approx": None,
+        }
+    normalized = wasserstein_1d(datetime_normalized(real_parsed, real_parsed), datetime_normalized(syn_parsed, real_parsed))
+    days = wasserstein_1d(datetime_numeric(real_parsed) / (24 * 60 * 60 * 1e9), datetime_numeric(syn_parsed) / (24 * 60 * 60 * 1e9))
+    return {
+        "normalized_wasserstein": normalized,
+        "wasserstein_days": days,
+        "wasserstein_weeks": float(days / 7.0) if days is not None else None,
+        "wasserstein_months_approx": float(days / 30.4375) if days is not None else None,
+    }
+
+
 def token_lengths(series: pd.Series) -> pd.Series:
     return series.map(lambda value: len(normalize_text(value).split())).astype(float)
 
@@ -160,6 +194,104 @@ def text_hash_embedding(text: Any, dim: int = 64) -> np.ndarray:
         vec[bucket] += sign
     norm = np.linalg.norm(vec)
     return vec / norm if norm > 0 else vec
+
+
+def canonicalize_categorical_value(value: Any, column_config: dict[str, Any] | None = None) -> Any:
+    column_config = column_config or {}
+    if is_null_like(value):
+        return pd.NA
+    dtype = str(column_config.get("dtype", "")).lower()
+    valid_values = column_config.get("valid_values")
+    normalized = normalize_value(value)
+    if is_binary_categorical(column_config):
+        lowered = normalized.lower()
+        if lowered in {"true", "t", "yes", "y"}:
+            return 1
+        if lowered in {"false", "f", "no", "n"}:
+            return 0
+        numeric = pd.to_numeric(pd.Series([normalized]), errors="coerce").iloc[0]
+        if pd.notna(numeric) and float(numeric) in {0.0, 1.0}:
+            return int(numeric)
+    if dtype in {"int", "integer", "int64", "int32"} or valid_values_are_integer_like(valid_values):
+        numeric = pd.to_numeric(pd.Series([normalized]), errors="coerce").iloc[0]
+        if pd.notna(numeric) and float(numeric).is_integer():
+            return int(numeric)
+    if dtype in {"float", "double", "number", "numeric"}:
+        numeric = pd.to_numeric(pd.Series([normalized]), errors="coerce").iloc[0]
+        if pd.notna(numeric):
+            return float(numeric)
+    return normalized
+
+
+def canonicalize_categorical_series(series: pd.Series, column_config: dict[str, Any] | None = None) -> pd.Series:
+    return series.map(lambda value: canonicalize_categorical_value(value, column_config))
+
+
+def categorical_canonicalization_diagnostics(
+    real: pd.Series,
+    synthetic: pd.Series,
+    column_config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    column_config = column_config or {}
+    real_after = canonicalize_categorical_series(real, column_config)
+    syn_after = canonicalize_categorical_series(synthetic, column_config)
+    valid = canonical_valid_values(column_config)
+    return {
+        "real_unique_before": unique_preview(real),
+        "synthetic_unique_before": unique_preview(synthetic),
+        "real_unique_after": unique_preview(real_after),
+        "synthetic_unique_after": unique_preview(syn_after),
+        "unmapped_real_count": unmapped_count(real_after, valid),
+        "unmapped_synthetic_count": unmapped_count(syn_after, valid),
+    }
+
+
+def canonical_valid_values(column_config: dict[str, Any] | None = None) -> set[Any] | None:
+    column_config = column_config or {}
+    valid_values = column_config.get("valid_values")
+    if valid_values is None:
+        return None
+    return {canonicalize_categorical_value(value, column_config) for value in valid_values}
+
+
+def unique_preview(series: pd.Series, limit: int = 25) -> list[Any]:
+    values = series.dropna().unique().tolist()
+    values = sorted(values, key=lambda item: str(item))[: int(limit)]
+    return jsonable(values)
+
+
+def unmapped_count(series: pd.Series, valid_values: set[Any] | None) -> int:
+    if valid_values is None:
+        return 0
+    mask = series.notna() & ~series.isin(valid_values)
+    return int(mask.sum())
+
+
+def is_binary_categorical(column_config: dict[str, Any]) -> bool:
+    dtype = str(column_config.get("dtype", "")).lower()
+    if dtype in {"bool", "boolean"}:
+        return True
+    valid_values = column_config.get("valid_values")
+    if valid_values is None:
+        return False
+    normalized = {normalize_value(value).lower() for value in valid_values}
+    return normalized.issubset({"0", "1", "true", "false"}) and normalized != set()
+
+
+def valid_values_are_integer_like(valid_values: Any) -> bool:
+    if valid_values is None:
+        return False
+    try:
+        values = list(valid_values)
+    except TypeError:
+        return False
+    if not values:
+        return False
+    for value in values:
+        numeric = pd.to_numeric(pd.Series([normalize_value(value)]), errors="coerce").iloc[0]
+        if pd.isna(numeric) or not float(numeric).is_integer():
+            return False
+    return True
 
 
 def flatten_dict(prefix: str, data: dict[str, Any]) -> list[dict[str, Any]]:

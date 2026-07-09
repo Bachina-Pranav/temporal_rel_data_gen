@@ -27,7 +27,10 @@ from evaluation.paper_metrics.schema_validation import constraint_violation_metr
 from evaluation.paper_metrics.shape_trend import shape_metrics, trend_metrics  # noqa: E402
 from evaluation.paper_metrics.temporal_fidelity import temporal_metrics  # noqa: E402
 from evaluation.paper_metrics.text_embedding import text_embedding_c2st_metrics  # noqa: E402
-from evaluation.paper_metrics.utils import ensure_dir, write_json  # noqa: E402
+from evaluation.paper_metrics.utils import categorical_canonicalization_diagnostics, ensure_dir, write_json  # noqa: E402
+
+
+PAPER_METRICS_VERSION = "single_event_table_v1.1"
 
 
 def parse_args() -> argparse.Namespace:
@@ -78,14 +81,25 @@ def evaluate_paper_metrics(config: dict[str, Any], output_dir: Path) -> dict[str
         real = real.sample(n=n_real, random_state=seed).reset_index(drop=True)
         synthetic = synthetic.sample(n=n_syn, random_state=seed + 1).reset_index(drop=True)
     table_cfg = config.get("table") or {}
+    row_count_match = len(real) == len(synthetic)
+    row_count_ratio = float(len(synthetic) / len(real)) if len(real) else None
+    evaluator_warnings = evaluator_warning_records(real, synthetic)
 
     validity = constraint_violation_metrics(synthetic, table_cfg)
-    fk, fk_df = fk_cardinality_metrics(real, synthetic, table_cfg)
+    fk, fk_df = fk_cardinality_metrics(real, synthetic, table_cfg, row_count_match=row_count_match)
+    if not row_count_match:
+        evaluator_warnings.append(
+            {
+                "code": "FK_CARDINALITY_ROW_COUNT_CONFOUNDED",
+                "message": "Absolute FK cardinality metrics are row-count-confounded; headline FK similarity uses normalized cardinality.",
+            }
+        )
     temporal, temporal_df = temporal_metrics(real, synthetic, config)
-    shape, column_df = shape_metrics(real, synthetic, table_cfg)
-    trend, pair_df = trend_metrics(real, synthetic, table_cfg)
+    shape, column_df = shape_metrics(real, synthetic, table_cfg, config)
+    trend, pair_df = trend_metrics(real, synthetic, table_cfg, config)
     text_embedding = text_embedding_c2st_metrics(real, synthetic, config, output_dir)
     c2st, feature_importance = single_table_c2st_metrics(real, synthetic, config)
+    categorical_diagnostics = categorical_diagnostics_for_table(real, synthetic, table_cfg)
 
     write_table(column_df, output_dir / "per_column_metrics.csv")
     write_table(pair_df, output_dir / "per_pair_trend_metrics.csv")
@@ -94,13 +108,14 @@ def evaluate_paper_metrics(config: dict[str, Any], output_dir: Path) -> dict[str
     write_table(feature_importance, output_dir / "c2st_feature_importance.csv")
     write_json(c2st, output_dir / "c2st_report.json")
     write_json(text_embedding, output_dir / "text_embedding_c2st_report.json")
+    write_json({"warnings": evaluator_warnings}, output_dir / "evaluator_warnings.json")
 
     summary = {
         "constraint_violation_rate": validity.get("constraint_violation_rate"),
         "fk_cardinality_similarity": fk.get("macro_similarity"),
         "temporal_event_distance": temporal.get("macro_temporal_event_distance"),
-        "shape_error": shape.get("macro_attribute_shape_error", shape.get("macro_shape_error")),
-        "trend_error": trend.get("macro_attribute_trend_error", trend.get("macro_trend_error")),
+        "shape_error": shape.get("macro_non_id_shape_error", shape.get("macro_attribute_shape_error", shape.get("macro_shape_error"))),
+        "trend_error": trend.get("macro_headline_trend_error", trend.get("macro_attribute_trend_error", trend.get("macro_trend_error"))),
         "text_embedding_c2st_error": text_embedding.get("macro_error"),
         "single_table_c2st_error": c2st.get("error"),
     }
@@ -115,6 +130,7 @@ def evaluate_paper_metrics(config: dict[str, Any], output_dir: Path) -> dict[str
         },
     }
     return {
+        "paper_metrics_version": config.get("paper_metrics_version", PAPER_METRICS_VERSION),
         "dataset": {
             "dataset_name": config.get("dataset_name"),
             "evaluation_level": config.get("evaluation_level", "single_event_table"),
@@ -122,9 +138,13 @@ def evaluate_paper_metrics(config: dict[str, Any], output_dir: Path) -> dict[str
             "synthetic_table_path": config.get("synthetic_table_path"),
             "num_real_rows": int(len(real)),
             "num_synthetic_rows": int(len(synthetic)),
+            "row_count_match": bool(row_count_match),
+            "row_count_ratio": row_count_ratio,
         },
+        "evaluator_warnings": evaluator_warnings,
         "paper_metrics_summary": summary,
         "internal_overall_score": internal_overall_score(summary),
+        "categorical_canonicalization": categorical_diagnostics,
         "validity": validity,
         "fk_cardinality": fk,
         "temporal": temporal,
@@ -134,6 +154,31 @@ def evaluate_paper_metrics(config: dict[str, Any], output_dir: Path) -> dict[str
         "single_table_c2st": c2st,
         "skipped_metrics": skipped,
     }
+
+
+def evaluator_warning_records(real: pd.DataFrame, synthetic: pd.DataFrame) -> list[dict[str, str]]:
+    if len(real) == len(synthetic):
+        return []
+    return [
+        {
+            "code": "ROW_COUNT_MISMATCH",
+            "message": (
+                "Real and synthetic row counts differ. Some count-based metrics may be biased. "
+                "For final paper evaluation, generate synthetic rows equal to real rows or use explicit balanced subsampling."
+            ),
+        }
+    ]
+
+
+def categorical_diagnostics_for_table(real: pd.DataFrame, synthetic: pd.DataFrame, table_cfg: dict[str, Any]) -> dict[str, Any]:
+    diagnostics: dict[str, Any] = {}
+    for column, cfg in (table_cfg.get("columns", {}) or {}).items():
+        if str((cfg or {}).get("type", "")).lower() != "categorical":
+            continue
+        if column not in real or column not in synthetic:
+            continue
+        diagnostics[column] = categorical_canonicalization_diagnostics(real[column], synthetic[column], cfg or {})
+    return diagnostics
 
 
 def internal_overall_score(summary: dict[str, Any]) -> dict[str, Any]:

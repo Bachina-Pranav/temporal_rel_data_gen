@@ -1,8 +1,36 @@
 dataset_name: amazon_toy
+paper_metrics_version: single_event_table_v1.1
 evaluation_level: single_event_table
 
 real_table_path: data/original/rel-amazon-toy/review.csv
-synthetic_table_path: outputs/amazon-toy/conditional_tabdlm_exp5_3_lstm_length_preserving_privacy_sampler/runs/v51_length_preserving_exact_block/synthetic_review_attrs_fast.csv
+synthetic_table_path: outputs/amazon-toy/conditional_tabdlm_exp5_3_lstm_length_preserving_privacy_sampler/runs/v51_length_preserving_exact_block/synthetic_review_attrs_full_79663.csv
+
+row_count:
+  require_match_for_final: true
+  on_mismatch: warn
+
+categorical_canonicalization:
+  enabled: true
+
+datetime:
+  normalize_for_distance: true
+  report_human_readable_wasserstein: true
+
+shape:
+  headline_excludes_primary_keys: true
+  headline_excludes_foreign_keys: true
+
+trend:
+  exclude_primary_keys_from_headline: true
+  exclude_foreign_keys_from_headline: true
+  exclude_high_cardinality_ids_from_headline: true
+  high_cardinality_threshold: 100
+
+c2st:
+  balanced_sampling: true
+  save_feature_names: true
+  save_feature_importance: true
+  max_rows_for_c2st: 100000
 
 legacy_evaluator:
   enabled: true
@@ -31,10 +59,12 @@ table:
       nullable: false
     rating:
       type: categorical
+      dtype: int
       valid_values: [1, 2, 3, 4, 5, "1", "2", "3", "4", "5"]
       nullable: false
     verified:
       type: categorical
+      dtype: int
       valid_values: [0, 1, "0", "1", true, false, "True", "False", "true", "false"]
       nullable: false
     summary:
@@ -66,12 +96,16 @@ evaluation:
   text:
     embedding_model: sentence-transformers/all-MiniLM-L6-v2
     cache_embeddings: true
-    max_text_rows: 50000
+    max_text_rows: 79663
     text_columns:
       - summary
       - review_text
   c2st:
     enabled: true
+    balanced_sampling: true
+    save_feature_names: true
+    save_feature_importance: true
+    max_rows_for_c2st: 100000
     classifiers:
       - logistic_regression
       - random_forest
