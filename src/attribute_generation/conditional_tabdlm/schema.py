@@ -250,10 +250,10 @@ def resolve_auto_review_text_config(raw_config: dict[str, Any]) -> dict[str, Any
     train_path = Path(raw.get("paths", {}).get("train_data_path", ""))
     if not train_path.exists():
         raise FileNotFoundError(f"Cannot resolve review_text max_tokens=auto; missing train_data_path: {train_path}")
-    frame = pd.read_csv(train_path, usecols=["review_text"])
-    normalized = frame["review_text"].map(normalize_text)
-    normalized = normalized[normalized.str.len() > 0]
-    content_lengths = normalized.map(lambda text: len(str(text).split())).to_numpy(dtype=np.int64)
+    content_lengths = review_text_content_lengths_from_csv(
+        train_path,
+        chunk_size=int(raw.get("training", {}).get("auto_text_length_chunk_size", 500_000)),
+    )
     if content_lengths.size == 0:
         raise ValueError("Cannot resolve review_text max_tokens=auto from empty review_text column")
     token_lengths = content_lengths + 2
@@ -319,6 +319,18 @@ def resolve_auto_review_text_config(raw_config: dict[str, Any]) -> dict[str, Any
         "review_text_length_bucket_distribution_real": distribution,
     }
     return raw
+
+
+def review_text_content_lengths_from_csv(train_path: Path, chunk_size: int = 500_000) -> np.ndarray:
+    pieces: list[np.ndarray] = []
+    for chunk in pd.read_csv(train_path, usecols=["review_text"], chunksize=int(chunk_size), low_memory=False):
+        normalized = chunk["review_text"].map(normalize_text)
+        normalized = normalized[normalized.str.len() > 0]
+        if len(normalized):
+            pieces.append(normalized.map(lambda text: len(str(text).split())).to_numpy(dtype=np.int64))
+    if not pieces:
+        return np.asarray([], dtype=np.int64)
+    return np.concatenate(pieces).astype(np.int64, copy=False)
 
 
 def review_text_length_stats(content_lengths: np.ndarray, token_lengths: np.ndarray) -> dict[str, Any]:

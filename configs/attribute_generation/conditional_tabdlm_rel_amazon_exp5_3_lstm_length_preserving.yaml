@@ -205,8 +205,16 @@ review_text_decoder:
 
 training:
   max_rows: null
-  train_row_sampling: full
-  batch_size: 256
+  epoch_mode: false
+  max_steps: 50000
+  steps_per_eval: 2000
+  steps_per_checkpoint: 5000
+  train_row_sampling: temporal_stratified
+  sampling_mode: temporal_stratified
+  physical_batch_size: 64
+  gradient_accumulation_steps: 8
+  effective_batch_size: 512
+  batch_size: 64
   epochs: 50
   early_stopping_patience: 8
   early_stopping_min_delta: 0.0001
@@ -214,12 +222,18 @@ training:
   weight_decay: 0.01
   seed: 42
   num_workers: 8
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 4
   mixed_precision: true
+  amp_dtype: fp16
   gradient_clip_norm: 1.0
   save_best_by: valid/loss_total
   auto_reduce_batch_size: true
   min_batch_size: 16
   device: auto
+  save_best: true
+  validation_max_batches: 100
 
 training_regularization:
   decoder_input_token_dropout:

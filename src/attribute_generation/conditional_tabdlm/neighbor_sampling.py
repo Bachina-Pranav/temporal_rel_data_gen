@@ -81,7 +81,7 @@ class TemporalHistoryIndex:
             raise ValueError(f"Temporal graph has {bad} invalid timestamps in {timestamp_col!r}")
         self.customers = normalized[customer_col].to_numpy(dtype=object)
         self.products = normalized[product_col].to_numpy(dtype=object)
-        self.timestamps_ns = timestamps.view("int64").to_numpy(dtype=np.int64)
+        self.timestamps_ns = timestamps.to_numpy(dtype="datetime64[ns]").astype(np.int64)
         self.timestamps_seconds = (self.timestamps_ns.astype(np.float64) / 1e9).astype(np.float32)
         self.num_rows = int(len(normalized))
         self.customer_histories = self._build_histories(self.customers)

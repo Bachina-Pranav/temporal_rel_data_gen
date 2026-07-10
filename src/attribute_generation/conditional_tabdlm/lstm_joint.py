@@ -28,7 +28,10 @@ from .graph_dataset import build_temporal_history_index, write_temporal_graph_me
 from .graph_encoder import TemporalStructureOnlyGraphEncoder
 from .graph_schema import assert_valid_graph_conditioning, graph_conditioning_enabled, graph_metadata
 from .model import DateTimeEncoder
+from .neighbor_cache import CachedTemporalHistoryIndex
+from .pretokenized import PretokenizedLSTMDataset, load_pretokenized_bundle
 from .schema import ConditionalTABDLMConfig, ConditionalTABDLMSchema
+from .temporal_stratified_sampler import TemporalStratifiedSampler
 from .tokenization import CategoryVocab, SimpleTextTokenizer, stable_hash_bucket
 from .train import (
     build_graph_encoder,
@@ -516,7 +519,7 @@ def build_lstm_model(
 
 def train_lstm_from_config(config: ConditionalTABDLMConfig, device: str | None = None) -> Path:
     training = config.raw.get("training", {})
-    requested_batch_size = int(training.get("batch_size", 256))
+    requested_batch_size = int(training.get("physical_batch_size", training.get("batch_size", 256)))
     auto_reduce = bool(training.get("auto_reduce_batch_size", False))
     batch_sizes = (
         candidate_train_batch_sizes(requested_batch_size, int(training.get("min_batch_size", requested_batch_size)))
@@ -555,6 +558,14 @@ def _train_lstm_from_config_once(
     auto_reduce_batch_size: bool = False,
 ) -> Path:
     training = config.raw.get("training", {})
+    if not bool_value(training.get("epoch_mode", True)):
+        return _train_lstm_fixed_step_from_config_once(
+            config,
+            device=device,
+            batch_size_override=batch_size_override,
+            requested_batch_size=requested_batch_size,
+            auto_reduce_batch_size=auto_reduce_batch_size,
+        )
     seed = int(training.get("seed", 42))
     set_seed(seed)
     output_dir = ensure_dir(config.output_dir)
@@ -576,8 +587,20 @@ def _train_lstm_from_config_once(
     valid_dataset = ConditionalTABDLMDataset(valid_frame, config.schema, categorical_vocabs, tokenizer, num_hash_buckets)
     batch_size = int(batch_size_override if batch_size_override is not None else training.get("batch_size", 256))
     num_workers = int(training.get("num_workers", 0))
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, collate_fn=make_lstm_collate_fn)
-    valid_loader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=make_lstm_collate_fn)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        collate_fn=make_lstm_collate_fn,
+        **dataloader_performance_kwargs(training, num_workers, train=True),
+    )
+    valid_loader = DataLoader(
+        valid_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=make_lstm_collate_fn,
+        **dataloader_performance_kwargs(training, num_workers, train=False),
+    )
 
     device = resolve_device(device or str(training.get("device", "auto")))
     model = build_lstm_model(config, categorical_vocabs, tokenizer).to(device)
@@ -693,6 +716,203 @@ def _train_lstm_from_config_once(
     return best_path
 
 
+def _train_lstm_fixed_step_from_config_once(
+    config: ConditionalTABDLMConfig,
+    device: str | None = None,
+    batch_size_override: int | None = None,
+    requested_batch_size: int | None = None,
+    auto_reduce_batch_size: bool = False,
+) -> Path:
+    training = config.raw.get("training", {})
+    seed = int(training.get("seed", 42))
+    set_seed(seed)
+    output_dir = ensure_dir(config.output_dir)
+    checkpoint_dir = ensure_dir(config.checkpoint_dir)
+    metadata_dir = ensure_dir(output_dir / "metadata")
+    save_yaml(config.to_dict(), output_dir / "config_resolved.yaml")
+
+    pretokenized_dir = training.get("pretokenized_dir") or config.raw.get("paths", {}).get("pretokenized_dir")
+    if pretokenized_dir:
+        bundle = load_pretokenized_bundle(pretokenized_dir, config.schema)
+        train_dataset = PretokenizedLSTMDataset(bundle, "train")
+        valid_dataset = PretokenizedLSTMDataset(bundle, "valid")
+        categorical_vocabs = bundle.categorical_vocabs
+        tokenizer = bundle.tokenizer
+        train_frame = None
+        valid_frame = None
+        train_rows_available = int(len(train_dataset))
+    else:
+        train_frame, valid_frame, _ = load_prepared_tables(config)
+        train_frame = maybe_limit_rows(train_frame, training.get("max_rows"), seed)
+        valid_frame = maybe_limit_rows(valid_frame, validation_row_cap(training.get("max_rows"), len(valid_frame)), seed + 1)
+        categorical_vocabs = load_category_vocabs(config)
+        tokenizer = load_text_tokenizer(config)
+        num_hash_buckets = int(config.raw.get("id_encoding", {}).get("num_buckets", 262144))
+        train_dataset = ConditionalTABDLMDataset(train_frame, config.schema, categorical_vocabs, tokenizer, num_hash_buckets)
+        valid_dataset = ConditionalTABDLMDataset(valid_frame, config.schema, categorical_vocabs, tokenizer, num_hash_buckets)
+        train_rows_available = int(len(train_dataset))
+
+    use_graph_context = graph_conditioning_enabled(config.raw)
+    if use_graph_context:
+        assert_valid_graph_conditioning(config.raw)
+
+    batch_size = int(batch_size_override if batch_size_override is not None else training.get("physical_batch_size", training.get("batch_size", 64)))
+    grad_accum = gradient_accumulation_steps_for(training, batch_size)
+    effective_batch_size = int(batch_size * grad_accum)
+    max_steps = int(training.get("max_steps", 50000))
+    steps_per_eval = int(training.get("steps_per_eval", 2000))
+    steps_per_checkpoint = int(training.get("steps_per_checkpoint", 5000))
+    num_workers = int(training.get("num_workers", 0))
+    max_microbatches = max(1, max_steps * grad_accum)
+    train_loader = build_fixed_step_lstm_loader(
+        train_dataset,
+        config,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        num_microbatches=max_microbatches,
+        seed=seed,
+    )
+    valid_loader = DataLoader(
+        valid_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=make_lstm_collate_fn,
+        **dataloader_performance_kwargs(training, num_workers, train=False),
+    )
+
+    device = resolve_device(device or str(training.get("device", "auto")))
+    model = build_lstm_model(config, categorical_vocabs, tokenizer).to(device)
+    graph_encoder = build_graph_encoder(config, categorical_vocabs, tokenizer).to(device) if use_graph_context else None
+    neighbor_cache_dir = training.get("neighbor_cache_dir") or config.raw.get("paths", {}).get("neighbor_cache_dir")
+    if use_graph_context and neighbor_cache_dir:
+        train_history_index = CachedTemporalHistoryIndex(neighbor_cache_dir)
+        valid_history_index = train_history_index
+        valid_row_id_offset = 0
+    elif use_graph_context:
+        if train_frame is None or valid_frame is None:
+            raise ValueError("Fixed-step pretokenized graph training requires --neighbor-cache-dir")
+        train_history_index = build_temporal_history_index(train_frame, config, seed=seed)
+        valid_graph_frame = pd.concat([train_frame, valid_frame], ignore_index=True)
+        valid_history_index = build_temporal_history_index(valid_graph_frame, config, seed=seed + 1)
+        valid_row_id_offset = len(train_frame)
+    else:
+        train_history_index = None
+        valid_history_index = None
+        valid_row_id_offset = 0
+    if use_graph_context:
+        if train_frame is not None:
+            write_temporal_graph_metadata(train_frame, config, output_dir / "graph", source="real_training_rows", seed=seed)
+        graph_flags = graph_metadata(config.raw, real_graph_used_at_sampling=False)
+        save_json(graph_flags, output_dir / "graph_conditioning_flags.json")
+        save_json(graph_flags, metadata_dir / "graph_conditioning.json")
+
+    loss_weights = dict(config.raw.get("loss_weights", {}))
+    if train_frame is not None:
+        length_class_weights = compute_length_class_weights(train_frame, config, categorical_vocabs, tokenizer)
+    else:
+        length_class_weights = compute_length_class_weights_from_pretokenized(train_dataset, config, categorical_vocabs)
+    length_tensors = {
+        column: tensor.to(device)
+        for column, tensor in (length_class_weights or {}).get("tensor", {}).items()
+    }
+    if length_class_weights is not None:
+        for column, payload in length_class_weights["json"].items():
+            save_json(payload, metadata_dir / f"{column}_weights.json")
+    write_lstm_model_metadata(config, metadata_dir)
+
+    optimizer = torch.optim.AdamW(
+        list(model.parameters()) + (list(graph_encoder.parameters()) if graph_encoder is not None else []),
+        lr=float(training.get("lr", training.get("learning_rate", 5e-4))),
+        weight_decay=float(training.get("weight_decay", 0.01)),
+    )
+    use_amp = bool(training.get("mixed_precision", True)) and str(device).startswith("cuda")
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    clip_norm = float(training.get("gradient_clip_norm", 1.0))
+    log_path = output_dir / "train_log.jsonl"
+    metrics_log_path = ensure_dir(output_dir / "logs") / "train_metrics.jsonl"
+    for path in [log_path, metrics_log_path]:
+        if path.exists():
+            path.unlink()
+    best_path = checkpoint_dir / "best.pt"
+    last_path = checkpoint_dir / "last.pt"
+    start = time.perf_counter()
+    best_valid = float("inf")
+    best_step = 0
+    last_valid_metrics: dict[str, float] = {"total_loss": float("inf")}
+    sampler = getattr(train_loader, "sampler", None)
+    train_metrics = run_lstm_fixed_steps(
+        model,
+        train_loader,
+        valid_loader,
+        optimizer,
+        scaler,
+        device,
+        use_amp,
+        loss_weights,
+        tokenizer,
+        length_tensors,
+        max_steps=max_steps,
+        gradient_accumulation_steps=grad_accum,
+        steps_per_eval=steps_per_eval,
+        steps_per_checkpoint=steps_per_checkpoint,
+        checkpoint_dir=checkpoint_dir,
+        log_path=log_path,
+        metrics_log_path=metrics_log_path,
+        categorical_vocabs=categorical_vocabs,
+        graph_encoder=graph_encoder,
+        train_history_index=train_history_index,
+        valid_history_index=valid_history_index,
+        valid_row_id_offset=valid_row_id_offset,
+        config=config,
+        clip_norm=clip_norm,
+        validation_max_batches=int(training.get("validation_max_batches", 100)),
+    )
+    elapsed = time.perf_counter() - start
+    best_valid = float(train_metrics.get("best_valid_total_loss", best_valid))
+    best_step = int(train_metrics.get("best_step", best_step))
+    last_valid_metrics = dict(train_metrics.get("last_valid_metrics", last_valid_metrics))
+    if not best_path.exists():
+        save_lstm_checkpoint(best_path, model, config, categorical_vocabs, tokenizer, max_steps, last_valid_metrics, graph_encoder=graph_encoder)
+    save_lstm_checkpoint(last_path, model, config, categorical_vocabs, tokenizer, max_steps, last_valid_metrics, graph_encoder=graph_encoder)
+    if isinstance(sampler, TemporalStratifiedSampler):
+        save_json(sampler.diagnostics().to_dict(), output_dir / "sampling_diagnostics.json")
+    train_rows_seen = int(max_steps * effective_batch_size)
+    train_subset_used = training.get("max_rows") not in (None, "all") or bool(pretokenized_dir)
+    runtime = {
+        "train_mode": "fixed_step",
+        "epoch_mode": False,
+        "max_steps": int(max_steps),
+        "physical_batch_size": int(batch_size),
+        "gradient_accumulation_steps": int(grad_accum),
+        "effective_batch_size": int(effective_batch_size),
+        "sampling_mode": str(training.get("sampling_mode", training.get("train_row_sampling", "temporal_stratified"))),
+        "train_rows_available": int(train_rows_available),
+        "train_rows_seen_approx": int(train_rows_seen),
+        "full_epoch_equivalent_fraction": float(train_rows_seen / max(train_rows_available, 1)),
+        "train_subset_used": bool(train_subset_used),
+        "max_train_rows": training.get("max_rows"),
+        "mixed_precision_used": bool(use_amp),
+        "amp_dtype": str(training.get("amp_dtype", "fp16")),
+        "best_checkpoint_path": str(best_path),
+        "best_valid_total_loss": float(best_valid),
+        "best_step": int(best_step),
+        "total_training_seconds": float(elapsed),
+        "train_batch_size_requested": int(requested_batch_size if requested_batch_size is not None else batch_size),
+        "train_batch_size_used": int(batch_size),
+        "auto_reduce_batch_size": bool(auto_reduce_batch_size),
+        "min_batch_size": int(training.get("min_batch_size", batch_size)),
+        "oom_retries": int(0 if requested_batch_size in (None, batch_size) else 1),
+        "final_physical_batch_size": int(batch_size),
+        "pretokenized_dir": str(pretokenized_dir) if pretokenized_dir else None,
+        "neighbor_cache_dir": str(neighbor_cache_dir) if neighbor_cache_dir else None,
+        "architecture_changed": False,
+    }
+    runtime.update({key: value for key, value in train_metrics.items() if key.startswith("avg_") or key.endswith("_seconds")})
+    save_json(runtime, metadata_dir / "training_runtime.json")
+    print(f"Wrote best checkpoint to {best_path}")
+    return best_path
+
+
 def candidate_train_batch_sizes(initial_batch_size: int, min_batch_size: int) -> list[int]:
     initial = max(1, int(initial_batch_size))
     floor = min(initial, max(1, int(min_batch_size)))
@@ -720,6 +940,367 @@ def clear_cuda_after_oom() -> None:
             pass
 
 
+def run_lstm_fixed_steps(
+    model: JointLSTMRelationalAttributeGenerator,
+    train_loader: DataLoader,
+    valid_loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    scaler: torch.cuda.amp.GradScaler,
+    device: str,
+    use_amp: bool,
+    loss_weights: dict[str, float],
+    tokenizer: SimpleTextTokenizer,
+    length_class_weights: dict[str, torch.Tensor],
+    *,
+    max_steps: int,
+    gradient_accumulation_steps: int,
+    steps_per_eval: int,
+    steps_per_checkpoint: int,
+    checkpoint_dir: Path,
+    log_path: Path,
+    metrics_log_path: Path,
+    categorical_vocabs: dict[str, CategoryVocab],
+    graph_encoder: TemporalStructureOnlyGraphEncoder | None = None,
+    train_history_index: Any | None = None,
+    valid_history_index: Any | None = None,
+    valid_row_id_offset: int = 0,
+    config: ConditionalTABDLMConfig | None = None,
+    clip_norm: float = 1.0,
+    validation_max_batches: int | None = 100,
+) -> dict[str, Any]:
+    model.train(True)
+    if graph_encoder is not None:
+        graph_encoder.train(True)
+    optimizer.zero_grad(set_to_none=True)
+    iterator = iter(train_loader)
+    best_valid = float("inf")
+    best_step = 0
+    last_valid_metrics: dict[str, float] = {"total_loss": float("inf")}
+    component_totals: dict[str, float] = {}
+    component_counts: dict[str, float] = {}
+    component_corrects: dict[str, int] = {}
+    timer_totals = {
+        "batch_load": 0.0,
+        "h2d": 0.0,
+        "graph_context": 0.0,
+        "forward": 0.0,
+        "backward": 0.0,
+        "optimizer": 0.0,
+    }
+    microbatches = 0
+    progress = tqdm(total=int(max_steps), desc="train_lstm_fixed_step") if tqdm is not None else None
+    train_start = time.perf_counter()
+    for step in range(1, int(max_steps) + 1):
+        step_start = time.perf_counter()
+        for _ in range(int(gradient_accumulation_steps)):
+            load_start = time.perf_counter()
+            try:
+                batch = next(iterator)
+            except StopIteration:
+                iterator = iter(train_loader)
+                batch = next(iterator)
+            timer_totals["batch_load"] += time.perf_counter() - load_start
+            h2d_start = time.perf_counter()
+            batch = move_batch_to_device(batch, device)
+            timer_totals["h2d"] += time.perf_counter() - h2d_start
+            with torch.cuda.amp.autocast(enabled=use_amp, dtype=amp_dtype_from_name(config.raw.get("training", {}).get("amp_dtype", "fp16") if config is not None else "fp16")):
+                graph_start = time.perf_counter()
+                graph_context, _ = compute_graph_outputs(
+                    graph_encoder,
+                    train_history_index,
+                    batch,
+                    device,
+                    deterministic=False,
+                    config=config,
+                    training=True,
+                )
+                timer_totals["graph_context"] += time.perf_counter() - graph_start
+                forward_start = time.perf_counter()
+                logits = model(
+                    batch["foreign_key_ids"],
+                    batch["datetime_values"],
+                    batch["categorical_ids"],
+                    batch["text_ids"],
+                    graph_context=graph_context,
+                )
+                loss, component = lstm_joint_loss(
+                    logits,
+                    batch,
+                    model.schema,
+                    loss_weights,
+                    tokenizer,
+                    length_class_weights,
+                    config=config,
+                )
+                loss = loss / max(int(gradient_accumulation_steps), 1)
+                timer_totals["forward"] += time.perf_counter() - forward_start
+            backward_start = time.perf_counter()
+            scaler.scale(loss).backward()
+            timer_totals["backward"] += time.perf_counter() - backward_start
+            accumulate_lstm_components(component, component_totals, component_counts, component_corrects, model.schema)
+            microbatches += 1
+        optimizer_start = time.perf_counter()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(list(model.parameters()) + (list(graph_encoder.parameters()) if graph_encoder is not None else []), clip_norm)
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad(set_to_none=True)
+        timer_totals["optimizer"] += time.perf_counter() - optimizer_start
+        if progress is not None:
+            elapsed = time.perf_counter() - train_start
+            progress.set_postfix(
+                rows_seen=step * int(gradient_accumulation_steps) * int(train_loader.batch_size or 1),
+                step_s=f"{(elapsed / max(step, 1)):.3f}",
+            )
+            progress.update(1)
+        should_eval = step == int(max_steps) or (steps_per_eval > 0 and step % int(steps_per_eval) == 0)
+        should_ckpt = step == int(max_steps) or (steps_per_checkpoint > 0 and step % int(steps_per_checkpoint) == 0)
+        if should_eval:
+            valid_metrics = run_lstm_epoch(
+                model,
+                valid_loader,
+                None,
+                scaler,
+                device,
+                use_amp,
+                loss_weights,
+                tokenizer,
+                length_class_weights,
+                graph_encoder=graph_encoder,
+                graph_history_index=valid_history_index,
+                graph_deterministic=True,
+                graph_row_id_offset=valid_row_id_offset,
+                config=config,
+                clip_norm=clip_norm,
+                max_batches=validation_max_batches,
+            )
+            last_valid_metrics = valid_metrics
+            current = float(valid_metrics.get("total_loss", float("inf")))
+            improved = current < best_valid
+            if improved:
+                best_valid = current
+                best_step = step
+                save_lstm_checkpoint(
+                    checkpoint_dir / "best.pt",
+                    model,
+                    config,
+                    categorical_vocabs,
+                    tokenizer,
+                    step,
+                    valid_metrics,
+                    graph_encoder=graph_encoder,
+                )
+            train_metrics = finalize_lstm_component_metrics(component_totals, component_counts, component_corrects, model.schema, loss_weights, config)
+            row = {
+                "step": int(step),
+                "max_steps": int(max_steps),
+                **{f"train_{key}": value for key, value in train_metrics.items()},
+                **{f"valid_{key}": value for key, value in valid_metrics.items()},
+                "best_valid_total_loss": float(best_valid),
+                "best_step": int(best_step),
+                "rows_seen_approx": int(step * int(gradient_accumulation_steps) * int(train_loader.batch_size or 1)),
+                "wall_clock_seconds": float(time.perf_counter() - train_start),
+                "step_seconds": float(time.perf_counter() - step_start),
+            }
+            append_jsonl(log_path, row)
+            append_jsonl(metrics_log_path, row)
+            print(json.dumps(jsonable(row), sort_keys=True), flush=True)
+        if should_ckpt:
+            save_lstm_checkpoint(
+                checkpoint_dir / "last.pt",
+                model,
+                config,
+                categorical_vocabs,
+                tokenizer,
+                step,
+                last_valid_metrics,
+                graph_encoder=graph_encoder,
+            )
+    if progress is not None:
+        progress.close()
+    total_seconds = time.perf_counter() - train_start
+    denom = max(float(microbatches), 1.0)
+    return {
+        "best_valid_total_loss": float(best_valid),
+        "best_step": int(best_step),
+        "last_valid_metrics": last_valid_metrics,
+        "avg_step_seconds": float(total_seconds / max(int(max_steps), 1)),
+        "avg_batch_load_seconds": float(timer_totals["batch_load"] / denom),
+        "avg_h2d_seconds": float(timer_totals["h2d"] / denom),
+        "avg_graph_context_seconds": float(timer_totals["graph_context"] / denom),
+        "avg_forward_seconds": float(timer_totals["forward"] / denom),
+        "avg_backward_seconds": float(timer_totals["backward"] / denom),
+        "avg_optimizer_seconds": float(timer_totals["optimizer"] / max(int(max_steps), 1)),
+        "total_loop_seconds": float(total_seconds),
+    }
+
+
+def accumulate_lstm_components(
+    component: dict[str, dict[str, float | int]],
+    totals: dict[str, float],
+    counts: dict[str, float],
+    corrects: dict[str, int],
+    schema: ConditionalTABDLMSchema,
+) -> None:
+    for key, stats in component.items():
+        totals[key] = totals.get(key, 0.0) + float(stats["loss_sum"])
+        counts[key] = counts.get(key, 0.0) + float(stats["count"])
+        if key in schema.model_categorical_targets or key in {metric_name_for_lstm(column) for column in schema.model_categorical_targets}:
+            corrects[key] = corrects.get(key, 0) + int(stats.get("correct", 0))
+
+
+def finalize_lstm_component_metrics(
+    totals: dict[str, float],
+    counts: dict[str, float],
+    corrects: dict[str, int],
+    schema: ConditionalTABDLMSchema,
+    loss_weights: dict[str, float],
+    config: ConditionalTABDLMConfig | None,
+) -> dict[str, float]:
+    metrics: dict[str, float] = {}
+    total = 0.0
+    cat_metric_names = {metric_name_for_lstm(column): column for column in schema.model_categorical_targets}
+    for key in sorted(totals):
+        count = max(float(counts.get(key, 0.0)), 1.0)
+        value = float(totals[key] / count)
+        metrics[f"{key}_loss"] = value
+        total += float(loss_weights.get(key, 1.0)) * value
+        if key in cat_metric_names:
+            metrics[f"{key}_accuracy"] = float(corrects.get(key, 0) / count)
+    smoothing = text_label_smoothing_from_config(config)
+    for column, value in smoothing.items():
+        metric_key = "label_smoothing_summary" if column == "summary" else f"label_smoothing_{column}"
+        metrics[metric_key] = float(value)
+    metrics["total_loss"] = float(total)
+    return metrics
+
+
+def build_fixed_step_lstm_loader(
+    dataset: Any,
+    config: ConditionalTABDLMConfig,
+    *,
+    batch_size: int,
+    num_workers: int,
+    num_microbatches: int,
+    seed: int,
+) -> DataLoader:
+    training = config.raw.get("training", {})
+    sampling_cfg = config.raw.get("sampling", {})
+    mode = str(training.get("sampling_mode", training.get("train_row_sampling", sampling_cfg.get("mode", "temporal_stratified"))))
+    timestamps = getattr(dataset, "timestamps_ns", None)
+    sampler = None
+    shuffle = True
+    if timestamps is not None and mode in {"uniform", "temporal_stratified", "temporal_weighted", "hybrid"}:
+        sampler = TemporalStratifiedSampler(
+            np.asarray(timestamps, dtype=np.int64),
+            mode=mode,
+            num_time_bins=int(sampling_cfg.get("num_time_bins", training.get("num_time_bins", 128))),
+            binning=str(sampling_cfg.get("binning", training.get("binning", "quantile"))),
+            replacement=bool(sampling_cfg.get("replacement", True)),
+            seed=seed,
+            num_samples=int(num_microbatches) * int(batch_size),
+            timestamp_column=config.schema.datetime_columns[0] if config.schema.datetime_columns else None,
+        )
+        shuffle = False
+    return DataLoader(
+        dataset,
+        batch_size=int(batch_size),
+        shuffle=shuffle if sampler is None else False,
+        sampler=sampler,
+        collate_fn=make_lstm_collate_fn,
+        drop_last=True,
+        **dataloader_performance_kwargs(training, num_workers, train=True),
+    )
+
+
+def dataloader_performance_kwargs(training: dict[str, Any], num_workers: int, *, train: bool) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "num_workers": int(num_workers),
+        "pin_memory": bool(training.get("pin_memory", training.get("dataloader", {}).get("pin_memory", True))),
+    }
+    if int(num_workers) > 0:
+        kwargs["persistent_workers"] = bool(
+            training.get("persistent_workers", training.get("dataloader", {}).get("persistent_workers", True))
+        )
+        kwargs["prefetch_factor"] = int(
+            training.get("prefetch_factor", training.get("dataloader", {}).get("prefetch_factor", 4))
+        )
+        timeout = int(training.get("dataloader_timeout_seconds", 0) or 0)
+        if timeout > 0:
+            kwargs["timeout"] = timeout
+    if not train:
+        kwargs["drop_last"] = False
+    return kwargs
+
+
+def gradient_accumulation_steps_for(training: dict[str, Any], physical_batch_size: int) -> int:
+    if training.get("gradient_accumulation_steps") is not None:
+        return max(1, int(training.get("gradient_accumulation_steps")))
+    target = training.get("target_effective_batch_size", training.get("effective_batch_size"))
+    if target is None:
+        return 1
+    return max(1, int(math.ceil(float(target) / max(int(physical_batch_size), 1))))
+
+
+def compute_length_class_weights_from_pretokenized(
+    dataset: PretokenizedLSTMDataset,
+    config: ConditionalTABDLMConfig,
+    categorical_vocabs: dict[str, CategoryVocab],
+) -> dict[str, Any] | None:
+    tensors: dict[str, torch.Tensor] = {}
+    payloads: dict[str, Any] = {}
+    for column in config.schema.length_bucket_targets:
+        if column not in categorical_vocabs:
+            continue
+        length_cfg = config.raw.get(f"{'summary_length' if column == 'summary_length_bucket' else 'review_text_length'}_loss", {})
+        if not bool(length_cfg.get("class_balanced", False)):
+            continue
+        col_idx = config.schema.model_categorical_targets.index(column)
+        values = np.asarray(dataset.categorical_ids[dataset.indices, col_idx], dtype=np.int64)
+        vocab = categorical_vocabs[column]
+        counts = np.bincount(values, minlength=vocab.size).astype(float)
+        total = max(float(counts.sum()), 1.0)
+        freqs = counts / total
+        power = float(length_cfg.get("class_weight_power", 0.5))
+        raw = np.zeros_like(freqs)
+        nonzero = freqs > 0
+        raw[nonzero] = np.power(1.0 / freqs[nonzero], power)
+        if raw[nonzero].size:
+            raw[nonzero] = raw[nonzero] / raw[nonzero].mean()
+        raw[~nonzero] = float(length_cfg.get("max_class_weight", 5.0))
+        weights = np.clip(
+            raw,
+            float(length_cfg.get("min_class_weight", 0.5)),
+            float(length_cfg.get("max_class_weight", 5.0)),
+        )
+        tensors[column] = torch.tensor(weights, dtype=torch.float32)
+        id_to_token = vocab.id_to_token
+        payloads[column] = {
+            "class_balanced": True,
+            "column": column,
+            "counts": {id_to_token[idx]: int(counts[idx]) for idx in range(vocab.size)},
+            "frequencies": {id_to_token[idx]: float(freqs[idx]) for idx in range(vocab.size)},
+            "weights": {id_to_token[idx]: float(weights[idx]) for idx in range(vocab.size)},
+        }
+    if not tensors:
+        return None
+    return {"tensor": tensors, "json": payloads}
+
+
+def amp_dtype_from_name(name: Any) -> torch.dtype:
+    if str(name).lower() in {"bf16", "bfloat16"}:
+        return torch.bfloat16
+    return torch.float16
+
+
+def bool_value(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 def run_lstm_epoch(
     model: JointLSTMRelationalAttributeGenerator,
     loader: DataLoader,
@@ -736,6 +1317,7 @@ def run_lstm_epoch(
     graph_row_id_offset: int = 0,
     config: ConditionalTABDLMConfig | None = None,
     clip_norm: float = 1.0,
+    max_batches: int | None = None,
 ) -> dict[str, float]:
     training = optimizer is not None
     model.train(training)
@@ -747,7 +1329,9 @@ def run_lstm_epoch(
     iterator = loader
     if tqdm is not None:
         iterator = tqdm(loader, leave=False, desc="train_lstm" if training else "valid_lstm")
-    for batch in iterator:
+    for batch_idx, batch in enumerate(iterator):
+        if max_batches is not None and batch_idx >= int(max_batches):
+            break
         batch = move_batch_to_device(batch, device)
         if training:
             optimizer.zero_grad(set_to_none=True)
@@ -1311,7 +1895,7 @@ def resolve_sampling_batch_size(value: Any, device: str) -> int:
 
 def move_batch_to_device(value: Any, device: str) -> Any:
     if torch.is_tensor(value):
-        return value.to(device)
+        return value.to(device, non_blocking=str(device).startswith("cuda"))
     if isinstance(value, dict):
         return {key: move_batch_to_device(item, device) for key, item in value.items()}
     return value
