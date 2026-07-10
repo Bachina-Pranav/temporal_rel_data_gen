@@ -9,11 +9,15 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Iterator
 
-import numpy as np
-import pandas as pd
-
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from tempdir_bootstrap import configure_tempdir  # noqa: E402
+
+configure_tempdir(Path(__file__).resolve().parents[2])
+
+import numpy as np
+import pandas as pd
 
 from attribute_generation.conditional_tabdlm.dataset import normalize_frame, validate_columns  # noqa: E402
 from attribute_generation.conditional_tabdlm.schema import (  # noqa: E402

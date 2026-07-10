@@ -8,10 +8,14 @@ import json
 import sys
 from pathlib import Path
 
-import torch
-
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from tempdir_bootstrap import configure_tempdir  # noqa: E402
+
+configure_tempdir(Path(__file__).resolve().parents[2])
+
+import torch
 
 from attribute_generation.conditional_tabdlm.lstm_joint import train_lstm_from_config  # noqa: E402
 from attribute_generation.conditional_tabdlm.schema import (  # noqa: E402

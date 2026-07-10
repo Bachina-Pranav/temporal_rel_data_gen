@@ -7,11 +7,15 @@ import argparse
 import sys
 from pathlib import Path
 
-import numpy as np
-import pandas as pd
-
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from tempdir_bootstrap import configure_tempdir  # noqa: E402
+
+configure_tempdir(Path(__file__).resolve().parents[2])
+
+import numpy as np
+import pandas as pd
 
 from attribute_generation.conditional_tabdlm.graph_schema import temporal_filter_config  # noqa: E402
 from attribute_generation.conditional_tabdlm.neighbor_cache import validate_cache_temporal_safety  # noqa: E402
