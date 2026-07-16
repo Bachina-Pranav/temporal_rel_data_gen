@@ -1,0 +1,14 @@
+dataset_name: hm_100k
+source_dataset: H&M Personalized Fashion Recommendations
+domain: seasonal retail purchases
+processed_dir: data/processed/interaction_benchmarks/hm_100k
+interaction_table: interactions.csv
+source_entity_table: customers.csv
+destination_entity_table: articles.csv
+source_id_column: customer_id
+destination_id_column: article_id
+timestamp_column: event_time
+generated_attributes:
+  price: continuous_numerical
+  sales_channel_id: categorical
+method_scope: single_designated_temporal_interaction_table

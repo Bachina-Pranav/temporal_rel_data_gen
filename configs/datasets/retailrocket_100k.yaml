@@ -1,0 +1,13 @@
+dataset_name: retailrocket_100k
+source_dataset: RetailRocket e-commerce dataset
+domain: e-commerce events
+processed_dir: data/processed/interaction_benchmarks/retailrocket_100k
+interaction_table: interactions.csv
+source_entity_table: visitors.csv
+destination_entity_table: items.csv
+source_id_column: visitor_id
+destination_id_column: item_id
+timestamp_column: event_time
+generated_attributes:
+  event_type: categorical
+method_scope: single_designated_temporal_interaction_table

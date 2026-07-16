@@ -1,0 +1,17 @@
+dataset_name: yelp_100k
+source_dataset: Yelp Open Dataset
+domain: local business reviews
+processed_dir: data/processed/interaction_benchmarks/yelp_100k
+interaction_table: interactions.csv
+source_entity_table: users.csv
+destination_entity_table: businesses.csv
+source_id_column: user_id
+destination_id_column: business_id
+timestamp_column: event_time
+generated_attributes:
+  stars: ordinal_categorical
+  useful: count_numerical
+  funny: count_numerical
+  cool: count_numerical
+  review_text: text
+method_scope: single_designated_temporal_interaction_table

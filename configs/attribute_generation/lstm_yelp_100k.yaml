@@ -1,0 +1,69 @@
+experiment_name: lstm_yelp_100k
+dataset_name: yelp_100k
+
+paths:
+  train_data_path: data/processed/interaction_benchmarks/yelp_100k/interactions.csv
+  synthetic_spine_path: data/processed/interaction_benchmarks/yelp_100k/interactions.csv
+  output_dir: outputs/yelp_100k/lstm
+
+columns:
+  condition:
+    foreign_keys: [user_id, business_id]
+    datetimes: [event_time]
+  target:
+    categorical: [stars]
+    numerical: [useful, funny, cool]
+    text: [review_text]
+
+schema:
+  fields:
+    user_id: {role: source_foreign_key, semantic_type: foreign_key}
+    business_id: {role: destination_foreign_key, semantic_type: foreign_key}
+    event_time: {role: timestamp, semantic_type: datetime}
+    stars: {role: generated_attribute, semantic_type: ordinal_categorical, nullable: false}
+    useful: {role: generated_attribute, semantic_type: count_numerical, preprocessing: log1p_standardize, output_distribution: log1p_gaussian, nullable: false}
+    funny: {role: generated_attribute, semantic_type: count_numerical, preprocessing: log1p_standardize, output_distribution: log1p_gaussian, nullable: false}
+    cool: {role: generated_attribute, semantic_type: count_numerical, preprocessing: log1p_standardize, output_distribution: log1p_gaussian, nullable: false}
+    review_text: {role: generated_attribute, semantic_type: text, nullable: false}
+
+graph_conditioning:
+  enabled: true
+  mode: structure_only_temporal
+  node_types: [user, business, review_event]
+  event_node_type: review_event
+  foreign_key_edges:
+    - {source_node_type: user, source_column: user_id, target_node_type: review_event, edge_type: user_to_review}
+    - {source_node_type: business, source_column: business_id, target_node_type: review_event, edge_type: business_to_review}
+  temporal_filter:
+    enabled: true
+    mode: past_only
+    timestamp_column: event_time
+    allow_same_timestamp_events: false
+    exclude_target_event_from_neighbors: true
+    max_history_events_per_customer: 50
+    max_history_events_per_product: 100
+    history_sampling_strategy: recent
+  forbidden_node_features: [rating, verified, summary, review_text, stars, useful, funny, cool]
+  graph_uses_future_events: false
+  graph_uses_target_attributes: false
+  graph_encoder: {type: temporal_structure_ego_encoder, hidden_dim: 128, output_dim: 128, num_layers: 1, dropout: 0.1}
+
+text:
+  max_length:
+    review_text: 256
+
+tokenizer: {max_vocab_size: 30000, min_frequency: 1, lowercase: true}
+id_encoding: {type: hash_embedding, num_buckets: 262144, embedding_dim: 64}
+datetime_encoding: {type: continuous_time_fourier, embedding_dim: 32}
+model:
+  family: joint_lstm_generator
+  row_hidden_dim: 192
+  latent_noise_dim: 64
+  categorical_context_dim: 24
+  dropout: 0.1
+  use_graph_context: true
+  graph_context_dim: 128
+text_decoder: {type: lstm, embedding_dim: 128, hidden_dim: 192, num_layers: 1, dropout: 0.0}
+training: {batch_size: 64, epochs: 5, lr: 0.0005, weight_decay: 0.01, seed: 42, num_workers: 0, mixed_precision: true, device: auto}
+loss_weights: {stars: 1.0, useful: 1.0, funny: 1.0, cool: 1.0, review_text: 1.0}
+sampling: {num_rows: 1000, batch_size: auto, temperature: 0.9, top_p: 0.95, numerical_temperature: 1.0, seed: 42, device: auto}

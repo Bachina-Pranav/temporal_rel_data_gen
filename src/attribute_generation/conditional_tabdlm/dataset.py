@@ -12,6 +12,7 @@ import torch
 from torch.utils.data import Dataset
 
 from .schema import ConditionalTABDLMConfig, ConditionalTABDLMSchema
+from .numerical import fit_numerical_transformers, transform_numerical_value
 from .tokenization import (
     CategoryVocab,
     SimpleTextTokenizer,
@@ -30,6 +31,7 @@ class PreparedData:
     schema_path: Path
     tokenizer_path: Path
     categorical_vocab_paths: dict[str, Path]
+    numerical_metadata_path: Path | None = None
 
 
 def prepare_rel_amazon_data(config: ConditionalTABDLMConfig) -> PreparedData:
@@ -48,11 +50,13 @@ def prepare_rel_amazon_data(config: ConditionalTABDLMConfig) -> PreparedData:
     frame = frame.sort_values(sort_columns, kind="mergesort").reset_index(drop=True)
 
     train, valid, test = time_aware_split(frame)
+    numerical_metadata = fit_numerical_transformers(train, config) if schema.numerical_targets else {}
     write_dataframe(train, output_dir / "train.parquet")
     write_dataframe(valid, output_dir / "valid.parquet")
     write_dataframe(test, output_dir / "test.parquet")
 
     save_json(schema.to_dict(), output_dir / "schema.json")
+    save_json(numerical_metadata, output_dir / "numerical_metadata.json")
     token_cfg = config.raw.get("tokenizer", {})
     max_vocab_size = int(token_cfg.get("max_vocab_size", 30000))
     min_frequency = int(token_cfg.get("min_frequency", 1))
@@ -95,6 +99,7 @@ def prepare_rel_amazon_data(config: ConditionalTABDLMConfig) -> PreparedData:
         schema_path=output_dir / "schema.json",
         tokenizer_path=output_dir / "tokenizer_metadata.json",
         categorical_vocab_paths=vocab_paths,
+        numerical_metadata_path=output_dir / "numerical_metadata.json" if schema.numerical_targets else None,
     )
 
 
@@ -112,9 +117,11 @@ def normalize_frame(frame: pd.DataFrame, schema: ConditionalTABDLMSchema) -> pd.
         frame[column] = pd.to_datetime(frame[column], errors="coerce")
     for column in schema.categorical_targets:
         frame[column] = frame[column].astype(str)
+    for column in schema.numerical_targets:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
     for column in schema.text_targets:
         frame[column] = frame[column].map(normalize_text)
-    return frame.dropna(subset=list(schema.datetime_columns)).reset_index(drop=True)
+    return frame.dropna(subset=list(schema.datetime_columns) + list(schema.numerical_targets)).reset_index(drop=True)
 
 
 def time_aware_split(frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -148,6 +155,13 @@ def load_text_tokenizer(config: ConditionalTABDLMConfig) -> SimpleTextTokenizer:
     return SimpleTextTokenizer.from_dict(load_json(config.data_dir / "tokenizer_metadata.json"))
 
 
+def load_numerical_metadata(config: ConditionalTABDLMConfig) -> dict[str, Any]:
+    path = config.data_dir / "numerical_metadata.json"
+    if not path.exists():
+        return {}
+    return load_json(path)
+
+
 class ConditionalTABDLMDataset(Dataset):
     """Rows encoded as fixed condition tokens plus clean target tokens."""
 
@@ -158,12 +172,14 @@ class ConditionalTABDLMDataset(Dataset):
         categorical_vocabs: dict[str, CategoryVocab],
         text_tokenizer: SimpleTextTokenizer,
         num_hash_buckets: int,
+        numerical_metadata: dict[str, Any] | None = None,
     ):
         self.frame = normalize_frame(frame, schema).reset_index(drop=True)
         self.schema = schema
         self.categorical_vocabs = categorical_vocabs
         self.text_tokenizer = text_tokenizer
         self.num_hash_buckets = int(num_hash_buckets)
+        self.numerical_metadata = dict(numerical_metadata or {})
 
     def __len__(self) -> int:
         return len(self.frame)
@@ -182,6 +198,10 @@ class ConditionalTABDLMDataset(Dataset):
         for column in self.schema.model_categorical_targets:
             value = self.auxiliary_value(row, column) if column in self.schema.auxiliary_categorical_targets else row[column]
             categorical.append(self.categorical_vocabs[column].encode(value))
+        numerical = [
+            transform_numerical_value(row[column], self.numerical_metadata.get(column, {}))
+            for column in self.schema.numerical_targets
+        ]
         text_ids: dict[str, list[int]] = {}
         text_attention: dict[str, list[int]] = {}
         for column in self.schema.text_targets:
@@ -192,6 +212,7 @@ class ConditionalTABDLMDataset(Dataset):
             "foreign_key_ids": torch.tensor(foreign_keys, dtype=torch.long),
             "datetime_values": torch.tensor(datetimes, dtype=torch.float32),
             "categorical_ids": torch.tensor(categorical, dtype=torch.long),
+            "numerical_values": torch.tensor(numerical, dtype=torch.float32),
             "text_ids": {column: torch.tensor(ids, dtype=torch.long) for column, ids in text_ids.items()},
             "text_attention": {column: torch.tensor(att, dtype=torch.long) for column, att in text_attention.items()},
             "row_id": torch.tensor(int(index), dtype=torch.long),
@@ -244,6 +265,7 @@ def collate_and_mask(
     foreign_key_ids = torch.stack([sample["foreign_key_ids"] for sample in samples], dim=0)
     datetime_values = torch.stack([sample["datetime_values"] for sample in samples], dim=0)
     categorical_clean = torch.stack([sample["categorical_ids"] for sample in samples], dim=0)
+    numerical_values = torch.stack([sample["numerical_values"] for sample in samples], dim=0)
     batch_size = categorical_clean.shape[0]
     timesteps = torch.rand(batch_size, dtype=torch.float32)
     rates = mask_probability(timesteps, min_mask_prob, max_mask_prob, mask_schedule)
@@ -295,6 +317,7 @@ def collate_and_mask(
         "categorical_input_ids": categorical_input,
         "categorical_clean_ids": categorical_clean,
         "categorical_labels": categorical_labels,
+        "numerical_values": numerical_values,
         "text_input_ids": text_input,
         "text_clean_ids": {
             column: torch.stack([sample["text_ids"][column] for sample in samples], dim=0)

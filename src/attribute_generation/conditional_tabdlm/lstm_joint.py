@@ -20,6 +20,7 @@ from .constrained import decode_category_id, mask_invalid_category_logits, valid
 from .dataset import (
     ConditionalTABDLMDataset,
     load_category_vocabs,
+    load_numerical_metadata,
     load_prepared_tables,
     load_text_tokenizer,
     prepare_rel_amazon_data,
@@ -28,6 +29,7 @@ from .graph_dataset import build_temporal_history_index, write_temporal_graph_me
 from .graph_encoder import TemporalStructureOnlyGraphEncoder
 from .graph_schema import assert_valid_graph_conditioning, graph_conditioning_enabled, graph_metadata
 from .model import DateTimeEncoder
+from .numerical import gaussian_nll_from_params, inverse_transform_numerical, sample_gaussian_params
 from .neighbor_cache import CachedTemporalHistoryIndex
 from .pretokenized import PretokenizedLSTMDataset, load_pretokenized_bundle
 from .schema import ConditionalTABDLMConfig, ConditionalTABDLMSchema
@@ -132,6 +134,12 @@ class JointLSTMRelationalAttributeGenerator(nn.Module):
                 for column in schema.model_categorical_targets
             }
         )
+        self.numerical_heads = nn.ModuleDict(
+            {
+                column: nn.Linear(self.row_hidden_dim, 2)
+                for column in schema.numerical_targets
+            }
+        )
         self.categorical_context_embeddings = nn.ModuleDict(
             {
                 column: nn.Embedding(categorical_vocabs[column].size, self.categorical_context_dim)
@@ -211,6 +219,9 @@ class JointLSTMRelationalAttributeGenerator(nn.Module):
 
     def categorical_logits(self, row_latent: torch.Tensor) -> dict[str, torch.Tensor]:
         return {column: head(row_latent) for column, head in self.categorical_heads.items()}
+
+    def numerical_params(self, row_latent: torch.Tensor) -> dict[str, torch.Tensor]:
+        return {column: head(row_latent) for column, head in self.numerical_heads.items()}
 
     def categorical_context(self, row_latent: torch.Tensor, categorical_ids: torch.Tensor) -> torch.Tensor:
         pieces = [row_latent]
@@ -302,6 +313,7 @@ class JointLSTMRelationalAttributeGenerator(nn.Module):
         condition = self.encode_condition(foreign_key_ids, datetime_values, graph_context=graph_context)
         row = self.row_latent(condition, noise=noise)
         cat_logits = self.categorical_logits(row)
+        numerical = self.numerical_params(row)
         context = self.categorical_context(row, categorical_ids)
         text_logits: dict[str, torch.Tensor] = {}
         summary_repr = None
@@ -313,7 +325,7 @@ class JointLSTMRelationalAttributeGenerator(nn.Module):
             text_logits[column] = self.text_heads[column](output)
             if column == "summary" and self.review_text_conditioned_on_summary:
                 summary_repr = self.summary_representation_from_output(output, state, teacher)
-        return {"categorical": cat_logits, "text": text_logits, "row_latent": row}
+        return {"categorical": cat_logits, "numerical": numerical, "text": text_logits, "row_latent": row}
 
     @torch.no_grad()
     def generate(
@@ -333,6 +345,7 @@ class JointLSTMRelationalAttributeGenerator(nn.Module):
         condition = self.encode_condition(foreign_key_ids, datetime_values, graph_context=graph_context)
         row = self.row_latent(condition)
         cat_logits = self.categorical_logits(row)
+        numerical_params = self.numerical_params(row)
         sampled_cat_columns: list[torch.Tensor] = []
         decoded_cats: dict[str, list[Any]] = {}
         for column in self.schema.model_categorical_targets:
@@ -369,6 +382,7 @@ class JointLSTMRelationalAttributeGenerator(nn.Module):
         return {
             "categorical_ids": categorical_ids,
             "categorical": decoded_cats,
+            "numerical_params": numerical_params,
             "text_ids": text_ids,
             "text": decoded_text,
             "text_lengths": lengths,
@@ -455,6 +469,7 @@ class JointLSTMRelationalAttributeGenerator(nn.Module):
             "decoder_type": self.decoder_type,
             "use_graph_context": self.use_graph_context,
             "text_vocab_size": self.text_vocab_size,
+            "numerical_targets": list(self.schema.numerical_targets),
             "review_text_conditioned_on_summary": self.review_text_conditioned_on_summary,
             "summary_condition_type": self.summary_condition_type,
             "summary_condition_dim": self.summary_condition_dim,
@@ -462,10 +477,15 @@ class JointLSTMRelationalAttributeGenerator(nn.Module):
 
 
 def make_lstm_collate_fn(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    if "numerical_values" in samples[0]:
+        numerical_values = torch.stack([sample["numerical_values"] for sample in samples], dim=0)
+    else:
+        numerical_values = torch.empty((len(samples), 0), dtype=torch.float32)
     return {
         "foreign_key_ids": torch.stack([sample["foreign_key_ids"] for sample in samples], dim=0),
         "datetime_values": torch.stack([sample["datetime_values"] for sample in samples], dim=0),
         "categorical_ids": torch.stack([sample["categorical_ids"] for sample in samples], dim=0),
+        "numerical_values": numerical_values,
         "text_ids": {
             column: torch.stack([sample["text_ids"][column] for sample in samples], dim=0)
             for column in samples[0]["text_ids"]
@@ -582,9 +602,10 @@ def _train_lstm_from_config_once(
 
     categorical_vocabs = load_category_vocabs(config)
     tokenizer = load_text_tokenizer(config)
+    numerical_metadata = load_numerical_metadata(config)
     num_hash_buckets = int(config.raw.get("id_encoding", {}).get("num_buckets", 262144))
-    train_dataset = ConditionalTABDLMDataset(train_frame, config.schema, categorical_vocabs, tokenizer, num_hash_buckets)
-    valid_dataset = ConditionalTABDLMDataset(valid_frame, config.schema, categorical_vocabs, tokenizer, num_hash_buckets)
+    train_dataset = ConditionalTABDLMDataset(train_frame, config.schema, categorical_vocabs, tokenizer, num_hash_buckets, numerical_metadata=numerical_metadata)
+    valid_dataset = ConditionalTABDLMDataset(valid_frame, config.schema, categorical_vocabs, tokenizer, num_hash_buckets, numerical_metadata=numerical_metadata)
     batch_size = int(batch_size_override if batch_size_override is not None else training.get("batch_size", 256))
     num_workers = int(training.get("num_workers", 0))
     train_loader = DataLoader(
@@ -747,9 +768,10 @@ def _train_lstm_fixed_step_from_config_once(
         valid_frame = maybe_limit_rows(valid_frame, validation_row_cap(training.get("max_rows"), len(valid_frame)), seed + 1)
         categorical_vocabs = load_category_vocabs(config)
         tokenizer = load_text_tokenizer(config)
+        numerical_metadata = load_numerical_metadata(config)
         num_hash_buckets = int(config.raw.get("id_encoding", {}).get("num_buckets", 262144))
-        train_dataset = ConditionalTABDLMDataset(train_frame, config.schema, categorical_vocabs, tokenizer, num_hash_buckets)
-        valid_dataset = ConditionalTABDLMDataset(valid_frame, config.schema, categorical_vocabs, tokenizer, num_hash_buckets)
+        train_dataset = ConditionalTABDLMDataset(train_frame, config.schema, categorical_vocabs, tokenizer, num_hash_buckets, numerical_metadata=numerical_metadata)
+        valid_dataset = ConditionalTABDLMDataset(valid_frame, config.schema, categorical_vocabs, tokenizer, num_hash_buckets, numerical_metadata=numerical_metadata)
         train_rows_available = int(len(train_dataset))
 
     use_graph_context = graph_conditioning_enabled(config.raw)
@@ -1410,6 +1432,15 @@ def lstm_joint_loss(
         pred = logits["categorical"][column].argmax(dim=-1)
         correct = int((pred == labels).sum().detach().cpu())
         component[metric_name_for_lstm(column)] = {"loss_sum": float(loss_sum.detach().cpu()), "count": count, "correct": correct}
+    numerical_values = batch.get("numerical_values")
+    if numerical_values is not None:
+        for idx, column in enumerate(schema.numerical_targets):
+            target = numerical_values[:, idx]
+            loss_values = gaussian_nll_from_params(logits["numerical"][column], target)
+            loss_sum = loss_values.sum()
+            count = int(target.numel())
+            losses.append(float(loss_weights.get(column, 1.0)) * (loss_sum / max(count, 1)))
+            component[column] = {"loss_sum": float(loss_sum.detach().cpu()), "count": count}
     for column in schema.text_targets:
         labels = batch["text_ids"][column][:, 1:].contiguous()
         mask = labels != tokenizer.pad_id
@@ -1466,6 +1497,7 @@ def save_lstm_checkpoint(
 ) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    numerical_metadata = load_numerical_metadata(config)
     torch.save(
         {
             "model_state_dict": model.state_dict(),
@@ -1474,6 +1506,7 @@ def save_lstm_checkpoint(
             "schema": config.schema.to_dict(),
             "categorical_vocabs": {column: vocab.to_dict() for column, vocab in categorical_vocabs.items()},
             "tokenizer_metadata": tokenizer.to_dict(),
+            "numerical_metadata": numerical_metadata,
             "epoch": int(epoch),
             "valid_metrics": valid_metrics,
             "graph_encoder_state_dict": graph_encoder.state_dict() if graph_encoder is not None else None,
@@ -1491,6 +1524,9 @@ def load_lstm_checkpoint(
 ) -> tuple[JointLSTMRelationalAttributeGenerator, ConditionalTABDLMConfig, dict[str, CategoryVocab], SimpleTextTokenizer, TemporalStructureOnlyGraphEncoder | None]:
     checkpoint = torch.load(checkpoint_path, map_location=device)
     raw_config = checkpoint["raw_config"]
+    if checkpoint.get("numerical_metadata") is not None:
+        raw_config = dict(raw_config)
+        raw_config["_numerical_metadata"] = checkpoint["numerical_metadata"]
     schema = ConditionalTABDLMSchema.from_config_dict(raw_config)
     config = ConditionalTABDLMConfig(raw=raw_config, schema=schema, config_path=None)
     vocabs = {column: CategoryVocab.from_dict(data) for column, data in checkpoint["categorical_vocabs"].items()}
@@ -1549,7 +1585,8 @@ def sample_lstm_from_config(
         "summary": float(sampling.get("summary_repetition_penalty", 1.10)),
         "review_text": float(sampling.get("review_text_repetition_penalty", 1.05)),
     }
-    attrs: dict[str, list[Any]] = {column: [] for column in ckpt_config.schema.categorical_targets + ckpt_config.schema.text_targets}
+    numerical_metadata = ckpt_config.raw.get("_numerical_metadata") or load_numerical_metadata(ckpt_config)
+    attrs: dict[str, list[Any]] = {column: [] for column in ckpt_config.schema.categorical_targets + ckpt_config.schema.numerical_targets + ckpt_config.schema.text_targets}
     lengths: dict[str, list[int]] = {column: [] for column in ckpt_config.schema.text_targets}
     start_time = time.perf_counter()
     iterator = range(0, len(spine), batch_size_used)
@@ -1579,12 +1616,21 @@ def sample_lstm_from_config(
             )
         for column in ckpt_config.schema.categorical_targets:
             attrs[column].extend(generated["categorical"][column])
+        for column in ckpt_config.schema.numerical_targets:
+            sampled = sample_gaussian_params(
+                generated["numerical_params"][column],
+                temperature=float(sampling.get("numerical_temperature", sampling.get("temperature", 0.9))),
+            )
+            values = inverse_transform_numerical(sampled, numerical_metadata.get(column, {})).detach().cpu().tolist()
+            attrs[column].extend(values)
         for column in ckpt_config.schema.text_targets:
             attrs[column].extend(generated["text"][column])
             lengths[column].extend(generated["text_lengths"][column])
     total_seconds = float(time.perf_counter() - start_time)
     output = spine.loc[:, list(ckpt_config.schema.condition_columns)].copy()
     for column in ckpt_config.schema.categorical_targets:
+        output[column] = attrs[column]
+    for column in ckpt_config.schema.numerical_targets:
         output[column] = attrs[column]
     for column in ckpt_config.schema.text_targets:
         output[column] = attrs[column]
@@ -1659,6 +1705,7 @@ def write_lstm_model_metadata(config: ConditionalTABDLMConfig, metadata_dir: str
         "condition_columns": list(config.schema.condition_columns),
         "target_columns": {
             "categorical": list(config.schema.categorical_targets),
+            "numerical": list(config.schema.numerical_targets),
             "text": list(config.schema.text_targets),
         },
         "auxiliary_targets": list(config.schema.auxiliary_categorical_targets),

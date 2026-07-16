@@ -1,0 +1,67 @@
+experiment_name: lstm_movielens_100k
+dataset_name: movielens_100k
+
+paths:
+  train_data_path: data/processed/interaction_benchmarks/movielens_100k/interactions.csv
+  synthetic_spine_path: data/processed/interaction_benchmarks/movielens_100k/interactions.csv
+  output_dir: outputs/movielens_100k/lstm
+
+columns:
+  condition:
+    foreign_keys: [user_id, movie_id]
+    datetimes: [event_time]
+  target:
+    categorical: [rating]
+    numerical: []
+    text: []
+
+schema:
+  fields:
+    user_id: {role: source_foreign_key, semantic_type: foreign_key}
+    movie_id: {role: destination_foreign_key, semantic_type: foreign_key}
+    event_time: {role: timestamp, semantic_type: datetime}
+    rating:
+      role: generated_attribute
+      semantic_type: ordinal_categorical
+      nullable: false
+
+graph_conditioning:
+  enabled: true
+  mode: structure_only_temporal
+  node_types: [user, movie, rating_event]
+  event_node_type: rating_event
+  foreign_key_edges:
+    - {source_node_type: user, source_column: user_id, target_node_type: rating_event, edge_type: user_to_rating}
+    - {source_node_type: movie, source_column: movie_id, target_node_type: rating_event, edge_type: movie_to_rating}
+  temporal_filter:
+    enabled: true
+    mode: past_only
+    timestamp_column: event_time
+    allow_same_timestamp_events: false
+    exclude_target_event_from_neighbors: true
+    max_history_events_per_customer: 50
+    max_history_events_per_product: 100
+    history_sampling_strategy: recent
+  forbidden_node_features: [rating, verified, summary, review_text]
+  graph_uses_future_events: false
+  graph_uses_target_attributes: false
+  graph_encoder: {type: temporal_structure_ego_encoder, hidden_dim: 128, output_dim: 128, num_layers: 1, dropout: 0.1}
+
+text:
+  max_length: {}
+
+tokenizer: {max_vocab_size: 1000, min_frequency: 1, lowercase: true}
+id_encoding: {type: hash_embedding, num_buckets: 262144, embedding_dim: 64}
+datetime_encoding: {type: continuous_time_fourier, embedding_dim: 32}
+model:
+  family: joint_lstm_generator
+  row_hidden_dim: 128
+  latent_noise_dim: 32
+  categorical_context_dim: 16
+  dropout: 0.1
+  use_graph_context: true
+  graph_context_dim: 128
+text_decoder: {type: lstm, embedding_dim: 64, hidden_dim: 128, num_layers: 1, dropout: 0.0}
+training: {batch_size: 64, epochs: 5, lr: 0.0005, weight_decay: 0.01, seed: 42, num_workers: 0, mixed_precision: true, device: auto}
+loss_weights: {rating: 1.0}
+sampling: {num_rows: 1000, batch_size: auto, temperature: 0.9, top_p: 0.95, seed: 42, device: auto}

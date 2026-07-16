@@ -1,0 +1,13 @@
+dataset_name: movielens_100k
+source_dataset: MovieLens 25M
+domain: movie ratings
+processed_dir: data/processed/interaction_benchmarks/movielens_100k
+interaction_table: interactions.csv
+source_entity_table: users.csv
+destination_entity_table: movies.csv
+source_id_column: user_id
+destination_id_column: movie_id
+timestamp_column: event_time
+generated_attributes:
+  rating: ordinal_categorical
+method_scope: single_designated_temporal_interaction_table

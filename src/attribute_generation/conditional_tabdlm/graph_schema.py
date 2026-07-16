@@ -193,14 +193,18 @@ def graph_metadata(raw_config: dict[str, Any], *, real_graph_used_at_sampling: b
         metadata["graph_uses_target_attributes"] = False
     metadata["uses_graph_context"] = graph_conditioning_enabled(raw_config)
     metadata["graph_node_types"] = list(graph_config(raw_config).get("node_types", ["customer", "product", "review_event"]))
-    metadata["graph_edge_types"] = [
-        "customer_to_review",
-        "review_to_customer",
-        "product_to_review",
-        "review_to_product",
-        "customer_history_to_target",
-        "product_history_to_target",
-    ]
+    configured_edges = graph_config(raw_config).get("foreign_key_edges", [])
+    if configured_edges:
+        metadata["graph_edge_types"] = [str(edge.get("edge_type")) for edge in configured_edges if edge.get("edge_type") is not None]
+    else:
+        metadata["graph_edge_types"] = [
+            "customer_to_review",
+            "review_to_customer",
+            "product_to_review",
+            "review_to_product",
+            "customer_history_to_target",
+            "product_history_to_target",
+        ]
     metadata["graph_encoder_type"] = graph_encoder_config(raw_config).get("type")
     metadata["graph_num_layers"] = int(graph_encoder_config(raw_config).get("num_layers", 2))
     metadata["graph_hidden_dim"] = int(graph_encoder_config(raw_config).get("hidden_dim", 256))
