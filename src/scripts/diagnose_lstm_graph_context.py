@@ -144,8 +144,10 @@ def logit_delta_metrics(left: list[np.ndarray], right: list[np.ndarray], rating_
     kl = np.sum(pa * (np.log(np.clip(pa, 1e-12, None)) - np.log(np.clip(pb, 1e-12, None))), axis=1)
     expected_a = pa @ values
     expected_b = pb @ values
+    finite_pair_mask = np.isfinite(a) & np.isfinite(b)
+    finite_abs_delta = np.abs(a[finite_pair_mask] - b[finite_pair_mask])
     return {
-        "mean_abs_logit_difference": float(np.mean(np.abs(a - b))),
+        "mean_abs_logit_difference": float(np.mean(finite_abs_delta)) if finite_abs_delta.size else None,
         "mean_kl_divergence": float(np.mean(kl)),
         "argmax_changed_fraction": float(np.mean(np.argmax(a, axis=1) != np.argmax(b, axis=1))),
         "mean_abs_expected_rating_change": float(np.mean(np.abs(expected_a - expected_b))),
