@@ -84,6 +84,8 @@ class TemporalHistoryIndex:
         self.timestamps_ns = timestamps.to_numpy(dtype="datetime64[ns]").astype(np.int64)
         self.timestamps_seconds = (self.timestamps_ns.astype(np.float64) / 1e9).astype(np.float32)
         self.num_rows = int(len(normalized))
+        self.customer_hashes = self._precompute_hashes(self.customers, self.customer_col)
+        self.product_hashes = self._precompute_hashes(self.products, self.product_col)
         self.customer_histories = self._build_histories(self.customers)
         self.product_histories = self._build_histories(self.products)
 
@@ -120,6 +122,18 @@ class TemporalHistoryIndex:
         for values in histories.values():
             values.sort()
         return histories
+
+    def _precompute_hashes(self, values: np.ndarray, column: str) -> np.ndarray:
+        hashes = np.empty(len(values), dtype=np.int64)
+        cache: dict[str, int] = {}
+        for idx, value in enumerate(values):
+            key = str(value)
+            bucket = cache.get(key)
+            if bucket is None:
+                bucket = stable_hash_bucket(column, value, self.num_hash_buckets)
+                cache[key] = bucket
+            hashes[idx] = int(bucket)
+        return hashes
 
     def history_for_row(
         self,
@@ -204,16 +218,17 @@ class TemporalHistoryIndex:
         deterministic: bool = True,
     ) -> dict[str, torch.Tensor]:
         if torch.is_tensor(row_indices):
-            rows = [int(value) for value in row_indices.detach().cpu().tolist()]
+            rows_np = row_indices.detach().cpu().numpy().astype(np.int64, copy=False).reshape(-1)
         else:
-            rows = [int(value) for value in row_indices]
+            rows_np = np.asarray(list(row_indices), dtype=np.int64).reshape(-1)
+        rows = [int(value) for value in rows_np.tolist()]
         customer_histories = [self.history_for_row(row, kind="customer", deterministic=deterministic) for row in rows]
         product_histories = [self.history_for_row(row, kind="product", deterministic=deterministic) for row in rows]
         return {
-            "target_row_index": torch.tensor(rows, dtype=torch.long, device=device),
-            "target_customer_hash": self._hash_values([self.customers[row] for row in rows], self.customer_col, device),
-            "target_product_hash": self._hash_values([self.products[row] for row in rows], self.product_col, device),
-            "target_time": torch.tensor([self.timestamps_seconds[row] for row in rows], dtype=torch.float32, device=device),
+            "target_row_index": torch.from_numpy(rows_np).to(device=device, dtype=torch.long),
+            "target_customer_hash": torch.from_numpy(self.customer_hashes[rows_np]).to(device=device, dtype=torch.long),
+            "target_product_hash": torch.from_numpy(self.product_hashes[rows_np]).to(device=device, dtype=torch.long),
+            "target_time": torch.from_numpy(self.timestamps_seconds[rows_np]).to(device=device, dtype=torch.float32),
             **self._pack_history(customer_histories, kind="customer", device=device),
             **self._pack_history(product_histories, kind="product", device=device),
         }
@@ -227,26 +242,29 @@ class TemporalHistoryIndex:
     ) -> dict[str, torch.Tensor]:
         width = self.max_customer_history if kind == "customer" else self.max_product_history
         width = max(int(width), 0)
-        row_index = torch.full((len(histories), width), -1, dtype=torch.long, device=device)
-        customer_hash = torch.zeros((len(histories), width), dtype=torch.long, device=device)
-        product_hash = torch.zeros((len(histories), width), dtype=torch.long, device=device)
-        times = torch.zeros((len(histories), width), dtype=torch.float32, device=device)
-        mask = torch.zeros((len(histories), width), dtype=torch.bool, device=device)
+        batch_size = len(histories)
+        row_index_np = np.full((batch_size, width), -1, dtype=np.int64)
+        customer_hash_np = np.zeros((batch_size, width), dtype=np.int64)
+        product_hash_np = np.zeros((batch_size, width), dtype=np.int64)
+        times_np = np.zeros((batch_size, width), dtype=np.float32)
+        mask_np = np.zeros((batch_size, width), dtype=np.bool_)
         for batch_idx, history in enumerate(histories):
-            clipped = list(history[-width:]) if width > 0 else []
-            for pos, hist_idx in enumerate(clipped):
-                row_index[batch_idx, pos] = int(hist_idx)
-                customer_hash[batch_idx, pos] = stable_hash_bucket(self.customer_col, self.customers[hist_idx], self.num_hash_buckets)
-                product_hash[batch_idx, pos] = stable_hash_bucket(self.product_col, self.products[hist_idx], self.num_hash_buckets)
-                times[batch_idx, pos] = float(self.timestamps_seconds[hist_idx])
-                mask[batch_idx, pos] = True
+            if width <= 0 or not history:
+                continue
+            clipped = np.asarray(history[-width:], dtype=np.int64)
+            count = int(clipped.shape[0])
+            row_index_np[batch_idx, :count] = clipped
+            customer_hash_np[batch_idx, :count] = self.customer_hashes[clipped]
+            product_hash_np[batch_idx, :count] = self.product_hashes[clipped]
+            times_np[batch_idx, :count] = self.timestamps_seconds[clipped]
+            mask_np[batch_idx, :count] = True
         prefix = f"{kind}_history"
         return {
-            f"{prefix}_row_index": row_index,
-            f"{prefix}_customer_hash": customer_hash,
-            f"{prefix}_product_hash": product_hash,
-            f"{prefix}_time": times,
-            f"{prefix}_mask": mask,
+            f"{prefix}_row_index": torch.from_numpy(row_index_np).to(device=device, dtype=torch.long),
+            f"{prefix}_customer_hash": torch.from_numpy(customer_hash_np).to(device=device, dtype=torch.long),
+            f"{prefix}_product_hash": torch.from_numpy(product_hash_np).to(device=device, dtype=torch.long),
+            f"{prefix}_time": torch.from_numpy(times_np).to(device=device, dtype=torch.float32),
+            f"{prefix}_mask": torch.from_numpy(mask_np).to(device=device, dtype=torch.bool),
         }
 
     def _hash_values(
