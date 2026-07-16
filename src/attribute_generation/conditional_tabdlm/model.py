@@ -47,6 +47,7 @@ class ConditionalTABDLM(nn.Module):
         condition_dim: int = 256,
         use_graph_context: bool = False,
         graph_context_dim: int = 256,
+        graph_fusion_method: str = "condition_mean",
     ):
         super().__init__()
         self.schema = schema
@@ -60,6 +61,7 @@ class ConditionalTABDLM(nn.Module):
         self.condition_dim = int(condition_dim)
         self.use_graph_context = bool(use_graph_context)
         self.graph_context_dim = int(graph_context_dim)
+        self.graph_fusion_method = str(graph_fusion_method or "condition_mean")
         self.text_vocab_size = int(text_tokenizer.vocab_size)
         self.text_pad_id = int(text_tokenizer.pad_id)
         self.categorical_vocab_sizes = {
@@ -86,8 +88,16 @@ class ConditionalTABDLM(nn.Module):
                 nn.GELU(),
                 nn.LayerNorm(self.condition_dim),
             )
+            if self.graph_fusion_method == "gated_residual":
+                self.graph_gate_projector = nn.Linear(self.graph_context_dim, self.hidden_dim)
+                self.graph_value_projector = nn.Linear(self.graph_context_dim, self.hidden_dim)
+            else:
+                self.graph_gate_projector = None
+                self.graph_value_projector = None
         else:
             self.graph_context_projector = None
+            self.graph_gate_projector = None
+            self.graph_value_projector = None
         self.condition_norm = nn.LayerNorm(self.condition_dim)
         self.condition_to_hidden = nn.Sequential(
             nn.Linear(self.condition_dim, self.hidden_dim),
@@ -223,6 +233,23 @@ class ConditionalTABDLM(nn.Module):
         sequence = torch.cat(embeddings, dim=1)
         positions = torch.arange(sequence.shape[1], device=device).view(1, -1)
         sequence = sequence + self.position_embedding(positions) + shared_bias
+        if (
+            self.use_graph_context
+            and self.graph_fusion_method == "gated_residual"
+            and self.graph_gate_projector is not None
+            and self.graph_value_projector is not None
+        ):
+            if graph_context is None:
+                graph_context = torch.zeros(
+                    batch_size,
+                    self.graph_context_dim,
+                    dtype=sequence.dtype,
+                    device=device,
+                )
+            graph_context = graph_context.to(device=device, dtype=sequence.dtype)
+            graph_gate = torch.sigmoid(self.graph_gate_projector(graph_context)).unsqueeze(1)
+            graph_value = self.graph_value_projector(graph_context).unsqueeze(1)
+            sequence = sequence + graph_gate * graph_value
         attention = torch.cat(attention_parts, dim=1)
         encoded = self.encoder(sequence, src_key_padding_mask=~attention)
         encoded = self.output_norm(encoded)
@@ -249,6 +276,7 @@ class ConditionalTABDLM(nn.Module):
             "condition_dim": self.condition_dim,
             "use_graph_context": self.use_graph_context,
             "graph_context_dim": self.graph_context_dim,
+            "graph_fusion_method": self.graph_fusion_method,
             "text_vocab_size": self.text_vocab_size,
             "categorical_vocab_sizes": dict(self.categorical_vocab_sizes),
         }

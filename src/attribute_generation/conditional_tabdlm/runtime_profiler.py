@@ -24,6 +24,8 @@ PROFILE_TIMING_FIELDS = (
     "graph_context_lookup_seconds",
     "condition_encoding_seconds",
     "initial_noise_seconds",
+    "structured_diffusion_seconds",
+    "text_diffusion_seconds",
     "denoising_loop_seconds",
     "denoising_step_seconds",
     "final_forward_seconds",

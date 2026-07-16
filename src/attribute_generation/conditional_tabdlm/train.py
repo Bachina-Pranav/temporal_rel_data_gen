@@ -364,6 +364,7 @@ def build_model(
         condition_dim=int(model_cfg.get("condition_dim", 256)),
         use_graph_context=bool(model_cfg.get("use_graph_context", graph_conditioning_enabled(config.raw))),
         graph_context_dim=int(model_cfg.get("graph_context_dim", config.raw.get("graph_conditioning", {}).get("graph_encoder", {}).get("output_dim", 256))),
+        graph_fusion_method=str((model_cfg.get("graph_fusion") or {}).get("method", model_cfg.get("graph_fusion_method", "condition_mean"))),
     )
 
 
