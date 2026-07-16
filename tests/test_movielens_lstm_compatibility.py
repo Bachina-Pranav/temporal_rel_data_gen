@@ -19,6 +19,7 @@ from attribute_generation.conditional_tabdlm.dataset import (  # noqa: E402
 from attribute_generation.conditional_tabdlm.lstm_joint import build_lstm_model, lstm_joint_loss, make_lstm_collate_fn  # noqa: E402
 from attribute_generation.conditional_tabdlm.schema import ConditionalTABDLMConfig, ConditionalTABDLMSchema  # noqa: E402
 from attribute_generation.conditional_tabdlm.tokenization import CategoryVocab, SimpleTextTokenizer  # noqa: E402
+from attribute_generation.conditional_tabdlm.neighbor_sampling import TemporalHistoryIndex  # noqa: E402
 from evaluation.paper_metrics.shape_trend import column_shape_metric  # noqa: E402
 
 
@@ -136,3 +137,26 @@ def test_movielens_paper_shape_metric_reports_ordinal_wasserstein_for_rating():
 
     assert metric["primary_statistic"] == "total_variation"
     assert metric["secondary_statistics"]["ordinal_wasserstein_distance"] > 0
+
+
+def test_recent_temporal_history_uses_capped_strict_past_suffix():
+    frame = pd.DataFrame(
+        {
+            "user_id": ["u"] * 20,
+            "movie_id": ["m"] * 20,
+            "event_time": pd.date_range("2020-01-01", periods=20, freq="D"),
+        }
+    )
+    history = TemporalHistoryIndex(
+        frame,
+        customer_col="user_id",
+        product_col="movie_id",
+        timestamp_col="event_time",
+        num_hash_buckets=128,
+        max_customer_history=3,
+        max_product_history=4,
+        history_sampling_strategy="recent",
+    )
+
+    assert history.history_for_row(10, kind="customer", deterministic=False) == [7, 8, 9]
+    assert history.history_for_row(10, kind="product", deterministic=True) == [6, 7, 8, 9]

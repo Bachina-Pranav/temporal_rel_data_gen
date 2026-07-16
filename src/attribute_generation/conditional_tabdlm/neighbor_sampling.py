@@ -148,6 +148,15 @@ class TemporalHistoryIndex:
         else:
             cutoff = (target_ts, -1)
         end = bisect.bisect_left(items, cutoff)
+        if max_history <= 0:
+            return []
+        if deterministic or self.history_sampling_strategy == "recent":
+            start = max(0, end - max_history)
+            selected = [event_idx for _, event_idx in items[start:end] if int(event_idx) != row_idx]
+            if len(selected) > max_history:
+                selected = selected[-max_history:]
+            self._assert_temporal_safety(row_idx, selected)
+            return selected
         candidates = [event_idx for _, event_idx in items[:end] if int(event_idx) != row_idx]
         selected = self._sample_history(candidates, max_history=max_history, deterministic=deterministic)
         self._assert_temporal_safety(row_idx, selected)
