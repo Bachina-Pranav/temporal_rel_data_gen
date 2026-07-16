@@ -27,12 +27,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--top-p", type=float, default=None)
     parser.add_argument("--text-top-k", type=int, default=None)
-    parser.add_argument("--sampling-steps", type=int, default=None)
+    parser.add_argument("--sampling-steps", default=None, help="Inference denoising steps, or 'full' for the trained diffusion horizon.")
     parser.add_argument("--timestep-spacing", choices=["uniform", "quadratic", "leading", "trailing"], default=None)
     parser.add_argument("--inference-dtype", choices=["float32", "float16", "bfloat16"], default=None)
     parser.add_argument("--compile-model", action="store_true")
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--profile-output", default=None)
+    parser.add_argument("--length-mode", choices=["normal", "empirical_length", "oracle_length"], default=None)
+    parser.add_argument("--oracle-real-table", default=None, help="Real table used only to read row-level text lengths in oracle_length diagnostics.")
     parser.add_argument("--device", default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--debug-write-aux-targets", action="store_true")
@@ -62,6 +64,8 @@ def main() -> None:
         compile_model=args.compile_model,
         profile=args.profile,
         profile_output=args.profile_output,
+        length_mode=args.length_mode,
+        oracle_real_table_path=args.oracle_real_table,
         device=args.device,
         seed=args.seed,
         synthetic_spine_path=args.synthetic_spine,

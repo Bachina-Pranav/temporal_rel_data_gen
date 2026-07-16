@@ -53,13 +53,15 @@ def sample_from_config(
     debug_write_aux_targets: bool = False,
     disable_length_calibration: bool = False,
     repair_invalid_categoricals: bool = False,
-    sampling_steps: int | None = None,
+    sampling_steps: int | str | None = None,
     timestep_spacing: str | None = None,
     inference_dtype: str | None = None,
     compile_model: bool | None = None,
     text_top_k: int | None = None,
     profile: bool | None = None,
     profile_output: str | Path | None = None,
+    length_mode: str | None = None,
+    oracle_real_table_path: str | Path | None = None,
 ) -> Path:
     sampling = config.raw.get("sampling", {})
     diffusion = config.raw.get("diffusion", {})
@@ -74,7 +76,8 @@ def sample_from_config(
     seed = int(seed if seed is not None else sampling.get("seed", 42))
     device = resolve_device(device or str(sampling.get("device", "auto")))
     inference_dtype = str(inference_dtype or sampling.get("inference_dtype", "float32"))
-    sampling_steps = int(sampling_steps or diffusion.get("sampling_steps", diffusion.get("timesteps", 50)))
+    requested_sampling_steps = sampling_steps if sampling_steps is not None else diffusion.get("sampling_steps", diffusion.get("timesteps", 50))
+    sampling_steps = resolve_sampling_steps(requested_sampling_steps, int(diffusion.get("timesteps", diffusion.get("train_timesteps", 50))))
     timestep_spacing = str(timestep_spacing or diffusion.get("timestep_spacing", sampling.get("timestep_spacing", "uniform")))
     compile_model = bool(compile_model if compile_model is not None else sampling.get("compile_model", False))
     text_top_k = parse_optional_int(text_top_k if text_top_k is not None else sampling.get("text_top_k"))
@@ -94,6 +97,17 @@ def sample_from_config(
     if num_rows not in (None, "all"):
         spine = spine.head(int(num_rows)).copy()
     spine = spine.reset_index(drop=True)
+    length_mode = normalize_length_mode(length_mode or sampling.get("length_mode", "normal"))
+    with profile_timer(profiler, "length_target_preparation_seconds"):
+        target_text_lengths, length_target_metadata = prepare_text_length_targets(
+            ckpt_config.schema,
+            tokenizer,
+            length_mode=length_mode,
+            num_rows=len(spine),
+            train_data_path=ckpt_config.train_data_path,
+            oracle_real_table_path=oracle_real_table_path,
+            seed=seed,
+        )
     graph_history_index = None
     if graph_encoder is not None or graph_conditioning_enabled(ckpt_config.raw):
         graph_encoder = graph_encoder or build_graph_encoder(ckpt_config, vocabs, tokenizer).to(device)
@@ -130,6 +144,8 @@ def sample_from_config(
         inference_dtype=inference_dtype,
         text_top_k=text_top_k,
         profiler=profiler,
+        target_text_lengths=target_text_lengths,
+        length_mode=length_mode,
     )
     with profile_timer(profiler, "postprocessing_seconds"):
         output = spine.loc[:, list(ckpt_config.schema.condition_columns)].copy()
@@ -151,6 +167,12 @@ def sample_from_config(
     runtime_output = Path(profile_output) if profile_output else output_path.parent / "metadata" / "runtime_diffusion_sampling.json"
     summary_lengths = text_lengths(output.get("summary")) if "summary" in output else []
     review_lengths = text_lengths(output.get("review_text")) if "review_text" in output else []
+    sampling_diagnostics = attrs.get("_sampling_diagnostics", {})
+    schedule_path = output_path.parent / "metadata" / "timestep_schedule.json"
+    schedule_path.parent.mkdir(parents=True, exist_ok=True)
+    with schedule_path.open("w", encoding="utf-8") as handle:
+        json.dump(jsonable(sampling_diagnostics), handle, indent=2, sort_keys=True)
+        handle.write("\n")
     metadata = {
         "experiment_name": ckpt_config.raw.get("experiment_name", Path(ckpt_config.output_dir).name),
         "checkpoint_path": str(checkpoint_path),
@@ -164,8 +186,14 @@ def sample_from_config(
         "text_top_k": text_top_k,
         "seed": seed,
         "diffusion_train_timesteps": int(ckpt_config.raw.get("diffusion", {}).get("timesteps", 50)),
+        "diffusion_sampling_steps_requested": str(requested_sampling_steps),
         "diffusion_sampling_steps": int(sampling_steps),
+        "diffusion_sampling_steps_resolved": int(sampling_diagnostics.get("num_denoising_steps", sampling_steps)),
         "diffusion_timestep_spacing": str(timestep_spacing),
+        "diffusion_timestep_sequence_path": str(schedule_path),
+        "diffusion_timestep_sequence": sampling_diagnostics.get("timestep_sequence"),
+        "diffusion_model_forward_passes_per_batch": sampling_diagnostics.get("model_forward_passes_per_batch"),
+        "diffusion_model_forward_passes_total": sampling_diagnostics.get("model_forward_passes_total"),
         "inference_dtype": inference_dtype,
         "torch_compile_used": compile_used,
         "runtime_profile_path": str(runtime_output) if profiler.enabled or profile_output is not None else None,
@@ -184,6 +212,9 @@ def sample_from_config(
         "force_eos_after_sampled_length": ckpt_config.schema.force_eos_after_sampled_length,
         "force_pad_after_eos": bool(ckpt_config.schema.force_pad_after_eos),
         "length_calibration_disabled": bool(disable_length_calibration),
+        "length_mode": length_mode,
+        "length_mode_warning": length_target_metadata.get("warning"),
+        "length_target_metadata": length_target_metadata,
         "repair_invalid_categoricals": bool(repair_invalid_categoricals),
         "summary_max_tokens": int(ckpt_config.schema.text_max_lengths.get("summary", 0)) if "summary" in ckpt_config.schema.text_targets else None,
         "review_text_max_tokens": int(ckpt_config.schema.text_max_lengths.get("review_text", 0)) if "review_text" in ckpt_config.schema.text_targets else None,
@@ -240,8 +271,19 @@ def sample_from_config(
             torch_compile_used=compile_used,
             extra={
                 "diffusion_train_timesteps": int(ckpt_config.raw.get("diffusion", {}).get("timesteps", 50)),
-                "diffusion_sampling_steps": int(sampling_steps),
+                "diffusion_sampling_steps_requested": str(requested_sampling_steps),
+                "diffusion_sampling_steps": int(sampling_diagnostics.get("num_denoising_steps", sampling_steps)),
+                "diffusion_sampling_steps_configured": int(sampling_steps),
                 "diffusion_timestep_spacing": str(timestep_spacing),
+                "diffusion_model_forward_passes_per_batch": sampling_diagnostics.get("model_forward_passes_per_batch"),
+                "diffusion_model_forward_passes_total": sampling_diagnostics.get("model_forward_passes_total"),
+                "seconds_per_denoising_step": seconds_per_step(
+                    profiler.timings.get("denoising_loop_seconds", 0.0),
+                    sampling_diagnostics.get("num_denoising_steps"),
+                    sampling_diagnostics.get("num_batches"),
+                ),
+                "length_mode": length_mode,
+                "length_mode_warning": length_target_metadata.get("warning"),
                 "text_top_k": text_top_k,
                 "temperature": temperature,
                 "top_p": top_p,
@@ -289,6 +331,50 @@ def parse_optional_int(value: Any) -> int | None:
         return None
     parsed = int(value)
     return parsed if parsed > 0 else None
+
+
+def resolve_sampling_steps(value: int | str | None, total_timesteps: int) -> int:
+    """Resolve a requested inference step count against the trained horizon."""
+
+    total = max(1, int(total_timesteps))
+    if value is None:
+        return total
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"", "none", "null"}:
+            return total
+        if text == "full":
+            return total
+        parsed = int(text)
+    else:
+        parsed = int(value)
+    if parsed <= 0:
+        raise ValueError("sampling_steps must be positive or 'full'")
+    return min(parsed, total)
+
+
+def normalize_length_mode(value: str | None) -> str:
+    mode = str(value or "normal").strip().lower()
+    aliases = {
+        "none": "normal",
+        "default": "normal",
+        "empirical": "empirical_length",
+        "oracle": "oracle_length",
+    }
+    mode = aliases.get(mode, mode)
+    if mode not in {"normal", "empirical_length", "oracle_length"}:
+        raise ValueError("length_mode must be one of normal, empirical_length, or oracle_length")
+    return mode
+
+
+def seconds_per_step(total_seconds: float, num_steps: Any, num_batches: Any) -> float | None:
+    try:
+        denominator = int(num_steps) * int(num_batches)
+    except (TypeError, ValueError):
+        return None
+    if denominator <= 0:
+        return None
+    return float(total_seconds) / float(denominator)
 
 
 def maybe_compile_model(model: torch.nn.Module, enabled: bool) -> tuple[torch.nn.Module, bool]:
@@ -345,6 +431,121 @@ def masked_denoising_schedule(total_timesteps: int, sampling_steps: int, spacing
     if 1 not in schedule:
         schedule[-1] = 1
     return sorted(set(schedule), reverse=True)
+
+
+def prepare_text_length_targets(
+    schema: ConditionalTABDLMSchema,
+    tokenizer: SimpleTextTokenizer,
+    *,
+    length_mode: str,
+    num_rows: int,
+    train_data_path: str | Path,
+    oracle_real_table_path: str | Path | None = None,
+    seed: int = 42,
+) -> tuple[dict[str, np.ndarray] | None, dict[str, Any]]:
+    """Prepare optional per-row content-length targets without exposing text tokens."""
+
+    mode = normalize_length_mode(length_mode)
+    metadata: dict[str, Any] = {
+        "mode": mode,
+        "num_rows": int(num_rows),
+        "text_columns": list(schema.text_targets),
+        "unit": "tokenizer_content_tokens_excluding_bos_eos_pad",
+    }
+    if mode == "normal" or not schema.text_targets:
+        return None, metadata
+
+    if mode == "empirical_length":
+        distributions = text_length_distributions_from_table(
+            train_data_path,
+            schema,
+            tokenizer,
+        )
+        rng = np.random.default_rng(int(seed))
+        targets: dict[str, np.ndarray] = {}
+        metadata["source"] = str(train_data_path)
+        metadata["columns"] = {}
+        for column in schema.text_targets:
+            values = distributions[column]
+            if values.size == 0:
+                raise ValueError(f"Cannot sample empirical lengths for {column!r}; empty training distribution")
+            sampled = rng.choice(values, size=int(num_rows), replace=True)
+            targets[column] = sampled.astype(np.int64, copy=False)
+            metadata["columns"][column] = length_array_metadata(values, sampled)
+        return targets, metadata
+
+    if mode == "oracle_length":
+        source = Path(oracle_real_table_path or train_data_path)
+        targets = text_lengths_from_table_head(source, schema, tokenizer, int(num_rows))
+        metadata["source"] = str(source)
+        metadata["warning"] = "NOT A VALID GENERATIVE BASELINE: uses real row-level text lengths only."
+        metadata["columns"] = {
+            column: length_array_metadata(values, values)
+            for column, values in targets.items()
+        }
+        return targets, metadata
+
+    raise AssertionError(f"Unhandled length mode: {mode}")
+
+
+def text_length_distributions_from_table(
+    path: str | Path,
+    schema: ConditionalTABDLMSchema,
+    tokenizer: SimpleTextTokenizer,
+) -> dict[str, np.ndarray]:
+    path = Path(path)
+    usecols = list(schema.text_targets)
+    frame_iter = pd.read_csv(path, usecols=usecols, chunksize=200_000, low_memory=False)
+    pieces: dict[str, list[np.ndarray]] = {column: [] for column in usecols}
+    for chunk in frame_iter:
+        for column in usecols:
+            lengths = tokenizer_content_lengths(chunk[column], tokenizer, int(schema.text_max_lengths[column]))
+            pieces[column].append(lengths)
+    return {
+        column: np.concatenate(values).astype(np.int64, copy=False) if values else np.asarray([], dtype=np.int64)
+        for column, values in pieces.items()
+    }
+
+
+def text_lengths_from_table_head(
+    path: str | Path,
+    schema: ConditionalTABDLMSchema,
+    tokenizer: SimpleTextTokenizer,
+    num_rows: int,
+) -> dict[str, np.ndarray]:
+    path = Path(path)
+    frame = pd.read_csv(path, usecols=list(schema.text_targets), nrows=int(num_rows), low_memory=False)
+    if len(frame) < int(num_rows):
+        raise ValueError(f"Oracle-length source has {len(frame)} rows, but {num_rows} were requested: {path}")
+    return {
+        column: tokenizer_content_lengths(frame[column], tokenizer, int(schema.text_max_lengths[column]))
+        for column in schema.text_targets
+    }
+
+
+def tokenizer_content_lengths(series: pd.Series, tokenizer: SimpleTextTokenizer, max_length: int) -> np.ndarray:
+    lengths = [
+        tokenizer.content_length(tokenizer.encode(value, max_length=max_length)[0])
+        for value in series.fillna("").tolist()
+    ]
+    return np.asarray(lengths, dtype=np.int64)
+
+
+def length_array_metadata(reference: np.ndarray, selected: np.ndarray) -> dict[str, Any]:
+    reference = np.asarray(reference, dtype=np.int64)
+    selected = np.asarray(selected, dtype=np.int64)
+    return {
+        "reference_count": int(reference.size),
+        "selected_count": int(selected.size),
+        "reference_mean": float(np.mean(reference)) if reference.size else None,
+        "selected_mean": float(np.mean(selected)) if selected.size else None,
+        "reference_p50": float(np.quantile(reference, 0.50)) if reference.size else None,
+        "selected_p50": float(np.quantile(selected, 0.50)) if selected.size else None,
+        "reference_p95": float(np.quantile(reference, 0.95)) if reference.size else None,
+        "selected_p95": float(np.quantile(selected, 0.95)) if selected.size else None,
+        "reference_max": int(reference.max()) if reference.size else None,
+        "selected_max": int(selected.max()) if selected.size else None,
+    }
 
 
 def reveal_probability_for_schedule(current_step: int, next_step: int) -> float:
@@ -417,7 +618,10 @@ def sample_attributes(
     inference_dtype: str = "float32",
     text_top_k: int | None = None,
     profiler: RuntimeProfiler | None = None,
+    target_text_lengths: dict[str, np.ndarray | torch.Tensor | list[int]] | None = None,
+    length_mode: str = "normal",
 ) -> dict[str, list[str]]:
+    set_seed(int(seed))
     id_cfg = config.raw.get("id_encoding", {})
     diffusion = config.raw.get("diffusion", {})
     sampling_cfg = config.raw.get("sampling", {})
@@ -428,6 +632,7 @@ def sample_attributes(
         sampling_steps=int(sampling_steps or timesteps),
         spacing=timestep_spacing,
     )
+    length_mode = normalize_length_mode(length_mode)
     autocast_dtype, autocast_enabled = resolve_inference_dtype(inference_dtype, device)
     repetition_penalties = {
         column: float(sampling_cfg.get(f"{column}_content_repetition_penalty", sampling_cfg.get("summary_content_repetition_penalty", 1.0)))
@@ -454,6 +659,7 @@ def sample_attributes(
         iterator = tqdm(iterator, total=(len(spine) + int(batch_size) - 1) // int(batch_size), desc="sample")
     for start in iterator:
         batch_frame = spine.iloc[start : start + int(batch_size)]
+        batch_target_text_lengths = slice_text_length_targets(target_text_lengths, start, len(batch_frame), device)
         with profile_timer(profiler, "condition_encoding_seconds", device=device):
             foreign_key_ids, datetime_values = encode_conditions(batch_frame, schema, num_hash_buckets, device)
         graph_context = None
@@ -596,6 +802,7 @@ def sample_attributes(
                 top_p=top_p,
                 repetition_penalties=repetition_penalties,
                 min_content_tokens=min_content_tokens,
+                target_text_lengths=batch_target_text_lengths,
             )
 
         decoded_cats: dict[str, list[str]] = {}
@@ -657,7 +864,42 @@ def sample_attributes(
             )
     result["_debug_examples"] = debug_examples
     result["_length_calibration"] = calibration or {}
+    num_batches = int(math.ceil(len(spine) / max(int(batch_size), 1)))
+    result["_sampling_diagnostics"] = {
+        "total_timesteps": int(timesteps),
+        "requested_sampling_steps": int(sampling_steps or timesteps),
+        "num_denoising_steps": int(len(schedule)),
+        "timestep_spacing": str(timestep_spacing),
+        "timestep_sequence": [int(value) for value in schedule],
+        "commit_revealed_tokens": True,
+        "committed_tokens_can_be_revised": False,
+        "final_forward_pass_after_denoising": True,
+        "model_forward_passes_per_batch": int(len(schedule) + 1),
+        "num_batches": num_batches,
+        "model_forward_passes_total": int(num_batches * (len(schedule) + 1)),
+        "length_mode": length_mode,
+        "explicit_text_length_targets_used": bool(target_text_lengths),
+    }
     return result
+
+
+def slice_text_length_targets(
+    target_text_lengths: dict[str, np.ndarray | torch.Tensor | list[int]] | None,
+    start: int,
+    batch_size: int,
+    device: str,
+) -> dict[str, torch.Tensor] | None:
+    if not target_text_lengths:
+        return None
+    sliced: dict[str, torch.Tensor] = {}
+    stop = int(start) + int(batch_size)
+    for column, values in target_text_lengths.items():
+        if isinstance(values, torch.Tensor):
+            tensor = values[int(start) : stop].to(device=device, dtype=torch.long)
+        else:
+            tensor = torch.tensor(np.asarray(values, dtype=np.int64)[int(start) : stop], dtype=torch.long, device=device)
+        sliced[column] = tensor
+    return sliced
 
 
 def enforce_summary_length_constraints(
@@ -672,6 +914,7 @@ def enforce_summary_length_constraints(
     top_p: float,
     repetition_penalty: float = 1.0,
     min_content_tokens: int = 0,
+    target_text_lengths: dict[str, torch.Tensor] | None = None,
 ) -> list[dict[str, Any]]:
     rows = enforce_length_constraints(
         schema=schema,
@@ -685,6 +928,7 @@ def enforce_summary_length_constraints(
         top_p=top_p,
         repetition_penalties={column: repetition_penalty for column in schema.text_targets},
         min_content_tokens={column: min_content_tokens for column in schema.text_targets},
+        target_text_lengths=target_text_lengths,
     )
     if not schema.text_targets:
         return []
@@ -704,6 +948,7 @@ def enforce_length_constraints(
     top_p: float,
     repetition_penalties: dict[str, float] | None = None,
     min_content_tokens: dict[str, int] | None = None,
+    target_text_lengths: dict[str, torch.Tensor] | None = None,
 ) -> list[dict[str, dict[str, Any]]]:
     if not schema.text_targets:
         return []
@@ -720,7 +965,13 @@ def enforce_length_constraints(
         length_targets: list[int] | None = None
         length_buckets: list[str] | None = None
         buckets: dict[str, tuple[int, int]] = {}
-        if (
+        explicit_lengths = target_text_lengths.get(column) if target_text_lengths else None
+        if explicit_lengths is not None:
+            length_targets = [
+                int(value)
+                for value in explicit_lengths.detach().cpu().reshape(-1).tolist()
+            ]
+        elif (
             schema.use_length_bucket_in_sampling
             and bucket_column is not None
             and bucket_column in schema.model_categorical_targets
@@ -740,7 +991,18 @@ def enforce_length_constraints(
             bucket_name = length_buckets[row_idx] if length_buckets else None
             bucket_bounds = buckets.get(str(bucket_name), (None, None)) if bucket_name is not None else (None, None)
             sequences[row_idx, 0] = text_tokenizer.bos_id
-            if target_len is not None and schema.force_eos_after_sampled_length:
+            if explicit_lengths is not None and target_len is not None:
+                target_len = int(max(0, min(int(target_len), max_content)))
+                enforce_exact_content_length(
+                    sequences[row_idx],
+                    logits[row_idx],
+                    text_tokenizer,
+                    target_len=target_len,
+                    temperature=temperature,
+                    top_p=top_p,
+                    repetition_penalty=float(repetition_penalties.get(column, 1.0)),
+                )
+            elif target_len is not None and schema.force_eos_after_sampled_length:
                 target_len = int(max(0, min(target_len, max_content)))
                 mode = str(schema.force_eos_after_sampled_length).lower()
                 if mode == "soft":
@@ -784,12 +1046,46 @@ def enforce_length_constraints(
                 target_bucket_respected = int(int(low) <= int(decoded_length) <= int(high))
             debug_by_row[row_idx][column] = {
                 "target_content_length": target_len,
+                "target_length_source": "explicit" if explicit_lengths is not None else ("length_bucket" if target_len is not None else None),
                 "target_bucket_low": low,
                 "target_bucket_high": high,
                 "target_bucket_respected": target_bucket_respected,
                 "decoded_length_bucket": decoded_length_bucket(decoded_length, schema, bucket_column),
             }
     return debug_by_row
+
+
+def enforce_exact_content_length(
+    sequence: torch.Tensor,
+    logits: torch.Tensor,
+    tokenizer: SimpleTextTokenizer,
+    *,
+    target_len: int,
+    temperature: float,
+    top_p: float,
+    repetition_penalty: float,
+) -> None:
+    """Force BOS + target content tokens + EOS + PAD for one text field."""
+
+    max_len = int(sequence.shape[0])
+    max_content = tokenizer.max_content_tokens(max_len)
+    target = max(0, min(int(target_len), max_content))
+    sequence[0] = tokenizer.bos_id
+    eos_pos = min(target + 1, max_len - 1)
+    for pos in range(1, eos_pos):
+        token_id = int(sequence[pos].item())
+        if token_id in tokenizer.special_ids:
+            sequence[pos] = sample_content_token(
+                logits[pos],
+                tokenizer,
+                temperature=temperature,
+                top_p=top_p,
+                previous_ids=sequence[1:pos].detach().cpu().tolist(),
+                repetition_penalty=repetition_penalty,
+            )
+    sequence[eos_pos] = tokenizer.eos_id
+    if eos_pos + 1 < max_len:
+        sequence[eos_pos + 1 :] = tokenizer.pad_id
 
 
 def sample_length_bucket_logits(

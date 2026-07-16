@@ -17,6 +17,7 @@ PROFILE_TIMING_FIELDS = (
     "loading_synthetic_spine_seconds",
     "loading_model_seconds",
     "loading_spine_seconds",
+    "length_target_preparation_seconds",
     "graph_history_build_seconds",
     "graph_context_total_seconds",
     "graph_context_cache_build_seconds",

@@ -31,7 +31,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--synthetic-spine", default=None)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--num-rows", type=int, default=1000)
-    parser.add_argument("--sampling-steps", nargs="+", type=int, default=[50, 25, 10])
+    parser.add_argument("--sampling-steps", nargs="+", default=["50", "25", "10"], help="Step counts or 'full'.")
     parser.add_argument("--sample-batch-sizes", nargs="+", type=int, default=[32])
     parser.add_argument("--inference-dtypes", nargs="+", choices=["float32", "float16", "bfloat16"], default=["float32"])
     parser.add_argument("--text-top-k", nargs="+", default=["none"], help="Use 'none' for full-vocab top-p sampling.")
@@ -135,7 +135,7 @@ def build_variants(args: argparse.Namespace):
             for dtype in args.inference_dtypes:
                 for top_k in args.text_top_k:
                     yield {
-                        "sampling_steps": int(steps),
+                        "sampling_steps": str(steps),
                         "sample_batch_size": int(batch_size),
                         "inference_dtype": str(dtype),
                         "text_top_k": parse_top_k(top_k),

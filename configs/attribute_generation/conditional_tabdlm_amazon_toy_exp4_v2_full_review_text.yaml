@@ -238,6 +238,7 @@ sampling:
   inference_dtype: float32
   compile_model: false
   profile: false
+  length_mode: normal
   text_top_k: null
   temperature: 0.9
   top_p: 0.95
