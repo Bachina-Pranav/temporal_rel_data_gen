@@ -33,7 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--spine", required=True)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--num-rows", type=int, default=15000)
+    parser.add_argument("--num-rows", default="15000", help="Number of spine rows to use, or 'all'.")
     parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seed", type=int, default=42)
@@ -49,7 +49,11 @@ def main() -> None:
     model.eval()
     if graph_encoder is not None:
         graph_encoder.eval()
-    spine = pd.read_csv(args.spine).head(int(args.num_rows)).reset_index(drop=True)
+    num_rows = parse_num_rows(args.num_rows)
+    spine = pd.read_csv(args.spine)
+    if num_rows is not None:
+        spine = spine.head(num_rows)
+    spine = spine.reset_index(drop=True)
     if len(config.schema.foreign_key_columns) < 2:
         raise ValueError("Conditioning diagnostic requires two foreign-key columns")
     user_col, movie_col = config.schema.foreign_key_columns[:2]
@@ -116,6 +120,18 @@ def main() -> None:
     summary_path = output_dir / "conditioning_input_diagnostic.json"
     summary_path.write_text(json.dumps(jsonable(summary), indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(summary_path)
+
+
+def parse_num_rows(value: str | int | None) -> int | None:
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text == "all":
+        return None
+    parsed = int(text)
+    if parsed <= 0:
+        raise ValueError("--num-rows must be positive or 'all'")
+    return parsed
 
 
 def shuffled_column(frame: pd.DataFrame, column: str, rng: np.random.Generator) -> pd.DataFrame:

@@ -35,7 +35,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--spine", required=True)
     parser.add_argument("--reference-table", default=None)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--num-rows", type=int, default=10000)
+    parser.add_argument("--num-rows", default="10000", help="Number of spine rows to use, or 'all'.")
     parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seed", type=int, default=42)
@@ -52,7 +52,11 @@ def main() -> None:
         raise ValueError("Checkpoint/config does not have graph conditioning enabled")
     model.eval()
     graph_encoder.eval()
-    spine = pd.read_csv(args.spine).head(int(args.num_rows)).reset_index(drop=True)
+    num_rows = parse_num_rows(args.num_rows)
+    spine = pd.read_csv(args.spine)
+    if num_rows is not None:
+        spine = spine.head(num_rows)
+    spine = spine.reset_index(drop=True)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     graph_history = build_temporal_history_index(spine, ckpt_config, seed=int(args.seed))
@@ -117,6 +121,18 @@ def main() -> None:
     summary_path = output_dir / "graph_context_diagnostic.json"
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(f"Wrote {summary_path}")
+
+
+def parse_num_rows(value: str | int | None) -> int | None:
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text == "all":
+        return None
+    parsed = int(text)
+    if parsed <= 0:
+        raise ValueError("--num-rows must be positive or 'all'")
+    return parsed
 
 
 def deterministic_logits(model, foreign_key_ids, datetime_values, graph_context, rating_col: str, vocab) -> np.ndarray:
