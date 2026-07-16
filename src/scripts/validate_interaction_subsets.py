@@ -29,7 +29,18 @@ def main() -> None:
     failed = False
     for name in names:
         adapter = get_adapter(name)
-        report = validate_subset(adapter, root / adapter.benchmark_name)
+        subset_dir = root / adapter.benchmark_name
+        if not (subset_dir / "interactions.csv").exists():
+            report = {
+                "dataset_name": adapter.benchmark_name,
+                "valid": False,
+                "status": "missing",
+                "errors": [f"Missing subset interactions: {subset_dir / 'interactions.csv'}"],
+            }
+            print(json.dumps(report, sort_keys=True))
+            failed = True
+            continue
+        report = validate_subset(adapter, subset_dir)
         (root / adapter.benchmark_name / "validation_report.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         print(json.dumps(report, sort_keys=True))
         failed = failed or not report["valid"]

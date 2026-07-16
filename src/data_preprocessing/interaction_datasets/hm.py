@@ -70,6 +70,11 @@ class HMAdapter(InteractionDatasetAdapter):
                 }
             )
 
+    def iter_source_id_chunks(self, raw_root, *, chunk_size: int = 250_000) -> Iterator[pd.Series]:
+        path = self.locate_raw_files(raw_root).files["transactions"]
+        for chunk in pd.read_csv(path, usecols=["customer_id"], chunksize=chunk_size):
+            yield chunk["customer_id"].astype(str)
+
     def load_source_entities(self, raw_root, selected_ids: set[str]) -> pd.DataFrame:
         return filter_csv_by_ids(self.locate_raw_files(raw_root).files["customers"], "customer_id", selected_ids)
 

@@ -75,6 +75,11 @@ class RetailRocketAdapter(InteractionDatasetAdapter):
                 out["_audit_transactionid"] = audit_transaction
             yield out
 
+    def iter_source_id_chunks(self, raw_root, *, chunk_size: int = 250_000) -> Iterator[pd.Series]:
+        path = self.locate_raw_files(raw_root).files["events"]
+        for chunk in pd.read_csv(path, usecols=["visitorid"], chunksize=chunk_size):
+            yield chunk["visitorid"].astype(str)
+
     def load_destination_entities(self, raw_root, selected_ids: set[str]) -> pd.DataFrame:
         return pd.DataFrame({"item_id": sorted(str(value) for value in selected_ids)})
 

@@ -22,6 +22,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--archive", default=None, help="Local archive for one dataset, especially Yelp.")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--verify-only", action="store_true")
+    parser.add_argument("--fail-on-blocked", action="store_true", help="Exit nonzero when credentials/archive/license block a dataset.")
     return parser.parse_args()
 
 
@@ -49,7 +50,7 @@ def main() -> None:
         print(json.dumps(payload, sort_keys=True))
         results.append(payload)
     blocked = [row for row in results if str(row["status"]).startswith("blocked")]
-    if blocked:
+    if blocked and args.fail_on_blocked:
         raise SystemExit(2)
 
 

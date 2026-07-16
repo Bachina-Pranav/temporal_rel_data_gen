@@ -75,6 +75,11 @@ class MovieLensAdapter(InteractionDatasetAdapter):
             )
             yield out
 
+    def iter_source_id_chunks(self, raw_root, *, chunk_size: int = 250_000) -> Iterator[pd.Series]:
+        path = self.locate_raw_files(raw_root).files["ratings"]
+        for chunk in pd.read_csv(path, usecols=["userId"], chunksize=chunk_size):
+            yield chunk["userId"].astype(str)
+
     def load_destination_entities(self, raw_root, selected_ids: set[str]) -> pd.DataFrame:
         movies = pd.read_csv(self.locate_raw_files(raw_root).files["movies"])
         movies = movies.rename(columns={"movieId": "movie_id"})

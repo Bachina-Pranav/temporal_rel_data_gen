@@ -37,10 +37,17 @@ def count_source_histories(
     chunk_size: int = 250_000,
 ) -> pd.Series:
     counts: dict[str, int] = {}
-    for chunk in adapter.iter_interaction_chunks(raw_root, chunk_size=chunk_size):
-        source = chunk[adapter.source_id_column].astype(str)
+    rows_seen = 0
+    for chunk_idx, source in enumerate(adapter.iter_source_id_chunks(raw_root, chunk_size=chunk_size), start=1):
+        source = source.astype(str)
+        rows_seen += int(len(source))
         for key, value in source.value_counts().items():
             counts[str(key)] = counts.get(str(key), 0) + int(value)
+        if chunk_idx == 1 or chunk_idx % 10 == 0:
+            print(
+                f"[count] {adapter.dataset_name}: chunks={chunk_idx:,} rows={rows_seen:,} source_entities={len(counts):,}",
+                flush=True,
+            )
     return pd.Series(counts, dtype="int64").sort_index()
 
 
@@ -140,10 +147,20 @@ def build_interaction_subset(
     )
     selected = set(selection.selected_ids)
     chunks: list[pd.DataFrame] = []
-    for chunk in adapter.iter_interaction_chunks(raw_root, chunk_size=chunk_size):
+    rows_seen = 0
+    rows_retained = 0
+    for chunk_idx, chunk in enumerate(adapter.iter_interaction_chunks(raw_root, chunk_size=chunk_size), start=1):
+        rows_seen += int(len(chunk))
         mask = chunk[adapter.source_id_column].astype(str).isin(selected)
         if bool(mask.any()):
-            chunks.append(chunk.loc[mask].copy())
+            retained = chunk.loc[mask].copy()
+            rows_retained += int(len(retained))
+            chunks.append(retained)
+        if chunk_idx == 1 or chunk_idx % 10 == 0:
+            print(
+                f"[materialize] {adapter.dataset_name}: chunks={chunk_idx:,} rows={rows_seen:,} retained={rows_retained:,}",
+                flush=True,
+            )
     if not chunks:
         raise ValueError(f"No interactions retained for {adapter.dataset_name}")
     interactions = pd.concat(chunks, ignore_index=True)

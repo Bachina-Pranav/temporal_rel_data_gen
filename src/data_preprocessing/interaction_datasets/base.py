@@ -91,6 +91,21 @@ class InteractionDatasetAdapter:
     ) -> Iterator[pd.DataFrame]:
         raise NotImplementedError
 
+    def iter_source_id_chunks(
+        self,
+        raw_root: str | Path,
+        *,
+        chunk_size: int = 250_000,
+    ) -> Iterator[pd.Series]:
+        """Yield only source IDs for the complete-history counting pass.
+
+        Adapters can override this to avoid parsing timestamps/text/attributes
+        while counting large raw interaction sources.
+        """
+
+        for chunk in self.iter_interaction_chunks(raw_root, chunk_size=chunk_size):
+            yield chunk[self.source_id_column].astype(str)
+
     def load_source_entities(self, raw_root: str | Path, selected_ids: set[str]) -> pd.DataFrame:
         return pd.DataFrame({self.source_id_column: sorted(str(value) for value in selected_ids)})
 

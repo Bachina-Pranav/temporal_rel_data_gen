@@ -33,20 +33,37 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     names = args.datasets or ([args.dataset] if args.dataset else list_datasets())
+    failed = False
     for name in names:
         adapter = get_adapter(name)
-        manifest = build_interaction_subset(
-            adapter,
-            raw_root=args.raw_root,
-            processed_root=args.processed_root,
-            target_interactions=args.target_interactions,
-            allowed_relative_error=args.allowed_relative_error,
-            seed=args.seed,
-            chunk_size=args.chunk_size,
-            memory_budget_mb=args.memory_budget_mb,
-            temp_dir=args.temp_dir,
-        )
-        print(json.dumps({"dataset_name": adapter.benchmark_name, "output": str(Path(args.processed_root) / adapter.benchmark_name), **manifest}, sort_keys=True, default=str))
+        try:
+            manifest = build_interaction_subset(
+                adapter,
+                raw_root=args.raw_root,
+                processed_root=args.processed_root,
+                target_interactions=args.target_interactions,
+                allowed_relative_error=args.allowed_relative_error,
+                seed=args.seed,
+                chunk_size=args.chunk_size,
+                memory_budget_mb=args.memory_budget_mb,
+                temp_dir=args.temp_dir,
+            )
+            print(json.dumps({"dataset_name": adapter.benchmark_name, "output": str(Path(args.processed_root) / adapter.benchmark_name), **manifest}, sort_keys=True, default=str))
+        except FileNotFoundError as exc:
+            failed = True
+            print(
+                json.dumps(
+                    {
+                        "dataset_name": adapter.benchmark_name,
+                        "status": "missing_raw_data",
+                        "message": str(exc),
+                        "output": str(Path(args.processed_root) / adapter.benchmark_name),
+                    },
+                    sort_keys=True,
+                )
+            )
+    if failed:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

@@ -43,6 +43,15 @@ class YelpAdapter(InteractionDatasetAdapter):
         raw_dir = self.raw_dir(raw_root)
         raw_dir.mkdir(parents=True, exist_ok=True)
         if archive is not None:
+            archive = Path(archive)
+            if not archive.exists():
+                return DownloadResult(
+                    self.dataset_name,
+                    "blocked_missing_archive",
+                    raw_dir,
+                    f"Yelp archive not found: {archive}. Replace the placeholder with the real yelp_dataset.tar path.",
+                    {"archive": str(archive), "manual_acceptance_required": True},
+                )
             if not verify_only:
                 safe_extract_archive(archive, raw_dir)
             result = DownloadResult(self.dataset_name, "loaded_from_local_archive", raw_dir, f"Loaded {archive}", {"archive": str(archive), "manual_acceptance_required": True})
@@ -101,6 +110,18 @@ class YelpAdapter(InteractionDatasetAdapter):
                     rows = []
         if rows:
             yield pd.DataFrame(rows)
+
+    def iter_source_id_chunks(self, raw_root, *, chunk_size: int = 100_000) -> Iterator[pd.Series]:
+        path = self.locate_raw_files(raw_root).files["review"]
+        rows = []
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                rows.append(str(json.loads(line)["user_id"]))
+                if len(rows) >= chunk_size:
+                    yield pd.Series(rows, dtype=str)
+                    rows = []
+        if rows:
+            yield pd.Series(rows, dtype=str)
 
     def load_source_entities(self, raw_root, selected_ids: set[str]) -> pd.DataFrame:
         return filter_jsonl(self.locate_raw_files(raw_root).files["user"], "user_id", selected_ids)
