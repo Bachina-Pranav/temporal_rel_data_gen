@@ -74,7 +74,13 @@ def column_shape_metric(real_col: pd.Series, syn_col: pd.Series, col_type: str, 
         if support is not None:
             support = canonicalize_categorical_series(pd.Series(support), cfg).dropna().drop_duplicates().tolist()
         err = total_variation(real_col, syn_col, support=support)
-        return {"type": col_type, "shape_error": err, "primary_statistic": "total_variation", "secondary_statistics": {}}
+        secondary: dict[str, Any] = {}
+        if bool(cfg.get("ordered", False)) or str(cfg.get("semantic_type", "")).lower() == "ordinal_categorical":
+            secondary["ordinal_wasserstein_distance"] = wasserstein_1d(
+                numeric_series(real_col),
+                numeric_series(syn_col),
+            )
+        return {"type": col_type, "shape_error": err, "primary_statistic": "total_variation", "secondary_statistics": secondary}
     if col_type in {"numerical", "numeric", "number"}:
         r = numeric_series(real_col)
         s = numeric_series(syn_col)

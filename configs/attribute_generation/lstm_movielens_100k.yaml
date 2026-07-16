@@ -1,10 +1,30 @@
 experiment_name: lstm_movielens_100k
 dataset_name: movielens_100k
 
+dataset:
+  name: movielens_100k
+  interaction_table: interactions
+  source_entity_table: users
+  destination_entity_table: movies
+
+event_spine:
+  source_fk: user_id
+  destination_fk: movie_id
+  timestamp: event_time
+
+generated_attributes:
+  rating:
+    semantic_type: ordinal_categorical
+    valid_domain: [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0]
+
+text_fields: []
+continuous_numerical_fields: []
+count_numerical_fields: []
+
 paths:
   train_data_path: data/processed/interaction_benchmarks/movielens_100k/interactions.csv
   synthetic_spine_path: data/processed/interaction_benchmarks/movielens_100k/interactions.csv
-  output_dir: outputs/movielens_100k/lstm
+  output_dir: outputs/movielens-100k/lstm_v53
 
 columns:
   condition:
@@ -50,7 +70,7 @@ graph_conditioning:
 text:
   max_length: {}
 
-tokenizer: {max_vocab_size: 1000, min_frequency: 1, lowercase: true}
+tokenizer: {enabled: false, max_vocab_size: 0, min_frequency: 1, lowercase: true}
 id_encoding: {type: hash_embedding, num_buckets: 262144, embedding_dim: 64}
 datetime_encoding: {type: continuous_time_fourier, embedding_dim: 32}
 model:
@@ -61,7 +81,24 @@ model:
   dropout: 0.1
   use_graph_context: true
   graph_context_dim: 128
-text_decoder: {type: lstm, embedding_dim: 64, hidden_dim: 128, num_layers: 1, dropout: 0.0}
-training: {batch_size: 64, epochs: 5, lr: 0.0005, weight_decay: 0.01, seed: 42, num_workers: 0, mixed_precision: true, device: auto}
+text_decoder: {enabled: false, type: none, embedding_dim: 0, hidden_dim: 0, num_layers: 0, dropout: 0.0}
+review_text_decoder: {enabled: false, condition_on_summary: false}
+summary_decoder: {enabled: false}
+text_length_prediction: {enabled: false}
+numerical_heads: {enabled: false}
+training:
+  batch_size: 256
+  epochs: 100
+  early_stopping_patience: 12
+  early_stopping_min_delta: 0.0001
+  lr: 0.0005
+  weight_decay: 0.01
+  seed: 42
+  num_workers: 0
+  mixed_precision: true
+  auto_reduce_batch_size: true
+  min_batch_size: 32
+  gradient_clip_norm: 1.0
+  device: auto
 loss_weights: {rating: 1.0}
-sampling: {num_rows: 1000, batch_size: auto, temperature: 0.9, top_p: 0.95, seed: 42, device: auto}
+sampling: {num_rows: all, batch_size: auto, temperature: 0.9, top_p: 0.95, seed: 42, device: auto}

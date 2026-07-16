@@ -2,12 +2,26 @@ dataset_name: movielens_100k
 source_dataset: MovieLens 25M
 domain: movie ratings
 processed_dir: data/processed/interaction_benchmarks/movielens_100k
+dataset:
+  name: movielens_100k
+  interaction_table: interactions
+  source_entity_table: users
+  destination_entity_table: movies
 interaction_table: interactions.csv
 source_entity_table: users.csv
 destination_entity_table: movies.csv
 source_id_column: user_id
 destination_id_column: movie_id
 timestamp_column: event_time
+event_spine:
+  source_fk: user_id
+  destination_fk: movie_id
+  timestamp: event_time
 generated_attributes:
-  rating: ordinal_categorical
+  rating:
+    semantic_type: ordinal_categorical
+    valid_domain: [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0]
+text_fields: []
+continuous_numerical_fields: []
+count_numerical_fields: []
 method_scope: single_designated_temporal_interaction_table

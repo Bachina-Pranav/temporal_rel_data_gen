@@ -96,9 +96,13 @@ class JointLSTMRelationalAttributeGenerator(nn.Module):
         self.dropout = float(dropout)
         self.decoder_type = str(decoder_type).lower()
         self.use_graph_context = bool(use_graph_context)
-        self.text_vocab_size = int(text_tokenizer.vocab_size)
+        self.text_vocab_size = int(text_tokenizer.vocab_size) if schema.text_targets else 0
         self.text_pad_id = int(text_tokenizer.pad_id)
-        self.review_text_conditioned_on_summary = bool(review_text_conditioned_on_summary)
+        self.review_text_conditioned_on_summary = (
+            bool(review_text_conditioned_on_summary)
+            and "summary" in schema.text_targets
+            and "review_text" in schema.text_targets
+        )
         self.summary_condition_type = str(summary_condition_type)
         self.summary_condition_dim = int(summary_condition_dim)
         self.summary_condition_dropout = float(summary_condition_dropout)
@@ -146,7 +150,11 @@ class JointLSTMRelationalAttributeGenerator(nn.Module):
                 for column in schema.model_categorical_targets
             }
         )
-        self.text_embedding = nn.Embedding(self.text_vocab_size, self.text_embedding_dim, padding_idx=text_tokenizer.pad_id)
+        self.text_embedding = (
+            nn.Embedding(self.text_vocab_size, self.text_embedding_dim, padding_idx=text_tokenizer.pad_id)
+            if schema.text_targets
+            else None
+        )
         self.text_decoders = nn.ModuleDict()
         self.text_heads = nn.ModuleDict()
         self.text_initializers = nn.ModuleDict()
@@ -653,10 +661,6 @@ def _train_lstm_from_config_once(
     clip_norm = float(training.get("gradient_clip_norm", 1.0))
     log_path = output_dir / "train_log.jsonl"
     metrics_log_path = ensure_dir(output_dir / "logs") / "train_metrics.jsonl"
-    if log_path.exists():
-        log_path.unlink()
-    if metrics_log_path.exists():
-        metrics_log_path.unlink()
     best_valid = float("inf")
     best_path = checkpoint_dir / "best.pt"
     last_path = checkpoint_dir / "last.pt"
@@ -664,7 +668,35 @@ def _train_lstm_from_config_once(
     patience = int(training.get("early_stopping_patience", 0) or 0)
     min_delta = float(training.get("early_stopping_min_delta", 0.0) or 0.0)
     without_improvement = 0
-    for epoch in range(1, epochs + 1):
+    start_epoch = 1
+    resume_from = training.get("resume_from")
+    if resume_from:
+        checkpoint = torch.load(resume_from, map_location=device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        if graph_encoder is not None and checkpoint.get("graph_encoder_state_dict") is not None:
+            graph_encoder.load_state_dict(checkpoint["graph_encoder_state_dict"])
+        if checkpoint.get("optimizer_state_dict") is not None:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        if checkpoint.get("scaler_state_dict") is not None:
+            scaler.load_state_dict(checkpoint["scaler_state_dict"])
+        start_epoch = int(checkpoint.get("epoch", 0)) + 1
+        valid_total = (checkpoint.get("valid_metrics") or {}).get("total_loss")
+        if valid_total is not None:
+            best_valid = float(valid_total)
+        print(f"Resuming LSTM training from {resume_from} at epoch={start_epoch}")
+    elif log_path.exists():
+        log_path.unlink()
+    if not resume_from and metrics_log_path.exists():
+        metrics_log_path.unlink()
+    if resume_from and best_path.exists():
+        try:
+            best_checkpoint = torch.load(best_path, map_location="cpu")
+            best_total = (best_checkpoint.get("valid_metrics") or {}).get("total_loss")
+            if best_total is not None:
+                best_valid = min(best_valid, float(best_total))
+        except Exception:
+            pass
+    for epoch in range(start_epoch, epochs + 1):
         train_metrics = run_lstm_epoch(
             model,
             train_loader,
@@ -710,11 +742,11 @@ def _train_lstm_from_config_once(
         append_jsonl(log_path, row)
         append_jsonl(metrics_log_path, row)
         print(json.dumps(row, sort_keys=True))
-        save_lstm_checkpoint(last_path, model, config, categorical_vocabs, tokenizer, epoch, valid_metrics, graph_encoder=graph_encoder)
+        save_lstm_checkpoint(last_path, model, config, categorical_vocabs, tokenizer, epoch, valid_metrics, graph_encoder=graph_encoder, optimizer=optimizer, scaler=scaler)
         if improved:
             best_valid = current
             without_improvement = 0
-            save_lstm_checkpoint(best_path, model, config, categorical_vocabs, tokenizer, epoch, valid_metrics, graph_encoder=graph_encoder)
+            save_lstm_checkpoint(best_path, model, config, categorical_vocabs, tokenizer, epoch, valid_metrics, graph_encoder=graph_encoder, optimizer=optimizer, scaler=scaler)
         else:
             without_improvement += 1
         if patience > 0 and without_improvement >= patience:
@@ -1494,6 +1526,8 @@ def save_lstm_checkpoint(
     epoch: int,
     valid_metrics: dict[str, float],
     graph_encoder: TemporalStructureOnlyGraphEncoder | None = None,
+    optimizer: torch.optim.Optimizer | None = None,
+    scaler: torch.cuda.amp.GradScaler | None = None,
 ) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1512,6 +1546,8 @@ def save_lstm_checkpoint(
             "graph_encoder_state_dict": graph_encoder.state_dict() if graph_encoder is not None else None,
             "graph_encoder_config": graph_encoder.to_config() if graph_encoder is not None else None,
             "graph_conditioning_metadata": graph_metadata(config.raw, real_graph_used_at_sampling=False),
+            "optimizer_state_dict": optimizer.state_dict() if optimizer is not None else None,
+            "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
         },
         path,
     )
@@ -1627,7 +1663,10 @@ def sample_lstm_from_config(
             attrs[column].extend(generated["text"][column])
             lengths[column].extend(generated["text_lengths"][column])
     total_seconds = float(time.perf_counter() - start_time)
-    output = spine.loc[:, list(ckpt_config.schema.condition_columns)].copy()
+    output_columns = [column for column in ["event_id", *ckpt_config.schema.condition_columns] if column in spine.columns]
+    output = spine.loc[:, output_columns].copy()
+    if "event_id" not in output.columns:
+        output.insert(0, "event_id", [f"synthetic_event_{idx}" for idx in range(len(output))])
     for column in ckpt_config.schema.categorical_targets:
         output[column] = attrs[column]
     for column in ckpt_config.schema.numerical_targets:

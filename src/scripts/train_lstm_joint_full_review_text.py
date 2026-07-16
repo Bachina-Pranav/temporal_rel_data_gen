@@ -60,6 +60,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pretokenized-dir", default=None)
     parser.add_argument("--neighbor-cache-dir", default=None)
     parser.add_argument("--amp-dtype", choices=["fp16", "bf16"], default=None)
+    parser.add_argument("--resume-from", default=None)
     return parser.parse_args()
 
 
@@ -127,6 +128,8 @@ def load_config_with_overrides(args: argparse.Namespace) -> ConditionalTABDLMCon
         paths["neighbor_cache_dir"] = args.neighbor_cache_dir
     if args.amp_dtype is not None:
         training["amp_dtype"] = args.amp_dtype
+    if args.resume_from is not None:
+        training["resume_from"] = args.resume_from
     if args.profile:
         training["profile"] = True
     raw = resolve_auto_review_text_config(raw)

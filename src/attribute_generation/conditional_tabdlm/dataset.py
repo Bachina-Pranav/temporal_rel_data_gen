@@ -49,7 +49,8 @@ def prepare_rel_amazon_data(config: ConditionalTABDLMConfig) -> PreparedData:
     sort_columns = list(schema.datetime_columns)
     frame = frame.sort_values(sort_columns, kind="mergesort").reset_index(drop=True)
 
-    train, valid, test = time_aware_split(frame)
+    train, valid, test = split_prepared_frame(frame, schema)
+    save_json(split_metadata(train, valid, test, schema), output_dir / "split_metadata.json")
     numerical_metadata = fit_numerical_transformers(train, config) if schema.numerical_targets else {}
     write_dataframe(train, output_dir / "train.parquet")
     write_dataframe(valid, output_dir / "valid.parquet")
@@ -133,6 +134,79 @@ def time_aware_split(frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, p
         frame.iloc[train_end:valid_end].reset_index(drop=True),
         frame.iloc[valid_end:].reset_index(drop=True),
     )
+
+
+def split_prepared_frame(frame: pd.DataFrame, schema: ConditionalTABDLMSchema) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Use an explicit preprocessing split when present, otherwise keep legacy behavior."""
+
+    if "split" not in frame.columns:
+        return time_aware_split(frame)
+    labels = frame["split"].astype(str).str.strip().str.lower()
+    aliases = {
+        "train": "train",
+        "training": "train",
+        "valid": "validation",
+        "val": "validation",
+        "validation": "validation",
+        "test": "test",
+    }
+    normalized = labels.map(aliases)
+    unknown = sorted(set(labels[normalized.isna()].tolist()))
+    if unknown:
+        raise ValueError(f"Unknown split labels in train_data_path: {unknown}")
+    frame = frame.assign(split=normalized)
+    splits = []
+    for split_name in ("train", "validation", "test"):
+        split_frame = frame.loc[frame["split"] == split_name].copy()
+        if split_frame.empty:
+            raise ValueError(f"Explicit split column has no rows for {split_name!r}")
+        splits.append(sort_for_training(split_frame, schema))
+    return tuple(splits)  # type: ignore[return-value]
+
+
+def sort_for_training(frame: pd.DataFrame, schema: ConditionalTABDLMSchema) -> pd.DataFrame:
+    sort_columns = [column for column in schema.datetime_columns if column in frame.columns]
+    if "event_id" in frame.columns:
+        sort_columns.append("event_id")
+    if not sort_columns:
+        return frame.reset_index(drop=True)
+    return frame.sort_values(sort_columns, kind="mergesort").reset_index(drop=True)
+
+
+def split_metadata(
+    train: pd.DataFrame,
+    valid: pd.DataFrame,
+    test: pd.DataFrame,
+    schema: ConditionalTABDLMSchema,
+) -> dict[str, Any]:
+    split_frames = {"train": train, "validation": valid, "test": test}
+    metadata: dict[str, Any] = {
+        "split_source": "explicit_split_column" if "split" in train.columns else "legacy_time_aware_90_5_5",
+        "row_counts": {name: int(len(frame)) for name, frame in split_frames.items()},
+        "timestamp_bounds": {},
+        "cold_start_foreign_keys": {},
+    }
+    timestamp_col = schema.datetime_columns[0] if schema.datetime_columns else None
+    if timestamp_col is not None:
+        for name, frame in split_frames.items():
+            timestamps = pd.to_datetime(frame[timestamp_col], errors="coerce")
+            metadata["timestamp_bounds"][name] = {
+                "min": timestamps.min().isoformat() if len(timestamps) else None,
+                "max": timestamps.max().isoformat() if len(timestamps) else None,
+            }
+    for column in schema.foreign_key_columns:
+        train_values = set(train[column].astype(str)) if column in train else set()
+        column_meta: dict[str, Any] = {}
+        for name, frame in [("validation", valid), ("test", test)]:
+            values = set(frame[column].astype(str)) if column in frame else set()
+            new_values = sorted(values.difference(train_values))
+            column_meta[name] = {
+                "num_distinct": int(len(values)),
+                "num_first_seen_after_train": int(len(new_values)),
+                "examples_first_seen_after_train": new_values[:20],
+            }
+        metadata["cold_start_foreign_keys"][column] = column_meta
+    return metadata
 
 
 def load_prepared_tables(config: ConditionalTABDLMConfig) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:

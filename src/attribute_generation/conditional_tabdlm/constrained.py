@@ -14,7 +14,7 @@ from .tokenization import CategoryVocab, normalize_category
 MISSING_CATEGORY_TOKEN = "<missing>"
 
 
-def normalize_rating_value(value: Any) -> int | None:
+def normalize_rating_value(value: Any) -> int | float | None:
     if value is None:
         return None
     if isinstance(value, float) and np.isnan(value):
@@ -28,12 +28,16 @@ def normalize_rating_value(value: Any) -> int | None:
         return None
     if not np.isfinite(numeric):
         return None
-    rounded = int(round(numeric))
-    if abs(numeric - rounded) > 1e-8:
+    doubled = round(numeric * 2.0)
+    if abs(numeric * 2.0 - doubled) > 1e-8:
         return None
-    if rounded not in {1, 2, 3, 4, 5}:
+    normalized = float(doubled) / 2.0
+    if normalized <= 0.0:
         return None
-    return rounded
+    rounded = int(round(normalized))
+    if abs(normalized - rounded) <= 1e-8:
+        return rounded
+    return normalized
 
 
 def normalize_categorical_value(column: str, value: Any) -> str | None:
@@ -91,7 +95,7 @@ def valid_category_values(column: str, vocab: CategoryVocab) -> list[Any]:
         else:
             values.append(token)
     if str(column) == "rating":
-        return sorted(set(int(value) for value in values))
+        return sorted(set(values))
     return sorted(set(str(value) for value in values), key=category_sort_key)
 
 
@@ -109,7 +113,7 @@ def decode_category_id(column: str, vocab: CategoryVocab, idx: int) -> Any:
         rating = normalize_rating_value(token)
         if rating is None:
             raise ValueError(f"Decoded invalid rating token {token!r} from id={idx}")
-        return int(rating)
+        return rating
     normalized = normalize_categorical_value(column, token)
     if normalized is None or normalized == MISSING_CATEGORY_TOKEN:
         raise ValueError(f"Decoded invalid categorical token {token!r} for {column!r}")
@@ -137,7 +141,7 @@ def validate_output_categoricals(
         mask = categorical_validity_mask(output[column], column, valid_values)
         if bool(mask.all()):
             if column == "rating":
-                output[column] = output[column].map(lambda value: int(normalize_rating_value(value)))  # type: ignore[arg-type]
+                output[column] = output[column].map(normalize_rating_value)
             continue
         bad_rows = output.loc[~mask, [column]].head(10)
         if repair_invalid:
