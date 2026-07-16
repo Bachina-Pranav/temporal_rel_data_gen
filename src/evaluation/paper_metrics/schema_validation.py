@@ -61,7 +61,8 @@ def constraint_violation_metrics(synthetic: pd.DataFrame, table_config: dict[str
             if valid_values is not None:
                 checked.append("categorical_domain")
                 valid = canonical_valid_values(cfg)
-                mask = ~canonicalize_categorical_series(values, cfg).isin(valid) & ~values.map(is_null_like)
+                canonicalized = canonicalize_categorical_series(values, cfg)
+                mask = ~canonicalized.isin(valid) & ~values.map(is_null_like)
                 violation_mask |= mask
                 per_constraint_counts["categorical_domain"] += int(mask.sum())
                 total_checked += num_rows
@@ -88,6 +89,8 @@ def constraint_violation_metrics(synthetic: pd.DataFrame, table_config: dict[str
             "violation_count": int(violation_mask.sum()),
             "checked_constraints": checked,
         }
+        if col_type == "categorical" and cfg.get("valid_values") is not None:
+            per_column[column]["categorical_domain_diagnostics"] = categorical_domain_diagnostics(values, cfg)
 
     pk = table_config.get("primary_key")
     if pk:
@@ -135,3 +138,36 @@ def load_parent_values(column_config: dict[str, Any]) -> set[str] | None:
         return None
     parent = pd.read_csv(parent_path, usecols=[ref_col])
     return set(parent[ref_col].map(normalize_value))
+
+
+def categorical_domain_diagnostics(values: pd.Series, column_config: dict[str, Any]) -> dict[str, Any]:
+    non_null = ~values.map(is_null_like)
+    raw_valid = {normalize_value(value) for value in column_config.get("valid_values", [])}
+    raw_values = values.map(normalize_value)
+    raw_invalid = ~raw_values.isin(raw_valid) & non_null
+    canonical_valid = canonical_valid_values(column_config)
+    canonicalized = canonicalize_categorical_series(values, column_config)
+    canonical_invalid = ~canonicalized.isin(canonical_valid) & non_null
+    mapping = []
+    for raw_value, count in values.astype(object).value_counts(dropna=False).head(25).items():
+        canonical_value = canonicalize_categorical_series(pd.Series([raw_value]), column_config).iloc[0]
+        mapping.append(
+            {
+                "raw_value": None if pd.isna(raw_value) else raw_value,
+                "canonical_value": None if pd.isna(canonical_value) else canonical_value,
+                "count": int(count),
+                "raw_in_declared_domain": normalize_value(raw_value) in raw_valid,
+                "canonical_in_declared_domain": canonical_value in canonical_valid if canonical_valid is not None else None,
+            }
+        )
+    return {
+        "raw_invalid_count": int(raw_invalid.sum()),
+        "raw_invalid_rate": float(raw_invalid.mean()) if len(raw_invalid) else None,
+        "canonicalized_invalid_count": int(canonical_invalid.sum()),
+        "canonicalized_invalid_rate": float(canonical_invalid.mean()) if len(canonical_invalid) else None,
+        "invalid_examples": [
+            None if pd.isna(value) else value
+            for value in values.loc[canonical_invalid].astype(object).head(10).tolist()
+        ],
+        "canonicalization_mapping": mapping,
+    }

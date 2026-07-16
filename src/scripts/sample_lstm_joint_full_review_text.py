@@ -26,6 +26,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", default=None)
     parser.add_argument("--num-rows", default=None)
     parser.add_argument("--batch-size", default=None)
+    parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--seed", type=int, default=None)
     return parser.parse_args()
@@ -42,6 +43,7 @@ def main() -> None:
         output_path=args.output,
         num_rows=num_rows,
         batch_size=args.batch_size,
+        temperature=args.temperature,
         device=args.device,
         seed=args.seed,
         synthetic_spine_path=args.synthetic_spine,

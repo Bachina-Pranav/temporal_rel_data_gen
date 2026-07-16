@@ -125,8 +125,9 @@ def evaluate_frames(
     schema = config.schema
     real = normalize_for_eval(real, config)
     synthetic = normalize_for_eval(synthetic, config)
-    real = add_normalized_categorical_columns(real, schema)
-    synthetic = add_normalized_categorical_columns(synthetic, schema)
+    rating_valid_values = rating_domain_from_config(config, real)
+    real = add_normalized_categorical_columns(real, schema, rating_valid_values=rating_valid_values)
+    synthetic = add_normalized_categorical_columns(synthetic, schema, rating_valid_values=rating_valid_values)
     rating_col = schema.categorical_targets[0] if schema.categorical_targets else None
     verified_col = "verified" if "verified" in schema.categorical_targets else (
         schema.categorical_targets[1] if len(schema.categorical_targets) > 1 else None
@@ -140,7 +141,7 @@ def evaluate_frames(
     product_col = schema.foreign_key_columns[1] if len(schema.foreign_key_columns) > 1 else schema.foreign_key_columns[0]
 
     metrics: dict[str, Any] = {
-        "validity": validity_metrics(real, synthetic, schema),
+        "validity": validity_metrics(real, synthetic, schema, rating_valid_values=rating_valid_values),
         "marginal_categorical": {},
         "temporal": {},
         "joint": {},
@@ -160,7 +161,7 @@ def evaluate_frames(
                 rating_eval_col,
                 numeric=True,
                 prefix=rating_col,
-                support=RATING_SUPPORT,
+                support=rating_valid_values,
             )
         )
     if verified_col and verified_eval_col:
@@ -261,13 +262,18 @@ def eval_column(frame: pd.DataFrame, column: str | None) -> str | None:
     return normalized if normalized in frame.columns else column
 
 
-def add_normalized_categorical_columns(frame: pd.DataFrame, schema) -> pd.DataFrame:
+def add_normalized_categorical_columns(
+    frame: pd.DataFrame,
+    schema,
+    *,
+    rating_valid_values: list[int | float] | tuple[int | float, ...] | None = None,
+) -> pd.DataFrame:
     frame = frame.copy()
     for column in schema.categorical_targets:
         if column not in frame.columns:
             continue
         if column == "rating":
-            normalized, invalid_mask = normalize_rating_series(frame[column])
+            normalized, invalid_mask = normalize_rating_series(frame[column], valid_rating_values=rating_valid_values)
         elif column == "verified":
             normalized, invalid_mask = normalize_verified_series(frame[column])
         else:
@@ -279,15 +285,21 @@ def add_normalized_categorical_columns(frame: pd.DataFrame, schema) -> pd.DataFr
 
 def normalize_rating_series(
     series: pd.Series,
-    valid_rating_values: list[int] | tuple[int, ...] = tuple(RATING_SUPPORT),
+    valid_rating_values: list[int | float] | tuple[int | float, ...] | None = None,
 ) -> tuple[pd.Series, pd.Series]:
-    valid = set(int(value) for value in valid_rating_values)
+    if valid_rating_values is None:
+        valid_rating_values = tuple(RATING_SUPPORT)
+    valid = {
+        rating
+        for rating in (normalize_rating_value(value) for value in valid_rating_values)
+        if rating is not None
+    }
 
     def normalize(value: Any) -> int | float:
         rating = normalize_rating_value(value)
-        if rating is None or int(rating) not in valid:
+        if rating is None or rating not in valid:
             return np.nan
-        return int(rating)
+        return rating
 
     normalized = series.map(normalize).astype(object)
     invalid_mask = normalized.isna()
@@ -331,7 +343,13 @@ def normalize_verified_value(value: Any) -> int | float:
     return rounded
 
 
-def validity_metrics(real: pd.DataFrame, synthetic: pd.DataFrame, schema) -> dict[str, Any]:
+def validity_metrics(
+    real: pd.DataFrame,
+    synthetic: pd.DataFrame,
+    schema,
+    *,
+    rating_valid_values: list[int | float] | tuple[int | float, ...] | None = None,
+) -> dict[str, Any]:
     out: dict[str, Any] = {
         "num_real_rows": int(len(real)),
         "num_synthetic_rows": int(len(synthetic)),
@@ -343,7 +361,12 @@ def validity_metrics(real: pd.DataFrame, synthetic: pd.DataFrame, schema) -> dic
             values = synthetic[normalized]
             out[f"invalid_{column}_rate"] = float(synthetic[invalid].mean()) if len(values) else None
             if column == "rating":
-                out["valid_rating_values"] = list(RATING_SUPPORT)
+                out.update(
+                    rating_validity_details(
+                        synthetic[column] if column in synthetic else values,
+                        rating_valid_values or tuple(RATING_SUPPORT),
+                    )
+                )
             continue
         valid = normalized_valid_values(column, real[column].dropna().unique()) if column in real else []
         values = synthetic[column] if column in synthetic else pd.Series([], dtype=object)
@@ -351,7 +374,7 @@ def validity_metrics(real: pd.DataFrame, synthetic: pd.DataFrame, schema) -> dic
             valid_mask = categorical_validity_mask(values, column, valid)
             out[f"invalid_{column}_rate"] = float((~valid_mask).mean())
             if column == "rating":
-                out["valid_rating_values"] = [int(value) for value in valid if str(value).isdigit()]
+                out.update(rating_validity_details(values, rating_valid_values or tuple(RATING_SUPPORT)))
         else:
             out[f"invalid_{column}_rate"] = None
     for column in schema.text_targets:
@@ -363,6 +386,64 @@ def validity_metrics(real: pd.DataFrame, synthetic: pd.DataFrame, schema) -> dic
             out[f"{column}_length_mean_synthetic"] = float(syn_len.mean()) if len(syn_len) else None
             out[f"{column}_length_ks"] = ks_statistic(real_len, syn_len)
     return out
+
+
+def rating_domain_from_config(config: ConditionalTABDLMConfig, real: pd.DataFrame | None = None) -> list[int | float]:
+    attr_cfg = ((config.raw.get("generated_attributes") or {}).get("rating") or {})
+    domain = attr_cfg.get("valid_domain") or attr_cfg.get("valid_values")
+    if domain is None:
+        table_cfg = ((config.raw.get("table") or {}).get("columns") or {}).get("rating", {})
+        domain = table_cfg.get("valid_values") or table_cfg.get("valid_domain")
+    if domain is None and real is not None and "rating" in real.columns:
+        domain = real["rating"].dropna().unique().tolist()
+    if domain is None:
+        domain = list(RATING_SUPPORT)
+    normalized = [
+        rating
+        for rating in (normalize_rating_value(value) for value in domain)
+        if rating is not None
+    ]
+    if not normalized:
+        normalized = list(RATING_SUPPORT)
+    return sorted(set(normalized), key=float)
+
+
+def rating_validity_details(
+    values: pd.Series,
+    valid_rating_values: list[int | float] | tuple[int | float, ...],
+    *,
+    example_limit: int = 10,
+    mapping_limit: int = 25,
+) -> dict[str, Any]:
+    valid = {
+        rating
+        for rating in (normalize_rating_value(value) for value in valid_rating_values)
+        if rating is not None
+    }
+    parsed = values.map(normalize_rating_value)
+    raw_invalid = parsed.isna()
+    canonical_invalid = parsed.map(lambda value: value not in valid if value is not None and not pd.isna(value) else True)
+    mapping_rows = []
+    for raw_value, count in values.astype(object).value_counts(dropna=False).head(int(mapping_limit)).items():
+        normalized = normalize_rating_value(raw_value)
+        mapping_rows.append(
+            {
+                "raw_value": None if pd.isna(raw_value) else raw_value,
+                "canonical_value": normalized,
+                "count": int(count),
+                "in_declared_domain": bool(normalized in valid) if normalized is not None else False,
+            }
+        )
+    examples = values.loc[canonical_invalid].astype(object).head(int(example_limit)).tolist()
+    return {
+        "valid_rating_values": sorted(valid, key=float),
+        "raw_invalid_rating_count": int(raw_invalid.sum()),
+        "raw_invalid_rating_rate": float(raw_invalid.mean()) if len(raw_invalid) else None,
+        "canonicalized_invalid_rating_count": int(canonical_invalid.sum()),
+        "canonicalized_invalid_rating_rate": float(canonical_invalid.mean()) if len(canonical_invalid) else None,
+        "invalid_rating_examples": [None if pd.isna(value) else value for value in examples],
+        "rating_canonicalization_mapping": mapping_rows,
+    }
 
 
 def summary_length_diagnostics(

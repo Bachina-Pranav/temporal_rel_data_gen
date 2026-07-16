@@ -16,7 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from .constrained import decode_category_id, mask_invalid_category_logits, validate_output_categoricals, valid_category_values
+from .constrained import decode_category_id, mask_invalid_category_logits, normalize_rating_value, validate_output_categoricals, valid_category_values
 from .dataset import (
     ConditionalTABDLMDataset,
     load_category_vocabs,
@@ -83,6 +83,7 @@ class JointLSTMRelationalAttributeGenerator(nn.Module):
     ):
         super().__init__()
         self.schema = schema
+        self.categorical_vocabs = categorical_vocabs
         self.num_hash_buckets = int(num_hash_buckets)
         self.id_embedding_dim = int(id_embedding_dim)
         self.datetime_embedding_dim = int(datetime_embedding_dim)
@@ -1085,6 +1086,7 @@ def run_lstm_fixed_steps(
                     tokenizer,
                     length_class_weights,
                     config=config,
+                    categorical_vocabs=categorical_vocabs,
                 )
                 loss = loss / max(int(gradient_accumulation_steps), 1)
                 timer_totals["forward"] += time.perf_counter() - forward_start
@@ -1407,7 +1409,16 @@ def run_lstm_epoch(
                 batch["text_ids"],
                 graph_context=graph_context,
             )
-            loss, component = lstm_joint_loss(logits, batch, model.schema, loss_weights, tokenizer, length_class_weights, config=config)
+            loss, component = lstm_joint_loss(
+                logits,
+                batch,
+                model.schema,
+                loss_weights,
+                tokenizer,
+                length_class_weights,
+                config=config,
+                categorical_vocabs=getattr(model, "categorical_vocabs", None),
+            )
         if training:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -1451,6 +1462,7 @@ def lstm_joint_loss(
     tokenizer: SimpleTextTokenizer,
     length_class_weights: dict[str, torch.Tensor] | None = None,
     config: ConditionalTABDLMConfig | None = None,
+    categorical_vocabs: dict[str, CategoryVocab] | None = None,
 ) -> tuple[torch.Tensor, dict[str, dict[str, float | int]]]:
     losses: list[torch.Tensor] = []
     component: dict[str, dict[str, float | int]] = {}
@@ -1464,6 +1476,21 @@ def lstm_joint_loss(
         pred = logits["categorical"][column].argmax(dim=-1)
         correct = int((pred == labels).sum().detach().cpu())
         component[metric_name_for_lstm(column)] = {"loss_sum": float(loss_sum.detach().cpu()), "count": count, "correct": correct}
+        ordinal = rating_ordinal_auxiliary_loss(
+            logits["categorical"][column],
+            labels,
+            column,
+            config,
+            (categorical_vocabs or {}).get(column),
+        )
+        if ordinal is not None:
+            ordinal_loss_sum, ordinal_count, ordinal_weight = ordinal
+            losses.append(float(ordinal_weight) * (ordinal_loss_sum / max(ordinal_count, 1)))
+            component[f"{metric_name_for_lstm(column)}_ordinal_auxiliary"] = {
+                "loss_sum": float(ordinal_loss_sum.detach().cpu()),
+                "count": int(ordinal_count),
+                "correct": 0,
+            }
     numerical_values = batch.get("numerical_values")
     if numerical_values is not None:
         for idx, column in enumerate(schema.numerical_targets):
@@ -1493,6 +1520,61 @@ def lstm_joint_loss(
         zero = batch["foreign_key_ids"].float().sum() * 0.0
         return zero, {}
     return torch.stack(losses).sum(), component
+
+
+def rating_ordinal_auxiliary_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    column: str,
+    config: ConditionalTABDLMConfig | None,
+    vocab: CategoryVocab | None,
+) -> tuple[torch.Tensor, int, float] | None:
+    if column != "rating" or config is None or vocab is None:
+        return None
+    cfg = ((config.raw.get("rating_head") or {}).get("ordinal_auxiliary") or {})
+    if not bool(cfg.get("enabled", False)):
+        return None
+    method = str(cfg.get("method", "cumulative_emd"))
+    if method not in {"cumulative_emd", "squared_emd", "expected_absolute_error"}:
+        raise ValueError(f"Unsupported rating ordinal auxiliary method: {method}")
+    weight = float(cfg.get("weight", 0.1))
+    if weight <= 0.0:
+        return None
+    ordered = ordered_rating_vocab_entries(vocab)
+    if len(ordered) < 2:
+        return None
+    valid_ids = torch.tensor([idx for idx, _ in ordered], dtype=torch.long, device=logits.device)
+    rating_values = torch.tensor([value for _, value in ordered], dtype=logits.dtype, device=logits.device)
+    id_to_pos = torch.full((vocab.size,), -1, dtype=torch.long, device=logits.device)
+    id_to_pos[valid_ids] = torch.arange(len(ordered), dtype=torch.long, device=logits.device)
+    target_pos = id_to_pos[labels]
+    mask = target_pos >= 0
+    if not bool(mask.any()):
+        return None
+    valid_logits = logits.index_select(dim=1, index=valid_ids)[mask]
+    target_pos = target_pos[mask]
+    probs = torch.softmax(valid_logits, dim=1)
+    if method == "expected_absolute_error":
+        expected = probs @ rating_values
+        target = rating_values[target_pos]
+        loss_values = torch.abs(expected - target)
+        return loss_values.sum(), int(loss_values.numel()), weight
+    target_one_hot = F.one_hot(target_pos, num_classes=len(ordered)).to(dtype=probs.dtype)
+    pred_cdf = torch.cumsum(probs, dim=1)[:, :-1]
+    target_cdf = torch.cumsum(target_one_hot, dim=1)[:, :-1]
+    gaps = (rating_values[1:] - rating_values[:-1]).abs()
+    gaps = gaps / gaps.sum().clamp_min(1e-12)
+    loss_values = ((pred_cdf - target_cdf) ** 2 * gaps.view(1, -1)).sum(dim=1)
+    return loss_values.sum(), int(loss_values.numel()), weight
+
+
+def ordered_rating_vocab_entries(vocab: CategoryVocab) -> list[tuple[int, float]]:
+    entries: list[tuple[int, float]] = []
+    for idx in range(vocab.size):
+        rating = normalize_rating_value(vocab.decode(idx))
+        if rating is not None:
+            entries.append((idx, float(rating)))
+    return sorted(entries, key=lambda item: item[1])
 
 
 def text_label_smoothing_from_config(config: ConditionalTABDLMConfig | None) -> dict[str, float]:
@@ -1587,6 +1669,7 @@ def sample_lstm_from_config(
     output_path: str | Path | None = None,
     num_rows: int | str | None = None,
     batch_size: int | str | None = None,
+    temperature: float | None = None,
     device: str | None = None,
     seed: int | None = None,
     synthetic_spine_path: str | Path | None = None,
@@ -1611,7 +1694,7 @@ def sample_lstm_from_config(
         write_temporal_graph_metadata(spine, ckpt_config, output_path.parent / "graph", source="synthetic_spine", seed=seed, real_graph_used_at_sampling=False)
     id_cfg = ckpt_config.raw.get("id_encoding", {})
     num_hash_buckets = int(id_cfg.get("num_buckets", 262144))
-    temperature = float(sampling.get("temperature", 0.9))
+    temperature = float(temperature if temperature is not None else sampling.get("temperature", 0.9))
     top_p = float(sampling.get("top_p", 0.95))
     min_tokens = {
         "summary": int(sampling.get("min_summary_tokens", 1)),

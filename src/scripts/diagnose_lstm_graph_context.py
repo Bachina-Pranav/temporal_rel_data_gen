@@ -21,6 +21,7 @@ from attribute_generation.conditional_tabdlm.graph_dataset import build_temporal
 from attribute_generation.conditional_tabdlm.lstm_joint import encode_conditions, load_lstm_checkpoint  # noqa: E402
 from attribute_generation.conditional_tabdlm.schema import load_config  # noqa: E402
 from attribute_generation.conditional_tabdlm.train import resolve_device  # noqa: E402
+from attribute_generation.conditional_tabdlm.constrained import mask_invalid_category_logits, normalize_rating_value  # noqa: E402
 from attribute_generation.conditional_tabdlm.utils import set_seed  # noqa: E402
 
 
@@ -85,9 +86,9 @@ def main() -> None:
                     top_p=float(ckpt_config.raw.get("sampling", {}).get("top_p", 0.95)),
                 )
                 outputs[mode].extend(generated["categorical"][rating_col])
-            logits_correct.append(deterministic_logits(model, foreign_key_ids, datetime_values, contexts["correct"], rating_col))
-            logits_zero.append(deterministic_logits(model, foreign_key_ids, datetime_values, contexts["zero"], rating_col))
-            logits_shuffled.append(deterministic_logits(model, foreign_key_ids, datetime_values, contexts["shuffled"], rating_col))
+            logits_correct.append(deterministic_logits(model, foreign_key_ids, datetime_values, contexts["correct"], rating_col, vocabs[rating_col]))
+            logits_zero.append(deterministic_logits(model, foreign_key_ids, datetime_values, contexts["zero"], rating_col, vocabs[rating_col]))
+            logits_shuffled.append(deterministic_logits(model, foreign_key_ids, datetime_values, contexts["shuffled"], rating_col, vocabs[rating_col]))
     summary = {
         "checkpoint": str(args.checkpoint),
         "spine": str(args.spine),
@@ -95,8 +96,8 @@ def main() -> None:
         "rating_col": rating_col,
         "modes": {},
         "logit_delta": {
-            "correct_vs_zero_mean_abs": mean_abs_delta(logits_correct, logits_zero),
-            "correct_vs_shuffled_mean_abs": mean_abs_delta(logits_correct, logits_shuffled),
+            "correct_vs_zero": logit_delta_metrics(logits_correct, logits_zero, rating_values_for_vocab(vocabs[rating_col])),
+            "correct_vs_shuffled": logit_delta_metrics(logits_correct, logits_shuffled, rating_values_for_vocab(vocabs[rating_col])),
         },
     }
     reference = pd.read_csv(args.reference_table) if args.reference_table else None
@@ -118,17 +119,53 @@ def main() -> None:
     print(f"Wrote {summary_path}")
 
 
-def deterministic_logits(model, foreign_key_ids, datetime_values, graph_context, rating_col: str) -> np.ndarray:
+def deterministic_logits(model, foreign_key_ids, datetime_values, graph_context, rating_col: str, vocab) -> np.ndarray:
     condition = model.encode_condition(foreign_key_ids, datetime_values, graph_context=graph_context)
     noise = torch.zeros(condition.shape[0], model.latent_noise_dim, dtype=condition.dtype, device=condition.device)
     row = model.row_latent(condition, noise=noise)
-    return model.categorical_logits(row)[rating_col].detach().float().cpu().numpy()
+    logits = mask_invalid_category_logits(model.categorical_logits(row)[rating_col], rating_col, vocab)
+    return logits.detach().float().cpu().numpy()
 
 
 def mean_abs_delta(left: list[np.ndarray], right: list[np.ndarray]) -> float:
     a = np.concatenate(left, axis=0)
     b = np.concatenate(right, axis=0)
     return float(np.mean(np.abs(a - b)))
+
+
+def logit_delta_metrics(left: list[np.ndarray], right: list[np.ndarray], rating_values: list[float]) -> dict[str, float]:
+    a = np.concatenate(left, axis=0)
+    b = np.concatenate(right, axis=0)
+    pa = softmax_np(a)
+    pb = softmax_np(b)
+    values = np.asarray(rating_values, dtype=float)
+    if values.shape[0] != pa.shape[1]:
+        values = np.arange(pa.shape[1], dtype=float)
+    kl = np.sum(pa * (np.log(np.clip(pa, 1e-12, None)) - np.log(np.clip(pb, 1e-12, None))), axis=1)
+    expected_a = pa @ values
+    expected_b = pb @ values
+    return {
+        "mean_abs_logit_difference": float(np.mean(np.abs(a - b))),
+        "mean_kl_divergence": float(np.mean(kl)),
+        "argmax_changed_fraction": float(np.mean(np.argmax(a, axis=1) != np.argmax(b, axis=1))),
+        "mean_abs_expected_rating_change": float(np.mean(np.abs(expected_a - expected_b))),
+    }
+
+
+def rating_values_for_vocab(vocab) -> list[float]:
+    values = []
+    valid = [normalize_rating_value(vocab.decode(idx)) for idx in range(vocab.size)]
+    fallback = [float(value) for value in valid if value is not None]
+    fallback_value = float(np.mean(fallback)) if fallback else 0.0
+    for value in valid:
+        values.append(float(value) if value is not None else fallback_value)
+    return values
+
+
+def softmax_np(logits: np.ndarray) -> np.ndarray:
+    centered = logits - np.max(logits, axis=1, keepdims=True)
+    exp = np.exp(centered)
+    return exp / np.clip(exp.sum(axis=1, keepdims=True), 1e-12, None)
 
 
 def normalized_counts(values: pd.Series) -> dict[str, float]:
