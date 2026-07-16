@@ -1,4 +1,4 @@
-"""Runtime profiling helpers for LSTM joint attribute sampling."""
+"""Runtime profiling helpers for attribute sampling."""
 
 from __future__ import annotations
 
@@ -15,10 +15,22 @@ import torch
 PROFILE_TIMING_FIELDS = (
     "loading_checkpoint_seconds",
     "loading_synthetic_spine_seconds",
+    "loading_model_seconds",
+    "loading_spine_seconds",
+    "graph_history_build_seconds",
     "graph_context_total_seconds",
     "graph_context_cache_build_seconds",
     "graph_context_lookup_seconds",
     "condition_encoding_seconds",
+    "initial_noise_seconds",
+    "denoising_loop_seconds",
+    "denoising_step_seconds",
+    "final_forward_seconds",
+    "length_enforcement_seconds",
+    "categorical_decoding_seconds",
+    "text_decoding_seconds",
+    "debug_example_seconds",
+    "postprocessing_seconds",
     "row_latent_seconds",
     "categorical_sampling_seconds",
     "rating_sampling_seconds",

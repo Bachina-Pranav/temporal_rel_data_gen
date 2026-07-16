@@ -47,6 +47,8 @@ def train_from_config(config: ConditionalTABDLMConfig, device: str | None = None
     diffusion = config.raw.get("diffusion", {})
     seed = int(training.get("seed", 42))
     set_seed(seed)
+    device = resolve_device(device or str(training.get("device", "auto")))
+    configure_torch_runtime(training, device)
     output_dir = ensure_dir(config.output_dir)
     checkpoint_dir = ensure_dir(config.checkpoint_dir)
     save_yaml(config.to_dict(), output_dir / "config_resolved.yaml")
@@ -86,14 +88,19 @@ def train_from_config(config: ConditionalTABDLMConfig, device: str | None = None
     batch_size = int(training.get("batch_size", 128))
     num_workers = int(training.get("num_workers", training.get("workers", 0)))
     dataloader_timeout = int(training.get("dataloader_timeout_seconds", 0) or 0)
+    pin_memory = bool(training.get("pin_memory", device.startswith("cuda")))
     dataloader_kwargs = {
         "batch_size": batch_size,
         "num_workers": num_workers,
         "collate_fn": collate_fn,
         "drop_last": False,
+        "pin_memory": pin_memory,
     }
     if num_workers > 0:
         dataloader_kwargs["timeout"] = dataloader_timeout
+        dataloader_kwargs["persistent_workers"] = bool(training.get("persistent_workers", True))
+        if training.get("prefetch_factor") is not None:
+            dataloader_kwargs["prefetch_factor"] = int(training.get("prefetch_factor"))
     train_loader = DataLoader(
         train_dataset,
         shuffle=True,
@@ -105,15 +112,16 @@ def train_from_config(config: ConditionalTABDLMConfig, device: str | None = None
         **dataloader_kwargs,
     )
 
-    device = resolve_device(device or str(training.get("device", "auto")))
     print(
         "Training ConditionalTABDLM with "
         f"train_rows={len(train_dataset)}, valid_rows={len(valid_dataset)}, "
         f"batch_size={batch_size}, num_workers={num_workers}, "
         f"dataloader_timeout_seconds={dataloader_timeout if num_workers > 0 else 0}, "
+        f"pin_memory={pin_memory}, "
         f"device={device}"
     )
     model = build_model(config, categorical_vocabs, text_tokenizer).to(device)
+    model, compile_used = maybe_compile_training_module(model, bool(training.get("compile_model", False)))
     graph_encoder = build_graph_encoder(config, categorical_vocabs, text_tokenizer).to(device) if use_graph_context else None
     train_history_index = build_temporal_history_index(train_frame, config, seed=seed) if use_graph_context else None
     valid_graph_frame = pd.concat([train_frame, valid_frame], ignore_index=True) if use_graph_context else valid_frame
@@ -137,10 +145,11 @@ def train_from_config(config: ConditionalTABDLMConfig, device: str | None = None
         graph_flags = graph_metadata(config.raw, real_graph_used_at_sampling=False)
         save_json(graph_flags, output_dir / "graph_conditioning_flags.json")
         save_json(graph_flags, metadata_dir / "graph_conditioning.json")
-    optimizer = torch.optim.AdamW(
+    optimizer = build_optimizer(
         trainable_parameters(model, graph_encoder),
         lr=float(training.get("learning_rate", training.get("lr", 3e-4))),
         weight_decay=float(training.get("weight_decay", 0.01)),
+        fused=bool(training.get("fused_adamw", False)) and device.startswith("cuda"),
     )
     loss_weights = dict(config.raw.get("loss_weights", {}))
     text_token_loss_weights = text_token_loss_weights_by_column(config)
@@ -153,6 +162,7 @@ def train_from_config(config: ConditionalTABDLMConfig, device: str | None = None
     if length_class_weights is not None:
         for column, payload in length_class_weights["json"].items():
             save_json(payload, metadata_dir / f"{column}_weights.json")
+    length_class_weight_tensors = length_weight_tensors_to_device(length_class_weights, device)
     write_model_metadata(config, metadata_dir)
     use_amp = bool(training.get("mixed_precision", True)) and device.startswith("cuda")
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
@@ -166,6 +176,10 @@ def train_from_config(config: ConditionalTABDLMConfig, device: str | None = None
     epochs = int(training.get("epochs", 5))
     early_stopping_patience = int(training.get("early_stopping_patience", 0) or 0)
     early_stopping_min_delta = float(training.get("early_stopping_min_delta", 0.0) or 0.0)
+    length_calibration_interval = max(1, int(training.get("length_calibration_interval", 1) or 1))
+    checkpoint_interval = max(1, int(training.get("checkpoint_interval", 1) or 1))
+    save_last_every_epoch = bool(training.get("save_last_every_epoch", True))
+    latest_length_calibration = None
     epochs_without_improvement = 0
     best_epoch = 0
     for epoch in range(1, epochs + 1):
@@ -179,7 +193,7 @@ def train_from_config(config: ConditionalTABDLMConfig, device: str | None = None
             loss_weights,
             text_tokenizer,
             text_token_loss_weights,
-            length_weight_tensors_to_device(length_class_weights, device),
+            length_class_weight_tensors,
             graph_encoder=graph_encoder,
             graph_history_index=train_history_index,
             graph_deterministic=False,
@@ -196,7 +210,7 @@ def train_from_config(config: ConditionalTABDLMConfig, device: str | None = None
             loss_weights,
             text_tokenizer,
             text_token_loss_weights,
-            length_weight_tensors_to_device(length_class_weights, device),
+            length_class_weight_tensors,
             graph_encoder=graph_encoder,
             graph_history_index=valid_history_index,
             graph_deterministic=True,
@@ -204,19 +218,24 @@ def train_from_config(config: ConditionalTABDLMConfig, device: str | None = None
             graph_attr_store=valid_attr_store,
             config=config,
         )
-        length_calibration = compute_length_calibration(
-            model,
-            valid_loader,
-            config,
-            categorical_vocabs,
-            text_tokenizer,
-            device,
-            use_amp,
-            graph_encoder=graph_encoder,
-            graph_history_index=valid_history_index,
-            graph_row_id_offset=valid_row_id_offset,
-            graph_attr_store=valid_attr_store,
-        )
+        length_calibration = None
+        if epoch == 1 or epoch % length_calibration_interval == 0:
+            length_calibration = compute_length_calibration(
+                model,
+                valid_loader,
+                config,
+                categorical_vocabs,
+                text_tokenizer,
+                device,
+                use_amp,
+                graph_encoder=graph_encoder,
+                graph_history_index=valid_history_index,
+                graph_row_id_offset=valid_row_id_offset,
+                graph_attr_store=valid_attr_store,
+            )
+            latest_length_calibration = length_calibration
+        else:
+            length_calibration = latest_length_calibration
         if length_calibration is not None:
             save_json(length_calibration, metadata_dir / "summary_length_calibration.json")
         current_valid = float(valid_metrics["total_loss"])
@@ -230,21 +249,25 @@ def train_from_config(config: ConditionalTABDLMConfig, device: str | None = None
             "early_stopping_patience": early_stopping_patience,
             "early_stopping_min_delta": early_stopping_min_delta,
             "epochs_without_improvement": 0 if improved else epochs_without_improvement + 1,
+            "torch_compile_used": compile_used,
+            "length_calibration_interval": length_calibration_interval,
+            "checkpoint_interval": checkpoint_interval,
         }
         append_jsonl(log_path, row)
         print(json.dumps(row, sort_keys=True))
-        save_checkpoint(
-            last_path,
-            model,
-            config,
-            categorical_vocabs,
-            text_tokenizer,
-            epoch,
-            valid_metrics,
-            length_calibration=length_calibration,
-            length_bucket_weights=length_class_weights["json"] if length_class_weights is not None else None,
-            graph_encoder=graph_encoder,
-        )
+        if save_last_every_epoch and epoch % checkpoint_interval == 0:
+            save_checkpoint(
+                last_path,
+                model,
+                config,
+                categorical_vocabs,
+                text_tokenizer,
+                epoch,
+                valid_metrics,
+                length_calibration=length_calibration,
+                length_bucket_weights=length_class_weights["json"] if length_class_weights is not None else None,
+                graph_encoder=graph_encoder,
+            )
         if improved:
             best_valid = current_valid
             best_epoch = epoch
@@ -274,6 +297,49 @@ def train_from_config(config: ConditionalTABDLMConfig, device: str | None = None
             break
     print(f"Wrote best checkpoint to {best_path}")
     return best_path
+
+
+def configure_torch_runtime(training: dict[str, Any], device: str) -> None:
+    if bool(training.get("allow_tf32", True)) and str(device).startswith("cuda"):
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    matmul_precision = training.get("float32_matmul_precision")
+    if matmul_precision is not None and hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision(str(matmul_precision))
+
+
+def build_optimizer(
+    parameters,
+    *,
+    lr: float,
+    weight_decay: float,
+    fused: bool = False,
+) -> torch.optim.Optimizer:
+    kwargs = {"lr": float(lr), "weight_decay": float(weight_decay)}
+    if fused:
+        try:
+            return torch.optim.AdamW(parameters, fused=True, **kwargs)
+        except TypeError:
+            print("WARNING: fused AdamW is unavailable in this PyTorch build; using standard AdamW.", flush=True)
+    return torch.optim.AdamW(parameters, **kwargs)
+
+
+def maybe_compile_training_module(model: torch.nn.Module, enabled: bool) -> tuple[torch.nn.Module, bool]:
+    if not enabled:
+        return model, False
+    compile_fn = getattr(torch, "compile", None)
+    if compile_fn is None:
+        print("WARNING: torch.compile is unavailable; continuing without training compilation.", flush=True)
+        return model, False
+    try:
+        return compile_fn(model, mode="reduce-overhead"), True
+    except Exception as exc:
+        print(f"WARNING: torch.compile failed for training; continuing uncompiled. Reason: {exc}", flush=True)
+        return model, False
+
+
+def unwrap_compiled_module(model: torch.nn.Module) -> torch.nn.Module:
+    return getattr(model, "_orig_mod", model)
 
 
 def build_model(
@@ -968,10 +1034,11 @@ def save_checkpoint(
 ) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_model = unwrap_compiled_module(model)
     torch.save(
         {
-            "model_state_dict": model.state_dict(),
-            "model_config": model.to_config(),
+            "model_state_dict": checkpoint_model.state_dict(),
+            "model_config": checkpoint_model.to_config(),
             "raw_config": config.raw,
             "schema": config.schema.to_dict(),
             "categorical_vocabs": {column: vocab.to_dict() for column, vocab in categorical_vocabs.items()},

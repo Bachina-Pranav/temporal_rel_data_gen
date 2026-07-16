@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import math
 import json
 import random
+import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
+import numpy as np
 import pandas as pd
 import torch
 
@@ -21,6 +25,7 @@ from .graph_dataset import build_temporal_history_index, write_temporal_graph_me
 from .graph_encoder import TemporalAttributeDenoisingGraphEncoder, TemporalStructureOnlyGraphEncoder
 from .graph_schema import graph_conditioning_enabled, graph_metadata, graph_mode
 from .model import ConditionalTABDLM
+from .runtime_profiler import RuntimeProfiler
 from .schema import ConditionalTABDLMConfig, ConditionalTABDLMSchema
 from .tokenization import CategoryVocab, SimpleTextTokenizer, sample_length_from_bucket, stable_hash_bucket
 from .train import build_graph_encoder, build_model, resolve_device
@@ -39,6 +44,7 @@ def sample_from_config(
     output_path: str | Path | None = None,
     num_rows: int | str | None = None,
     batch_size: int | None = None,
+    sample_batch_size: int | None = None,
     temperature: float | None = None,
     top_p: float | None = None,
     device: str | None = None,
@@ -47,25 +53,43 @@ def sample_from_config(
     debug_write_aux_targets: bool = False,
     disable_length_calibration: bool = False,
     repair_invalid_categoricals: bool = False,
+    sampling_steps: int | None = None,
+    timestep_spacing: str | None = None,
+    inference_dtype: str | None = None,
+    compile_model: bool | None = None,
+    text_top_k: int | None = None,
+    profile: bool | None = None,
+    profile_output: str | Path | None = None,
 ) -> Path:
     sampling = config.raw.get("sampling", {})
+    diffusion = config.raw.get("diffusion", {})
+    profiler = RuntimeProfiler(enabled=bool((profile if profile is not None else sampling.get("profile", False)) or profile_output is not None))
+    profiler.start_total()
     checkpoint_path = Path(checkpoint_path) if checkpoint_path else config.checkpoint_dir / "best.pt"
     output_path = Path(output_path) if output_path else config.output_dir / "synthetic_review_attrs.csv"
     num_rows = num_rows if num_rows is not None else sampling.get("num_rows", 100000)
-    batch_size = int(batch_size or sampling.get("batch_size", 128))
+    batch_size = int(sample_batch_size or batch_size or sampling.get("sample_batch_size", sampling.get("batch_size", 128)))
     temperature = float(temperature if temperature is not None else sampling.get("temperature", 1.0))
     top_p = float(top_p if top_p is not None else sampling.get("top_p", 0.95))
     seed = int(seed if seed is not None else sampling.get("seed", 42))
     device = resolve_device(device or str(sampling.get("device", "auto")))
+    inference_dtype = str(inference_dtype or sampling.get("inference_dtype", "float32"))
+    sampling_steps = int(sampling_steps or diffusion.get("sampling_steps", diffusion.get("timesteps", 50)))
+    timestep_spacing = str(timestep_spacing or diffusion.get("timestep_spacing", sampling.get("timestep_spacing", "uniform")))
+    compile_model = bool(compile_model if compile_model is not None else sampling.get("compile_model", False))
+    text_top_k = parse_optional_int(text_top_k if text_top_k is not None else sampling.get("text_top_k"))
 
     set_seed(seed)
-    model, ckpt_config, vocabs, tokenizer, graph_encoder = load_model_checkpoint(
-        checkpoint_path,
-        device,
-        include_graph=True,
-    )
+    with profile_timer(profiler, "loading_model_seconds", device=device):
+        model, ckpt_config, vocabs, tokenizer, graph_encoder = load_model_checkpoint(
+            checkpoint_path,
+            device,
+            include_graph=True,
+        )
+    model, compile_used = maybe_compile_model(model, compile_model)
     spine_path = Path(synthetic_spine_path) if synthetic_spine_path else config.synthetic_spine_path
-    spine = pd.read_csv(spine_path)
+    with profile_timer(profiler, "loading_spine_seconds"):
+        spine = pd.read_csv(spine_path)
     validate_spine(spine, ckpt_config.schema)
     if num_rows not in (None, "all"):
         spine = spine.head(int(num_rows)).copy()
@@ -76,7 +100,8 @@ def sample_from_config(
         graph_encoder.eval()
         if graph_mode(ckpt_config.raw) == "temporal_attribute_denoising":
             spine = sort_spine_chronologically(spine, ckpt_config.schema)
-        graph_history_index = build_temporal_history_index(spine, ckpt_config, seed=seed)
+        with profile_timer(profiler, "graph_history_build_seconds"):
+            graph_history_index = build_temporal_history_index(spine, ckpt_config, seed=seed)
         write_temporal_graph_metadata(
             spine,
             ckpt_config,
@@ -100,22 +125,32 @@ def sample_from_config(
         disable_length_calibration=disable_length_calibration,
         graph_encoder=graph_encoder,
         graph_history_index=graph_history_index,
+        sampling_steps=sampling_steps,
+        timestep_spacing=timestep_spacing,
+        inference_dtype=inference_dtype,
+        text_top_k=text_top_k,
+        profiler=profiler,
     )
-    output = spine.loc[:, list(ckpt_config.schema.condition_columns)].copy()
-    for column in ckpt_config.schema.categorical_targets:
-        output[column] = attrs[column]
-    if debug_write_aux_targets:
-        for column in ckpt_config.schema.auxiliary_categorical_targets:
+    with profile_timer(profiler, "postprocessing_seconds"):
+        output = spine.loc[:, list(ckpt_config.schema.condition_columns)].copy()
+        for column in ckpt_config.schema.categorical_targets:
             output[column] = attrs[column]
-    for column in ckpt_config.schema.text_targets:
-        output[column] = attrs[column]
-    output = validate_output_categoricals(
-        output,
-        {column: vocabs[column] for column in ckpt_config.schema.categorical_targets if column in vocabs},
-        repair_invalid=repair_invalid_categoricals,
-    )
+        if debug_write_aux_targets:
+            for column in ckpt_config.schema.auxiliary_categorical_targets:
+                output[column] = attrs[column]
+        for column in ckpt_config.schema.text_targets:
+            output[column] = attrs[column]
+        output = validate_output_categoricals(
+            output,
+            {column: vocabs[column] for column in ckpt_config.schema.categorical_targets if column in vocabs},
+            repair_invalid=repair_invalid_categoricals,
+        )
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output.to_csv(output_path, index=False)
+    with profile_timer(profiler, "csv_writing_seconds"):
+        output.to_csv(output_path, index=False)
+    runtime_output = Path(profile_output) if profile_output else output_path.parent / "metadata" / "runtime_diffusion_sampling.json"
+    summary_lengths = text_lengths(output.get("summary")) if "summary" in output else []
+    review_lengths = text_lengths(output.get("review_text")) if "review_text" in output else []
     metadata = {
         "experiment_name": ckpt_config.raw.get("experiment_name", Path(ckpt_config.output_dir).name),
         "checkpoint_path": str(checkpoint_path),
@@ -123,9 +158,17 @@ def sample_from_config(
         "output_path": str(output_path),
         "num_rows": int(len(output)),
         "batch_size": batch_size,
+        "sample_batch_size": batch_size,
         "temperature": temperature,
         "top_p": top_p,
+        "text_top_k": text_top_k,
         "seed": seed,
+        "diffusion_train_timesteps": int(ckpt_config.raw.get("diffusion", {}).get("timesteps", 50)),
+        "diffusion_sampling_steps": int(sampling_steps),
+        "diffusion_timestep_spacing": str(timestep_spacing),
+        "inference_dtype": inference_dtype,
+        "torch_compile_used": compile_used,
+        "runtime_profile_path": str(runtime_output) if profiler.enabled or profile_output is not None else None,
         "condition_columns": list(ckpt_config.schema.condition_columns),
         "target_columns": {
             "categorical": list(ckpt_config.schema.categorical_targets),
@@ -179,9 +222,143 @@ def sample_from_config(
     with (output_path.parent / "sample_metadata.json").open("w") as handle:
         json.dump(metadata, handle, indent=2, sort_keys=True)
         handle.write("\n")
-    write_debug_outputs(attrs, output_path.parent / "debug")
+    with profile_timer(profiler, "debug_example_seconds"):
+        write_debug_outputs(attrs, output_path.parent / "debug")
+    profiler.stop_total()
+    if profiler.enabled or profile_output is not None:
+        runtime_summary = profiler.summary(
+            rows_generated=int(len(output)),
+            num_batches=int(math.ceil(len(spine) / max(batch_size, 1))),
+            batch_size_requested=int(batch_size),
+            batch_size_used=int(batch_size),
+            auto_batch_size_enabled=False,
+            summary_lengths=summary_lengths,
+            review_text_lengths=review_lengths,
+            device=device,
+            mixed_precision_used=inference_dtype.lower() != "float32",
+            dtype_used=inference_dtype,
+            torch_compile_used=compile_used,
+            extra={
+                "diffusion_train_timesteps": int(ckpt_config.raw.get("diffusion", {}).get("timesteps", 50)),
+                "diffusion_sampling_steps": int(sampling_steps),
+                "diffusion_timestep_spacing": str(timestep_spacing),
+                "text_top_k": text_top_k,
+                "temperature": temperature,
+                "top_p": top_p,
+            },
+        )
+        profiler.write_summary(runtime_output, runtime_summary)
+        profiler.write_detailed(Path(runtime_output).with_name("runtime_diffusion_sampling_events.json"))
     print(f"Wrote {output_path}")
     return output_path
+
+
+@contextmanager
+def profile_timer(
+    profiler: RuntimeProfiler | None,
+    name: str,
+    *,
+    device: str | None = None,
+    cuda: bool = False,
+) -> Iterator[None]:
+    if profiler is None or not profiler.enabled:
+        yield
+        return
+    if cuda:
+        synchronize_cuda(device)
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        if cuda:
+            synchronize_cuda(device)
+        profiler.add_time(name, float(time.perf_counter() - start))
+
+
+def synchronize_cuda(device: str | None = None) -> None:
+    if device is None or not str(device).startswith("cuda") or not torch.cuda.is_available():
+        return
+    try:
+        torch.cuda.synchronize(torch.device(device))
+    except Exception:
+        torch.cuda.synchronize()
+
+
+def parse_optional_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    parsed = int(value)
+    return parsed if parsed > 0 else None
+
+
+def maybe_compile_model(model: torch.nn.Module, enabled: bool) -> tuple[torch.nn.Module, bool]:
+    if not enabled:
+        return model, False
+    compile_fn = getattr(torch, "compile", None)
+    if compile_fn is None:
+        print("WARNING: torch.compile is unavailable; continuing without compilation.", flush=True)
+        return model, False
+    try:
+        return compile_fn(model, mode="reduce-overhead"), True
+    except Exception as exc:
+        print(f"WARNING: torch.compile failed; continuing without compilation. Reason: {exc}", flush=True)
+        return model, False
+
+
+def resolve_inference_dtype(dtype_name: str, device: str) -> tuple[torch.dtype, bool]:
+    name = str(dtype_name or "float32").lower()
+    if name in {"float32", "fp32", "none"} or not str(device).startswith("cuda"):
+        return torch.float32, False
+    if name in {"bfloat16", "bf16"}:
+        if torch.cuda.is_available() and hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported():
+            return torch.bfloat16, True
+        print("WARNING: bfloat16 requested but unsupported; falling back to float32.", flush=True)
+        return torch.float32, False
+    if name in {"float16", "fp16", "half"}:
+        return torch.float16, True
+    raise ValueError("inference_dtype must be one of float32, float16, or bfloat16")
+
+
+def masked_denoising_schedule(total_timesteps: int, sampling_steps: int, spacing: str = "uniform") -> list[int]:
+    total = max(1, int(total_timesteps))
+    steps = max(1, min(int(sampling_steps), total))
+    if steps >= total:
+        return list(range(total, 0, -1))
+    if steps == 1:
+        return [total]
+    spacing = str(spacing or "uniform").lower()
+    if spacing == "quadratic":
+        raw = np.square(np.linspace(np.sqrt(total), 1.0, num=steps))
+    elif spacing == "leading":
+        raw = np.linspace(total, 1.0, num=steps)
+        raw = total - np.square(np.linspace(0.0, np.sqrt(total - 1), num=steps))
+    elif spacing == "trailing":
+        raw = np.square(np.linspace(np.sqrt(total), 1.0, num=steps))
+    elif spacing == "uniform":
+        raw = np.linspace(total, 1.0, num=steps)
+    else:
+        raise ValueError("timestep_spacing must be one of uniform, quadratic, leading, or trailing")
+    schedule = sorted({int(round(value)) for value in raw}, reverse=True)
+    schedule = [min(total, max(1, value)) for value in schedule]
+    if total not in schedule:
+        schedule.insert(0, total)
+    if 1 not in schedule:
+        schedule[-1] = 1
+    return sorted(set(schedule), reverse=True)
+
+
+def reveal_probability_for_schedule(current_step: int, next_step: int) -> float:
+    current = max(1, int(current_step))
+    next_value = max(0, min(int(next_step), current - 1))
+    if next_value <= 0:
+        return 1.0
+    return float(np.clip(1.0 - (next_value / float(current)), 0.0, 1.0))
+
+
+def text_lengths(series: pd.Series | None) -> list[int]:
+    if series is None:
+        return []
+    return [len(str(value).split()) for value in series.fillna("").astype(str).tolist()]
 
 
 def load_model_checkpoint(
@@ -235,12 +412,23 @@ def sample_attributes(
     disable_length_calibration: bool = False,
     graph_encoder: TemporalStructureOnlyGraphEncoder | None = None,
     graph_history_index: Any | None = None,
+    sampling_steps: int | None = None,
+    timestep_spacing: str = "uniform",
+    inference_dtype: str = "float32",
+    text_top_k: int | None = None,
+    profiler: RuntimeProfiler | None = None,
 ) -> dict[str, list[str]]:
     id_cfg = config.raw.get("id_encoding", {})
     diffusion = config.raw.get("diffusion", {})
     sampling_cfg = config.raw.get("sampling", {})
     num_hash_buckets = int(id_cfg.get("num_buckets", 262144))
-    timesteps = int(diffusion.get("timesteps", 50))
+    timesteps = int(diffusion.get("timesteps", diffusion.get("train_timesteps", 50)))
+    schedule = masked_denoising_schedule(
+        total_timesteps=timesteps,
+        sampling_steps=int(sampling_steps or timesteps),
+        spacing=timestep_spacing,
+    )
+    autocast_dtype, autocast_enabled = resolve_inference_dtype(inference_dtype, device)
     repetition_penalties = {
         column: float(sampling_cfg.get(f"{column}_content_repetition_penalty", sampling_cfg.get("summary_content_repetition_penalty", 1.0)))
         for column in schema.text_targets
@@ -266,91 +454,107 @@ def sample_attributes(
         iterator = tqdm(iterator, total=(len(spine) + int(batch_size) - 1) // int(batch_size), desc="sample")
     for start in iterator:
         batch_frame = spine.iloc[start : start + int(batch_size)]
-        foreign_key_ids, datetime_values = encode_conditions(batch_frame, schema, num_hash_buckets, device)
+        with profile_timer(profiler, "condition_encoding_seconds", device=device):
+            foreign_key_ids, datetime_values = encode_conditions(batch_frame, schema, num_hash_buckets, device)
         graph_context = None
         if graph_encoder is not None and not attr_sampling:
             if graph_history_index is None:
                 raise ValueError("graph_history_index is required when graph_encoder is enabled")
             row_indices = list(range(start, start + len(batch_frame)))
-            graph_context = graph_encoder(
-                graph_history_index.build_batch(row_indices, device=device, deterministic=True)
-            )
-        cat_input = torch.empty((len(batch_frame), len(schema.model_categorical_targets)), dtype=torch.long, device=device)
-        for idx, column in enumerate(schema.model_categorical_targets):
-            cat_input[:, idx] = categorical_vocabs[column].mask_id
-        cat_remaining = torch.ones_like(cat_input, dtype=torch.bool)
+            with profile_timer(profiler, "graph_context_total_seconds", device=device, cuda=device.startswith("cuda")):
+                with torch.inference_mode(), torch.autocast(
+                    device_type="cuda",
+                    dtype=autocast_dtype,
+                    enabled=autocast_enabled,
+                ):
+                    graph_context = graph_encoder(
+                        graph_history_index.build_batch(row_indices, device=device, deterministic=True)
+                    )
+        with profile_timer(profiler, "initial_noise_seconds", device=device):
+            cat_input = torch.empty((len(batch_frame), len(schema.model_categorical_targets)), dtype=torch.long, device=device)
+            for idx, column in enumerate(schema.model_categorical_targets):
+                cat_input[:, idx] = categorical_vocabs[column].mask_id
+            cat_remaining = torch.ones_like(cat_input, dtype=torch.bool)
 
-        text_input: dict[str, torch.Tensor] = {}
-        text_attention: dict[str, torch.Tensor] = {}
-        text_remaining: dict[str, torch.Tensor] = {}
-        for column in schema.text_targets:
-            length = int(schema.text_max_lengths[column])
-            text_input[column] = torch.full((len(batch_frame), length), text_tokenizer.mask_id, dtype=torch.long, device=device)
-            text_input[column][:, 0] = text_tokenizer.bos_id
-            text_attention[column] = torch.ones((len(batch_frame), length), dtype=torch.long, device=device)
-            text_remaining[column] = torch.ones((len(batch_frame), length), dtype=torch.bool, device=device)
-            text_remaining[column][:, 0] = False
+            text_input: dict[str, torch.Tensor] = {}
+            text_attention: dict[str, torch.Tensor] = {}
+            text_remaining: dict[str, torch.Tensor] = {}
+            for column in schema.text_targets:
+                length = int(schema.text_max_lengths[column])
+                text_input[column] = torch.full((len(batch_frame), length), text_tokenizer.mask_id, dtype=torch.long, device=device)
+                text_input[column][:, 0] = text_tokenizer.bos_id
+                text_attention[column] = torch.ones((len(batch_frame), length), dtype=torch.long, device=device)
+                text_remaining[column] = torch.ones((len(batch_frame), length), dtype=torch.bool, device=device)
+                text_remaining[column][:, 0] = False
 
         logits: dict[str, Any] | None = None
-        for step in range(timesteps, 0, -1):
-            t = torch.full((len(batch_frame),), step / max(timesteps, 1), dtype=torch.float32, device=device)
-            if attr_sampling:
-                graph_context = sampling_graph_context(
-                    graph_encoder,
-                    graph_history_index,
-                    generated_attr_store,
-                    config,
-                    row_indices=list(range(start, start + len(batch_frame))),
-                    cat_input=cat_input,
-                    text_input=text_input,
-                    device=device,
-                )
-            logits = model(
-                foreign_key_ids=foreign_key_ids,
-                datetime_values=datetime_values,
-                categorical_input_ids=cat_input,
-                text_input_ids=text_input,
-                text_attention=text_attention,
-                diffusion_t=t,
-                graph_context=graph_context,
-            )
-            reveal_prob = 1.0 if step == 1 else 1.0 / float(step)
-            for idx, column in enumerate(schema.model_categorical_targets):
-                remaining = cat_remaining[:, idx]
-                if not bool(remaining.any()):
-                    continue
-                if column in schema.length_bucket_targets:
-                    sampled = sample_length_bucket_logits(
-                        logits["categorical"][column],
-                        column,
-                        categorical_vocabs[column],
-                        length_calibration_for_column(calibration, column),
-                        schema,
-                        temperature=temperature,
+        with profile_timer(profiler, "denoising_loop_seconds", device=device, cuda=device.startswith("cuda")):
+            for schedule_idx, step in enumerate(schedule):
+                next_step = schedule[schedule_idx + 1] if schedule_idx + 1 < len(schedule) else 0
+                reveal_prob = reveal_probability_for_schedule(step, next_step)
+                t = torch.full((len(batch_frame),), step / max(timesteps, 1), dtype=torch.float32, device=device)
+                if attr_sampling:
+                    graph_context = sampling_graph_context(
+                        graph_encoder,
+                        graph_history_index,
+                        generated_attr_store,
+                        config,
+                        row_indices=list(range(start, start + len(batch_frame))),
+                        cat_input=cat_input,
+                        text_input=text_input,
+                        device=device,
                     )
-                else:
-                    sampled = sample_categorical_logits(
-                        logits["categorical"][column],
-                        column,
-                        categorical_vocabs[column],
-                        temperature=temperature,
-                    )
-                reveal = remaining & (torch.rand_like(remaining.float()) < reveal_prob)
-                if step == 1:
-                    reveal = remaining
-                cat_input[reveal, idx] = sampled[reveal]
-                cat_remaining[reveal, idx] = False
-            for column in schema.text_targets:
-                remaining = text_remaining[column]
-                if not bool(remaining.any()):
-                    continue
-                flat_logits = logits["text"][column].reshape(-1, logits["text"][column].shape[-1])
-                sampled = sample_logits(flat_logits, temperature=temperature, top_p=top_p).view_as(text_input[column])
-                reveal = remaining & (torch.rand_like(remaining.float()) < reveal_prob)
-                if step == 1:
-                    reveal = remaining
-                text_input[column][reveal] = sampled[reveal]
-                text_remaining[column][reveal] = False
+                with profile_timer(profiler, "denoising_step_seconds", device=device, cuda=device.startswith("cuda")):
+                    with torch.inference_mode(), torch.autocast(
+                        device_type="cuda",
+                        dtype=autocast_dtype,
+                        enabled=autocast_enabled,
+                    ):
+                        logits = model(
+                            foreign_key_ids=foreign_key_ids,
+                            datetime_values=datetime_values,
+                            categorical_input_ids=cat_input,
+                            text_input_ids=text_input,
+                            text_attention=text_attention,
+                            diffusion_t=t,
+                            graph_context=graph_context,
+                        )
+                for idx, column in enumerate(schema.model_categorical_targets):
+                    remaining = cat_remaining[:, idx]
+                    if not bool(remaining.any()):
+                        continue
+                    if column in schema.length_bucket_targets:
+                        sampled = sample_length_bucket_logits(
+                            logits["categorical"][column],
+                            column,
+                            categorical_vocabs[column],
+                            length_calibration_for_column(calibration, column),
+                            schema,
+                            temperature=temperature,
+                        )
+                    else:
+                        sampled = sample_categorical_logits(
+                            logits["categorical"][column],
+                            column,
+                            categorical_vocabs[column],
+                            temperature=temperature,
+                        )
+                    reveal = remaining & (torch.rand_like(remaining.float()) < reveal_prob)
+                    if schedule_idx + 1 == len(schedule):
+                        reveal = remaining
+                    cat_input[reveal, idx] = sampled[reveal]
+                    cat_remaining[reveal, idx] = False
+                for column in schema.text_targets:
+                    remaining = text_remaining[column]
+                    if not bool(remaining.any()):
+                        continue
+                    flat_logits = logits["text"][column].reshape(-1, logits["text"][column].shape[-1])
+                    sampled = sample_logits(flat_logits, temperature=temperature, top_p=top_p, top_k=text_top_k).view_as(text_input[column])
+                    reveal = remaining & (torch.rand_like(remaining.float()) < reveal_prob)
+                    if schedule_idx + 1 == len(schedule):
+                        reveal = remaining
+                    text_input[column][reveal] = sampled[reveal]
+                    text_remaining[column][reveal] = False
 
         final_t = torch.zeros((len(batch_frame),), dtype=torch.float32, device=device)
         if attr_sampling:
@@ -364,67 +568,87 @@ def sample_attributes(
                 text_input=text_input,
                 device=device,
             )
-        logits = model(
-            foreign_key_ids=foreign_key_ids,
-            datetime_values=datetime_values,
-            categorical_input_ids=cat_input,
-            text_input_ids=text_input,
-            text_attention=text_attention,
-            diffusion_t=final_t,
-            graph_context=graph_context,
-        )
-        length_debug_rows = enforce_length_constraints(
-            schema=schema,
-            categorical_vocabs=categorical_vocabs,
-            text_tokenizer=text_tokenizer,
-            cat_input=cat_input,
-            text_input=text_input,
-            text_logits=logits["text"],
-            rng=rng,
-            temperature=temperature,
-            top_p=top_p,
-            repetition_penalties=repetition_penalties,
-            min_content_tokens=min_content_tokens,
-        )
+        with profile_timer(profiler, "final_forward_seconds", device=device, cuda=device.startswith("cuda")):
+            with torch.inference_mode(), torch.autocast(
+                device_type="cuda",
+                dtype=autocast_dtype,
+                enabled=autocast_enabled,
+            ):
+                logits = model(
+                    foreign_key_ids=foreign_key_ids,
+                    datetime_values=datetime_values,
+                    categorical_input_ids=cat_input,
+                    text_input_ids=text_input,
+                    text_attention=text_attention,
+                    diffusion_t=final_t,
+                    graph_context=graph_context,
+                )
+        with profile_timer(profiler, "length_enforcement_seconds", device=device, cuda=device.startswith("cuda")):
+            length_debug_rows = enforce_length_constraints(
+                schema=schema,
+                categorical_vocabs=categorical_vocabs,
+                text_tokenizer=text_tokenizer,
+                cat_input=cat_input,
+                text_input=text_input,
+                text_logits=logits["text"],
+                rng=rng,
+                temperature=temperature,
+                top_p=top_p,
+                repetition_penalties=repetition_penalties,
+                min_content_tokens=min_content_tokens,
+            )
 
         decoded_cats: dict[str, list[str]] = {}
-        for idx, column in enumerate(schema.model_categorical_targets):
-            decoded = [
-                decode_category_id(column, categorical_vocabs[column], value)
-                for value in cat_input[:, idx].detach().cpu().tolist()
-            ]
-            decoded_cats[column] = decoded
-            result[column].extend(decoded)  # type: ignore[arg-type]
-        for column in schema.text_targets:
-            decoded = [text_tokenizer.decode(row) for row in text_input[column].detach().cpu().tolist()]
-            result[column].extend(decoded)  # type: ignore[arg-type]
-            for local_idx, (row_index, decoded_text) in enumerate(zip(batch_frame.index.tolist(), decoded)):
-                if len(debug_examples) >= 200:
-                    break
-                ids = text_input[column][local_idx].detach().cpu().tolist()
-                raw_tokens = [text_tokenizer.inv_vocab.get(int(idx), text_tokenizer.unk_token) for idx in ids]
-                eos_position = next((idx for idx, token_id in enumerate(ids) if int(token_id) == text_tokenizer.eos_id), None)
-                length_bucket_col = length_bucket_column_for_text(schema, column)
-                example = {
-                    "text_column": column,
-                    "customer_id": batch_frame.iloc[local_idx].get(schema.foreign_key_columns[0]),
-                    "product_id": batch_frame.iloc[local_idx].get(schema.foreign_key_columns[1]) if len(schema.foreign_key_columns) > 1 else None,
-                    "review_time": str(batch_frame.iloc[local_idx].get(schema.datetime_columns[0])),
-                    "rating": decoded_cats.get("rating", [None] * len(batch_frame))[local_idx],
-                    "verified": decoded_cats.get("verified", [None] * len(batch_frame))[local_idx],
-                    f"{column}_length_bucket": decoded_cats.get(length_bucket_col, [None] * len(batch_frame))[local_idx] if length_bucket_col else None,
-                    "summary_length_bucket": decoded_cats.get("summary_length_bucket", [None] * len(batch_frame))[local_idx],
-                    "review_text_length_bucket": decoded_cats.get("review_text_length_bucket", [None] * len(batch_frame))[local_idx],
-                    f"decoded_{column}": decoded_text,
-                    "decoded_summary": decoded_text if column == "summary" else None,
-                    "raw_tokens": raw_tokens,
-                    "raw_summary_tokens": raw_tokens if column == "summary" else None,
-                    "raw_review_text_tokens": raw_tokens if column == "review_text" else None,
-                    "eos_position": eos_position,
-                    "content_length": text_tokenizer.content_length(ids),
-                    **length_debug_rows[local_idx].get(column, {}),
-                }
-                debug_examples.append(example)
+        with profile_timer(profiler, "categorical_decoding_seconds"):
+            for idx, column in enumerate(schema.model_categorical_targets):
+                decoded = [
+                    decode_category_id(column, categorical_vocabs[column], value)
+                    for value in cat_input[:, idx].detach().cpu().tolist()
+                ]
+                decoded_cats[column] = decoded
+                result[column].extend(decoded)  # type: ignore[arg-type]
+        with profile_timer(profiler, "text_decoding_seconds"):
+            text_rows_by_column = {
+                column: text_input[column].detach().cpu().tolist()
+                for column in schema.text_targets
+            }
+            decoded_text_by_column = {
+                column: [text_tokenizer.decode(row) for row in rows]
+                for column, rows in text_rows_by_column.items()
+            }
+            for column, decoded in decoded_text_by_column.items():
+                result[column].extend(decoded)  # type: ignore[arg-type]
+        with profile_timer(profiler, "debug_example_seconds"):
+            for column in schema.text_targets:
+                decoded = decoded_text_by_column[column]
+                rows = text_rows_by_column[column]
+                for local_idx, decoded_text in enumerate(decoded):
+                    if len(debug_examples) >= 200:
+                        break
+                    ids = rows[local_idx]
+                    raw_tokens = [text_tokenizer.inv_vocab.get(int(idx), text_tokenizer.unk_token) for idx in ids]
+                    eos_position = next((idx for idx, token_id in enumerate(ids) if int(token_id) == text_tokenizer.eos_id), None)
+                    length_bucket_col = length_bucket_column_for_text(schema, column)
+                    example = {
+                        "text_column": column,
+                        "customer_id": batch_frame.iloc[local_idx].get(schema.foreign_key_columns[0]),
+                        "product_id": batch_frame.iloc[local_idx].get(schema.foreign_key_columns[1]) if len(schema.foreign_key_columns) > 1 else None,
+                        "review_time": str(batch_frame.iloc[local_idx].get(schema.datetime_columns[0])),
+                        "rating": decoded_cats.get("rating", [None] * len(batch_frame))[local_idx],
+                        "verified": decoded_cats.get("verified", [None] * len(batch_frame))[local_idx],
+                        f"{column}_length_bucket": decoded_cats.get(length_bucket_col, [None] * len(batch_frame))[local_idx] if length_bucket_col else None,
+                        "summary_length_bucket": decoded_cats.get("summary_length_bucket", [None] * len(batch_frame))[local_idx],
+                        "review_text_length_bucket": decoded_cats.get("review_text_length_bucket", [None] * len(batch_frame))[local_idx],
+                        f"decoded_{column}": decoded_text,
+                        "decoded_summary": decoded_text if column == "summary" else None,
+                        "raw_tokens": raw_tokens,
+                        "raw_summary_tokens": raw_tokens if column == "summary" else None,
+                        "raw_review_text_tokens": raw_tokens if column == "review_text" else None,
+                        "eos_position": eos_position,
+                        "content_length": text_tokenizer.content_length(ids),
+                        **length_debug_rows[local_idx].get(column, {}),
+                    }
+                    debug_examples.append(example)
         if attr_sampling and generated_attr_store is not None:
             generated_attr_store.update_rows(
                 list(range(start, start + len(batch_frame))),
@@ -820,27 +1044,53 @@ def encode_conditions(
     num_hash_buckets: int,
     device: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    foreign_keys = []
-    for _, row in frame.iterrows():
-        foreign_keys.append([
-            stable_hash_bucket(column, row[column], num_hash_buckets)
-            for column in schema.foreign_key_columns
-        ])
+    foreign_keys = [
+        [
+            stable_hash_bucket(column, value, num_hash_buckets)
+            for value in frame[column].to_numpy()
+        ]
+        for column in schema.foreign_key_columns
+    ]
     datetimes = []
-    for _, row in frame.iterrows():
-        datetimes.append([
-            pd.Timestamp(row[column]).timestamp()
-            for column in schema.datetime_columns
-        ])
+    for column in schema.datetime_columns:
+        timestamps = pd.to_datetime(frame[column], errors="coerce")
+        if timestamps.isna().any():
+            raise ValueError(f"Cannot encode datetime condition {column!r}; found unparsable values")
+        timestamp_ns = timestamps.to_numpy(dtype="datetime64[ns]").astype(np.int64, copy=False)
+        datetimes.append((timestamp_ns.astype(np.float64) / 1_000_000_000.0).astype(np.float32))
     return (
-        torch.tensor(foreign_keys, dtype=torch.long, device=device),
-        torch.tensor(datetimes, dtype=torch.float32, device=device),
+        torch.tensor(np.asarray(foreign_keys, dtype=np.int64).T, dtype=torch.long, device=device),
+        torch.tensor(np.asarray(datetimes, dtype=np.float32).T, dtype=torch.float32, device=device),
     )
 
 
-def sample_logits(logits: torch.Tensor, temperature: float = 1.0, top_p: float = 1.0) -> torch.Tensor:
+def sample_logits(
+    logits: torch.Tensor,
+    temperature: float = 1.0,
+    top_p: float = 1.0,
+    top_k: int | None = None,
+) -> torch.Tensor:
     logits = torch.nan_to_num(logits.float(), nan=0.0, posinf=30.0, neginf=-30.0)
     logits = logits / max(float(temperature), 1e-6)
+    if top_k is not None and int(top_k) > 0 and int(top_k) < logits.shape[-1]:
+        k = int(top_k)
+        top_values, top_indices = torch.topk(logits, k=k, dim=-1)
+        if top_p < 1.0:
+            sorted_logits, sorted_local_idx = torch.sort(top_values, descending=True, dim=-1)
+            probs = torch.softmax(sorted_logits, dim=-1)
+            cumulative = torch.cumsum(probs, dim=-1)
+            remove = cumulative > float(top_p)
+            remove[:, 0] = False
+            sorted_logits = sorted_logits.masked_fill(remove, -float("inf"))
+            filtered_top = torch.full_like(top_values, -float("inf"))
+            filtered_top.scatter_(dim=-1, index=sorted_local_idx, src=sorted_logits)
+            top_values = filtered_top
+        probs = torch.softmax(top_values, dim=-1)
+        probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+        row_sums = probs.sum(dim=-1, keepdim=True)
+        probs = torch.where(row_sums > 0, probs / row_sums.clamp_min(1e-12), torch.full_like(probs, 1.0 / probs.shape[-1]))
+        local = torch.multinomial(probs, num_samples=1)
+        return top_indices.gather(dim=-1, index=local).squeeze(-1)
     if top_p < 1.0:
         sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
         probs = torch.softmax(sorted_logits, dim=-1)
