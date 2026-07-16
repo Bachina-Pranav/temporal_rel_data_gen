@@ -36,6 +36,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gradient-accumulation-steps", type=int, default=8)
     parser.add_argument("--warmup-steps", type=int, default=50)
     parser.add_argument("--profile-steps", type=int, default=200)
+    parser.add_argument("--validation-max-batches", type=int, default=5)
+    parser.add_argument("--device", default=None)
     parser.add_argument("--mixed-precision", action="store_true")
     parser.add_argument("--output-dir", required=True)
     return parser.parse_args()
@@ -68,8 +70,11 @@ def main() -> None:
             "gradient_accumulation_steps": int(args.gradient_accumulation_steps),
             "mixed_precision": bool(args.mixed_precision),
             "profile": True,
+            "validation_max_batches": int(args.validation_max_batches),
         }
     )
+    if args.device is not None:
+        training["device"] = args.device
     raw = resolve_auto_review_text_config(raw)
     schema = ConditionalTABDLMSchema.from_config_dict(raw)
     config = ConditionalTABDLMConfig(raw=raw, schema=schema, config_path=Path(args.config))

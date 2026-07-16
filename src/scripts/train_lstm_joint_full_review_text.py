@@ -49,6 +49,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--steps-per-eval", type=int, default=None)
     parser.add_argument("--steps-per-checkpoint", type=int, default=None)
+    parser.add_argument("--validation-max-batches", type=int, default=None)
     parser.add_argument("--epoch-mode", choices=["true", "false"], default=None)
     parser.add_argument("--sampling-mode", choices=["uniform", "temporal_stratified", "temporal_weighted", "hybrid"], default=None)
     parser.add_argument("--effective-batch-size", type=int, default=None)
@@ -102,6 +103,8 @@ def load_config_with_overrides(args: argparse.Namespace) -> ConditionalTABDLMCon
         training["steps_per_eval"] = int(args.steps_per_eval)
     if args.steps_per_checkpoint is not None:
         training["steps_per_checkpoint"] = int(args.steps_per_checkpoint)
+    if args.validation_max_batches is not None:
+        training["validation_max_batches"] = int(args.validation_max_batches)
     if args.epoch_mode is not None:
         training["epoch_mode"] = args.epoch_mode == "true"
     if args.sampling_mode is not None:

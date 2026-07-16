@@ -59,13 +59,13 @@ graph_conditioning:
     timestamp_column: event_time
     allow_same_timestamp_events: false
     exclude_target_event_from_neighbors: true
-    max_history_events_per_customer: 50
-    max_history_events_per_product: 100
+    max_history_events_per_customer: 8
+    max_history_events_per_product: 16
     history_sampling_strategy: recent
   forbidden_node_features: [rating, verified, summary, review_text]
   graph_uses_future_events: false
   graph_uses_target_attributes: false
-  graph_encoder: {type: temporal_structure_ego_encoder, hidden_dim: 128, output_dim: 128, num_layers: 1, dropout: 0.1}
+  graph_encoder: {type: temporal_structure_ego_encoder, hidden_dim: 64, output_dim: 64, num_layers: 1, dropout: 0.1}
 
 text:
   max_length: {}
@@ -80,7 +80,7 @@ model:
   categorical_context_dim: 16
   dropout: 0.1
   use_graph_context: true
-  graph_context_dim: 128
+  graph_context_dim: 64
 text_decoder: {enabled: false, type: none, embedding_dim: 0, hidden_dim: 0, num_layers: 0, dropout: 0.0}
 review_text_decoder: {enabled: false, condition_on_summary: false}
 summary_decoder: {enabled: false}
