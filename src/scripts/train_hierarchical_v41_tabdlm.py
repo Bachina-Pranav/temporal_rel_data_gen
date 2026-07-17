@@ -39,6 +39,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fused-adamw", action="store_true")
     parser.add_argument("--compile-model", action="store_true")
     parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--skip-checkpoints", action="store_true")
     parser.add_argument("--max-train-batches", type=int, default=None)
     parser.add_argument("--max-valid-batches", type=int, default=None)
     return parser.parse_args()
@@ -75,6 +76,8 @@ def main() -> None:
         training["compile_model"] = True
     if args.profile:
         training["profile"] = True
+    if args.skip_checkpoints:
+        training["skip_checkpoints"] = True
     if args.max_train_batches is not None:
         training["max_train_batches"] = int(args.max_train_batches)
     if args.max_valid_batches is not None:

@@ -169,6 +169,7 @@ def train_hierarchical_from_config(config: ConditionalTABDLMConfig, device: str 
         best_valid = float((resume_checkpoint.get("valid_metrics") or {}).get("total_loss", best_valid))
     best_path = checkpoint_dir / "best.pt"
     last_path = checkpoint_dir / "last.pt"
+    skip_checkpoints = bool(training.get("skip_checkpoints", False))
 
     for epoch in range(start_epoch, epochs + 1):
         train_metrics = run_hierarchical_epoch(
@@ -218,11 +219,13 @@ def train_hierarchical_from_config(config: ConditionalTABDLMConfig, device: str 
         }
         append_jsonl(log_path, row)
         print(json.dumps(row, sort_keys=True), flush=True)
-        save_hierarchical_checkpoint(last_path, model, optimizer, config, categorical_vocabs, text_tokenizer, epoch, valid_metrics, graph_encoder)
+        if not skip_checkpoints:
+            save_hierarchical_checkpoint(last_path, model, optimizer, config, categorical_vocabs, text_tokenizer, epoch, valid_metrics, graph_encoder)
         if current_valid < best_valid - early_stopping_min_delta:
             best_valid = current_valid
             epochs_without_improvement = 0
-            save_hierarchical_checkpoint(best_path, model, optimizer, config, categorical_vocabs, text_tokenizer, epoch, valid_metrics, graph_encoder)
+            if not skip_checkpoints:
+                save_hierarchical_checkpoint(best_path, model, optimizer, config, categorical_vocabs, text_tokenizer, epoch, valid_metrics, graph_encoder)
         else:
             epochs_without_improvement += 1
             if early_stopping_patience > 0 and epochs_without_improvement >= early_stopping_patience:
@@ -240,7 +243,10 @@ def train_hierarchical_from_config(config: ConditionalTABDLMConfig, device: str 
                     flush=True,
                 )
                 break
-    print(f"Wrote best checkpoint to {best_path}")
+    if skip_checkpoints:
+        print(f"Skipped checkpoint writing; best checkpoint path would be {best_path}")
+    else:
+        print(f"Wrote best checkpoint to {best_path}")
     return best_path
 
 
