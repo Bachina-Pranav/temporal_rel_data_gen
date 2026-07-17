@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
@@ -14,6 +15,8 @@ from .dataset import ConditionalTABDLMDataset, load_category_vocabs, load_prepar
 from .graph_dataset import build_temporal_history_index, write_temporal_graph_metadata
 from .graph_schema import assert_valid_graph_conditioning, graph_conditioning_enabled, graph_metadata
 from .hierarchical_schema import generation_plan_from_config
+from .neighbor_cache import CachedTemporalHistoryIndex
+from .pretokenized import PretokenizedLSTMDataset, load_pretokenized_bundle
 from .sample import sample_categorical_logits, sample_length_bucket_logits
 from .schema import ConditionalTABDLMConfig
 from .tokenization import CategoryVocab, SimpleTextTokenizer
@@ -56,16 +59,26 @@ def train_hierarchical_from_config(config: ConditionalTABDLMConfig, device: str 
     save_yaml(config.to_dict(), output_dir / "config_resolved.yaml")
     save_json(plan.to_dict(), output_dir / "metadata" / "generation_plan.json")
 
-    train_frame, valid_frame, _ = load_prepared_tables(config)
     use_graph_context = graph_conditioning_enabled(config.raw)
     if use_graph_context:
         assert_valid_graph_conditioning(config.raw)
 
-    categorical_vocabs = load_category_vocabs(config)
-    text_tokenizer = load_text_tokenizer(config)
-    num_hash_buckets = int(config.raw.get("id_encoding", {}).get("num_buckets", 262144))
-    train_dataset = ConditionalTABDLMDataset(train_frame, config.schema, categorical_vocabs, text_tokenizer, num_hash_buckets)
-    valid_dataset = ConditionalTABDLMDataset(valid_frame, config.schema, categorical_vocabs, text_tokenizer, num_hash_buckets)
+    pretokenized_dir = training.get("pretokenized_dir") or config.raw.get("paths", {}).get("pretokenized_dir")
+    if pretokenized_dir:
+        bundle = load_pretokenized_bundle(pretokenized_dir, config.schema)
+        train_dataset = PretokenizedLSTMDataset(bundle, "train")
+        valid_dataset = PretokenizedLSTMDataset(bundle, "valid")
+        categorical_vocabs = bundle.categorical_vocabs
+        text_tokenizer = bundle.tokenizer
+        train_frame = None
+        valid_frame = None
+    else:
+        train_frame, valid_frame, _ = load_prepared_tables(config)
+        categorical_vocabs = load_category_vocabs(config)
+        text_tokenizer = load_text_tokenizer(config)
+        num_hash_buckets = int(config.raw.get("id_encoding", {}).get("num_buckets", 262144))
+        train_dataset = ConditionalTABDLMDataset(train_frame, config.schema, categorical_vocabs, text_tokenizer, num_hash_buckets)
+        valid_dataset = ConditionalTABDLMDataset(valid_frame, config.schema, categorical_vocabs, text_tokenizer, num_hash_buckets)
     collate_fn = make_collate_fn(
         config.schema,
         categorical_vocabs,
@@ -106,12 +119,26 @@ def train_hierarchical_from_config(config: ConditionalTABDLMConfig, device: str 
         start_epoch = int(resume_checkpoint.get("epoch", 0)) + 1
     model, compile_used = maybe_compile_training_module(model, bool(training.get("compile_model", False)))
 
-    train_history_index = build_temporal_history_index(train_frame, config, seed=seed) if use_graph_context else None
-    valid_graph_frame = torch_load_concat_frames(train_frame, valid_frame) if use_graph_context else valid_frame
-    valid_history_index = build_temporal_history_index(valid_graph_frame, config, seed=seed + 1) if use_graph_context else None
-    valid_row_id_offset = len(train_frame) if use_graph_context else 0
+    neighbor_cache_dir = training.get("neighbor_cache_dir") or config.raw.get("paths", {}).get("neighbor_cache_dir")
+    if use_graph_context and neighbor_cache_dir:
+        train_history_index = CachedTemporalHistoryIndex(neighbor_cache_dir)
+        valid_history_index = train_history_index
+        valid_row_id_offset = 0
+    elif use_graph_context:
+        if train_frame is None or valid_frame is None:
+            raise ValueError("Pretokenized hierarchical graph training requires --neighbor-cache-dir")
+        train_history_index = build_temporal_history_index(train_frame, config, seed=seed)
+        valid_graph_frame = torch_load_concat_frames(train_frame, valid_frame)
+        valid_history_index = build_temporal_history_index(valid_graph_frame, config, seed=seed + 1)
+        valid_row_id_offset = len(train_frame)
+    else:
+        train_history_index = None
+        valid_history_index = None
+        valid_row_id_offset = 0
     if use_graph_context:
-        write_temporal_graph_metadata(train_frame, config, output_dir / "graph", source="real_training_rows", seed=seed)
+        if train_frame is not None:
+            write_temporal_graph_metadata(train_frame, config, output_dir / "graph", source="real_training_rows", seed=seed)
+        save_json(graph_metadata(config.raw, real_graph_used_at_sampling=False), output_dir / "metadata" / "graph_conditioning.json")
 
     optimizer = build_optimizer(
         trainable_parameters(model, graph_encoder),
@@ -127,7 +154,10 @@ def train_hierarchical_from_config(config: ConditionalTABDLMConfig, device: str 
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     loss_weights = dict(config.raw.get("loss_weights", {}))
     text_token_loss_weights = text_token_loss_weights_by_column(config)
-    length_weights = compute_length_class_weights(train_frame, config, categorical_vocabs, text_tokenizer)
+    if train_frame is not None:
+        length_weights = compute_length_class_weights(train_frame, config, categorical_vocabs, text_tokenizer)
+    else:
+        length_weights = compute_length_class_weights_from_pretokenized(train_dataset, config, categorical_vocabs)
     length_weight_tensors = length_weight_tensors_to_device(length_weights, device)
     log_path = output_dir / "train_log.jsonl"
     epochs = int(training.get("epochs", 5))
@@ -227,6 +257,60 @@ def dataloader_kwargs(training: dict[str, Any], device: str, num_workers: int) -
         if prefetch is not None:
             kwargs["prefetch_factor"] = int(prefetch)
     return kwargs
+
+
+def compute_length_class_weights_from_pretokenized(
+    dataset: PretokenizedLSTMDataset,
+    config: ConditionalTABDLMConfig,
+    categorical_vocabs: dict[str, CategoryVocab],
+) -> dict[str, Any] | None:
+    tensors: dict[str, torch.Tensor] = {}
+    payloads: dict[str, Any] = {}
+    for column in config.schema.length_bucket_targets:
+        length_cfg = config.raw.get(length_loss_config_name(column), {})
+        if not bool(length_cfg.get("class_balanced", False)):
+            continue
+        vocab = categorical_vocabs[column]
+        col_idx = config.schema.model_categorical_targets.index(column)
+        ids = np.asarray(dataset.categorical_ids[dataset.indices, col_idx], dtype=np.int64)
+        counts = np.bincount(ids, minlength=vocab.size).astype(float)
+        total = max(float(counts.sum()), 1.0)
+        freqs = counts / total
+        power = float(length_cfg.get("class_weight_power", 0.5))
+        raw = np.zeros_like(freqs)
+        nonzero = freqs > 0
+        raw[nonzero] = np.power(1.0 / freqs[nonzero], power)
+        if raw[nonzero].size:
+            raw[nonzero] = raw[nonzero] / raw[nonzero].mean()
+        raw[~nonzero] = float(length_cfg.get("max_class_weight", 5.0))
+        weights = np.clip(
+            raw,
+            float(length_cfg.get("min_class_weight", 0.5)),
+            float(length_cfg.get("max_class_weight", 5.0)),
+        )
+        tensors[column] = torch.tensor(weights, dtype=torch.float32)
+        id_to_token = vocab.id_to_token
+        payloads[column] = {
+            "class_balanced": True,
+            "column": column,
+            "class_weight_power": power,
+            "min_class_weight": float(length_cfg.get("min_class_weight", 0.5)),
+            "max_class_weight": float(length_cfg.get("max_class_weight", 5.0)),
+            "counts": {id_to_token[idx]: int(counts[idx]) for idx in range(vocab.size)},
+            "frequencies": {id_to_token[idx]: float(freqs[idx]) for idx in range(vocab.size)},
+            "weights": {id_to_token[idx]: float(weights[idx]) for idx in range(vocab.size)},
+        }
+    if not tensors:
+        return None
+    return {"tensor": tensors, "json": payloads}
+
+
+def length_loss_config_name(column: str) -> str:
+    if column == "summary_length_bucket":
+        return "summary_length_loss"
+    if column == "review_text_length_bucket":
+        return "review_text_length_loss"
+    return f"{column}_loss"
 
 
 def run_hierarchical_epoch(

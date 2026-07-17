@@ -24,6 +24,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default=None)
     parser.add_argument("--resume", default=None)
     parser.add_argument("--output-dir", default=None)
+    parser.add_argument("--pretokenized-dir", default=None)
+    parser.add_argument("--neighbor-cache-dir", default=None)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
@@ -49,6 +51,12 @@ def main() -> None:
     training = config.raw.setdefault("training", {})
     if args.output_dir is not None:
         paths["output_dir"] = args.output_dir
+    if args.pretokenized_dir is not None:
+        paths["pretokenized_dir"] = args.pretokenized_dir
+        training["pretokenized_dir"] = args.pretokenized_dir
+    if args.neighbor_cache_dir is not None:
+        paths["neighbor_cache_dir"] = args.neighbor_cache_dir
+        training["neighbor_cache_dir"] = args.neighbor_cache_dir
     if args.epochs is not None:
         training["epochs"] = int(args.epochs)
     if args.batch_size is not None:

@@ -339,7 +339,10 @@ def collate_and_mask(
     foreign_key_ids = torch.stack([sample["foreign_key_ids"] for sample in samples], dim=0)
     datetime_values = torch.stack([sample["datetime_values"] for sample in samples], dim=0)
     categorical_clean = torch.stack([sample["categorical_ids"] for sample in samples], dim=0)
-    numerical_values = torch.stack([sample["numerical_values"] for sample in samples], dim=0)
+    if "numerical_values" in samples[0]:
+        numerical_values = torch.stack([sample["numerical_values"] for sample in samples], dim=0)
+    else:
+        numerical_values = torch.empty((len(samples), 0), dtype=torch.float32)
     batch_size = categorical_clean.shape[0]
     timesteps = torch.rand(batch_size, dtype=torch.float32)
     rates = mask_probability(timesteps, min_mask_prob, max_mask_prob, mask_schedule)
@@ -357,7 +360,10 @@ def collate_and_mask(
     masked_any = categorical_mask.any(dim=1)
     for column in schema.text_targets:
         clean = torch.stack([sample["text_ids"][column] for sample in samples], dim=0)
-        attention = torch.stack([sample["text_attention"][column] for sample in samples], dim=0)
+        if "text_attention" in samples[0] and column in samples[0]["text_attention"]:
+            attention = torch.stack([sample["text_attention"][column] for sample in samples], dim=0)
+        else:
+            attention = (clean != text_tokenizer.pad_id).long()
         candidate = attention.bool()
         if candidate.shape[1] > 0:
             candidate[:, 0] = False
