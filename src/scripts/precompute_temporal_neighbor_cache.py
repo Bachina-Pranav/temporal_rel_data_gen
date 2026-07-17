@@ -17,11 +17,12 @@ configure_tempdir(Path(__file__).resolve().parents[2])
 import numpy as np
 import pandas as pd
 
+from attribute_generation.conditional_tabdlm.dataset import normalize_frame, validate_columns  # noqa: E402
 from attribute_generation.conditional_tabdlm.graph_schema import temporal_filter_config  # noqa: E402
 from attribute_generation.conditional_tabdlm.neighbor_cache import validate_cache_temporal_safety  # noqa: E402
 from attribute_generation.conditional_tabdlm.neighbor_sampling import TemporalHistoryIndex  # noqa: E402
 from attribute_generation.conditional_tabdlm.schema import ConditionalTABDLMSchema, resolve_auto_review_text_config  # noqa: E402
-from attribute_generation.conditional_tabdlm.tokenization import stable_hash_bucket  # noqa: E402
+from attribute_generation.conditional_tabdlm.tokenization import normalize_text, stable_hash_bucket  # noqa: E402
 from attribute_generation.conditional_tabdlm.utils import ensure_dir, load_yaml, save_json  # noqa: E402
 
 
@@ -49,7 +50,7 @@ def main() -> None:
     temporal = temporal_filter_config(raw)
     timestamp_col = str(temporal.get("timestamp_column", schema.datetime_columns[0]))
     output_dir = ensure_dir(args.output_dir)
-    frame = load_graph_frame(Path(raw["paths"]["train_data_path"]), [customer_col, product_col, timestamp_col])
+    frame = load_graph_frame(Path(raw["paths"]["train_data_path"]), schema, [customer_col, product_col, timestamp_col])
     num_buckets = int(raw.get("id_encoding", {}).get("num_buckets", 262144))
     print(f"[neighbor-cache] building TemporalHistoryIndex for {len(frame):,} rows", flush=True)
     history = TemporalHistoryIndex.from_config(
@@ -78,17 +79,18 @@ def main() -> None:
     print(f"Wrote temporal neighbor cache to {output_dir}", flush=True)
 
 
-def load_graph_frame(path: Path, columns: list[str]) -> pd.DataFrame:
-    frame = pd.read_csv(path, usecols=list(dict.fromkeys(columns)), low_memory=False)
+def load_graph_frame(path: Path, schema: ConditionalTABDLMSchema, columns: list[str]) -> pd.DataFrame:
+    required = list(dict.fromkeys(schema.required_columns))
+    frame = pd.read_csv(path, usecols=required, low_memory=False)
+    validate_columns(frame, schema)
+    frame = normalize_frame(frame, schema)
+    for column in schema.text_targets:
+        frame = frame[frame[column].map(normalize_text).str.len() > 0]
+    frame = frame.dropna(subset=list(schema.condition_columns)).reset_index(drop=True)
     missing = [column for column in columns if column not in frame.columns]
     if missing:
-        raise ValueError(f"Missing graph columns: {missing}")
-    frame = frame.dropna(subset=columns).reset_index(drop=True)
-    frame[columns[0]] = frame[columns[0]].astype(str)
-    frame[columns[1]] = frame[columns[1]].astype(str)
-    frame[columns[2]] = pd.to_datetime(frame[columns[2]], errors="coerce")
-    frame = frame.dropna(subset=[columns[2]]).reset_index(drop=True)
-    return frame
+        raise ValueError(f"Missing graph columns after filtering: {missing}")
+    return frame.loc[:, columns].reset_index(drop=True)
 
 
 def write_cache(output_dir: Path, history: TemporalHistoryIndex, customer_col: str, product_col: str) -> None:

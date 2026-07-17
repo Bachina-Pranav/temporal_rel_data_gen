@@ -363,7 +363,9 @@ def collate_and_mask(
         if "text_attention" in samples[0] and column in samples[0]["text_attention"]:
             attention = torch.stack([sample["text_attention"][column] for sample in samples], dim=0)
         else:
-            attention = (clean != text_tokenizer.pad_id).long()
+            # Match SimpleTextTokenizer.encode, which marks padded positions as
+            # attended so configured pad-token losses remain unchanged.
+            attention = torch.ones_like(clean, dtype=torch.long)
         candidate = attention.bool()
         if candidate.shape[1] > 0:
             candidate[:, 0] = False
