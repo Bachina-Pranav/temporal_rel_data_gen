@@ -11,7 +11,7 @@ The fixed support/entity tables are:
 
 The generated event table is:
 
-- `interactions.csv`, mapped from H&M `transactions_train.csv`
+- `interactions.csv`, mapped from RelBench `transactions.csv`
 
 Event spine:
 
@@ -28,13 +28,21 @@ There are no text fields for this experiment.
 
 ## Raw Data
 
-Expected raw files under `data/raw/hm/`:
+Expected RelBench export files under `data/original/rel-hm/`:
 
-- `customers.csv`
-- `articles.csv`
-- `transactions_train.csv`
+- `customer.csv`
+- `article.csv`
+- `transactions.csv`
 
-The local checkout used to prepare this code did not contain those raw files, so raw row counts and schema values are populated by the builder at run time in:
+If those files are missing, the builder calls:
+
+```python
+relbench.datasets.get_dataset("rel-hm")
+```
+
+and exports the RelBench database with `upto_test_timestamp=True`.
+
+The local checkout used to prepare this code did not contain those RelBench CSV files, so raw row counts and schema values are populated by the builder at run time in:
 
 - `data/processed/interaction_benchmarks/hm_10k_customers/subset_manifest.json`
 - `data/processed/interaction_benchmarks/hm_10k_customers/statistics.json`
@@ -56,7 +64,7 @@ The builder records:
 
 The subset is source-entity induced:
 
-1. Scan `transactions_train.csv`.
+1. Scan RelBench `transactions.csv`.
 2. Identify customers with at least one transaction.
 3. Sort active customer IDs deterministically.
 4. Uniformly sample exactly 10,000 active customers with seed 42.
@@ -100,7 +108,7 @@ sales_channel_id
 split
 ```
 
-`event_time` is parsed from raw `t_dat`. H&M dates have day-level granularity, so the builder preserves dates and does not invent times of day.
+`event_time` is parsed from raw `t_dat`. Rel-H&M dates have day-level granularity, so the builder preserves dates and does not invent times of day.
 
 `event_id` is deterministic: `hm-transaction-<raw_row_number>`. It remains unique even when all transaction attribute values are identical.
 
@@ -156,10 +164,27 @@ Build the subset:
 python src/scripts/build_interaction_subsets.py \
   --dataset hm \
   --raw-root data/raw \
+  --relbench-root data/original \
   --processed-root data/processed/interaction_benchmarks \
   --num-source-entities 10000 \
   --seed 42 \
   --chunk-size 500000
+```
+
+If `data/original/rel-hm/customer.csv`, `article.csv`, and `transactions.csv` are not present, this command now attempts the RelBench download/cache automatically.
+
+The `--archive` fallback exists only for the legacy Kaggle H&M CSV layout. It is not the primary path for this experiment:
+
+```bash
+python src/scripts/build_interaction_subsets.py \
+  --dataset hm \
+  --raw-root data/raw \
+  --relbench-root data/original \
+  --processed-root data/processed/interaction_benchmarks \
+  --num-source-entities 10000 \
+  --seed 42 \
+  --chunk-size 500000 \
+  --archive /path/to/h-and-m-personalized-fashion-recommendations.zip
 ```
 
 Validate the subset:
@@ -314,6 +339,6 @@ pytest -q \
 
 ## Remaining Notes
 
-- Raw H&M files were not present in this local checkout during preparation.
-- Exact raw counts and H&M price/channel domains should be read from the generated `subset_manifest.json` after running preprocessing on the VM.
+- RelBench `rel-hm` files were not present in this local checkout during preparation.
+- Exact raw counts and Rel-H&M price/channel domains should be read from the generated `subset_manifest.json` after running preprocessing on the VM.
 - The static paper-metrics config intentionally does not hard-code a sales-channel domain; the training vocabulary is derived from the training split.

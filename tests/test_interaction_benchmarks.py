@@ -5,6 +5,7 @@ import importlib.util
 import json
 import sys
 import tarfile
+import zipfile
 from pathlib import Path
 
 import pandas as pd
@@ -153,20 +154,20 @@ def test_hm_date_and_price_validation(tmp_path: Path):
 
 
 def test_hm_10k_customer_induced_subset_preserves_complete_histories_and_duplicates(tmp_path: Path):
-    raw = tmp_path / "raw" / "hm"
+    raw = tmp_path / "original" / "rel-hm"
     raw.mkdir(parents=True)
     pd.DataFrame(
         {
             "customer_id": ["c1", "c2", "c3", "c4"],
             "club_member_status": ["ACTIVE", "ACTIVE", "ACTIVE", "PRE-CREATE"],
         }
-    ).to_csv(raw / "customers.csv", index=False)
+    ).to_csv(raw / "customer.csv", index=False)
     pd.DataFrame(
         {
             "article_id": ["a1", "a2", "a3", "unused"],
             "product_type_name": ["shirt", "dress", "pants", "hat"],
         }
-    ).to_csv(raw / "articles.csv", index=False)
+    ).to_csv(raw / "article.csv", index=False)
     pd.DataFrame(
         {
             "t_dat": [
@@ -180,28 +181,32 @@ def test_hm_10k_customer_induced_subset_preserves_complete_histories_and_duplica
             "price": [0.1, 0.1, 0.2, 0.3],
             "sales_channel_id": [1, 1, 2, 1],
         }
-    ).to_csv(raw / "transactions_train.csv", index=False)
+    ).to_csv(raw / "transactions.csv", index=False)
 
     manifest_a = build_hm_induced_subset(
-        raw_root=tmp_path / "raw",
+        raw_root=tmp_path / "empty_raw",
+        relbench_root=tmp_path / "original",
         processed_root=tmp_path / "processed_a",
         num_customers=2,
         seed=42,
         chunk_size=2,
+        download_if_missing=False,
     )
     manifest_b = build_hm_induced_subset(
-        raw_root=tmp_path / "raw",
+        raw_root=tmp_path / "empty_raw",
+        relbench_root=tmp_path / "original",
         processed_root=tmp_path / "processed_b",
         num_customers=2,
         seed=42,
         chunk_size=3,
+        download_if_missing=False,
     )
     out = tmp_path / "processed_a" / "hm_10k_customers"
     interactions = pd.read_csv(out / "interactions.csv")
     customers = pd.read_csv(out / "customers.csv")
     articles = pd.read_csv(out / "articles.csv")
     selected = (out / "selected_customer_ids.txt").read_text(encoding="utf-8").strip().splitlines()
-    raw_counts = pd.read_csv(raw / "transactions_train.csv").astype({"customer_id": str}).groupby("customer_id").size()
+    raw_counts = pd.read_csv(raw / "transactions.csv").astype({"customer_id": str}).groupby("customer_id").size()
     subset_counts = interactions.astype({"customer_id": str}).groupby("customer_id").size()
 
     assert manifest_a["selected_source_entities"] == 2
@@ -223,6 +228,73 @@ def test_hm_10k_customer_induced_subset_preserves_complete_histories_and_duplica
     assert (out / "schema.yaml").exists()
     assert (out / "statistics.json").exists()
     assert (out / "validation_report.json").exists()
+
+
+def test_hm_10k_builder_extracts_archive_when_raw_files_are_missing(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    pd.DataFrame({"customer_id": ["c1", "c2"]}).to_csv(source / "customers.csv", index=False)
+    pd.DataFrame({"article_id": ["a1", "a2"]}).to_csv(source / "articles.csv", index=False)
+    pd.DataFrame(
+        {
+            "t_dat": ["2020-09-01", "2020-09-01", "2020-09-02", "2020-09-03"],
+            "customer_id": ["c1", "c1", "c2", "c2"],
+            "article_id": ["a1", "a1", "a2", "a1"],
+            "price": [0.1, 0.1, 0.2, 0.3],
+            "sales_channel_id": [1, 1, 2, 1],
+        }
+    ).to_csv(source / "transactions_train.csv", index=False)
+    archive = tmp_path / "hm.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        for name in ["customers.csv", "articles.csv", "transactions_train.csv"]:
+            zf.write(source / name, arcname=name)
+
+    manifest = build_hm_induced_subset(
+        raw_root=tmp_path / "raw",
+        processed_root=tmp_path / "processed",
+        archive=archive,
+        num_customers=2,
+        seed=42,
+        chunk_size=2,
+    )
+
+    assert manifest["selected_source_entities"] == 2
+    assert manifest["complete_source_histories"] is True
+    assert (tmp_path / "raw" / "hm" / "transactions_train.csv").exists()
+    assert (tmp_path / "processed" / "hm_10k_customers" / "interactions.csv").exists()
+
+
+def test_hm_10k_builder_accepts_relbench_singular_table_layout(tmp_path: Path):
+    relbench = tmp_path / "original" / "rel-hm"
+    relbench.mkdir(parents=True)
+    pd.DataFrame({"customer_id": ["c1", "c2"]}).to_csv(relbench / "customer.csv", index=False)
+    pd.DataFrame({"article_id": ["a1", "a2"]}).to_csv(relbench / "article.csv", index=False)
+    pd.DataFrame(
+        {
+            "t_dat": ["2020-09-01", "2020-09-01", "2020-09-02", "2020-09-03"],
+            "customer_id": ["c1", "c1", "c2", "c2"],
+            "article_id": ["a1", "a1", "a2", "a1"],
+            "price": [0.1, 0.1, 0.2, 0.3],
+            "sales_channel_id": [1, 1, 2, 1],
+        }
+    ).to_csv(relbench / "transactions.csv", index=False)
+
+    manifest = build_hm_induced_subset(
+        raw_root=tmp_path / "raw",
+        relbench_root=tmp_path / "original",
+        processed_root=tmp_path / "processed",
+        num_customers=2,
+        seed=42,
+        chunk_size=2,
+        download_if_missing=False,
+    )
+
+    out = tmp_path / "processed" / "hm_10k_customers"
+    assert manifest["source_dataset"] == "rel-hm"
+    assert manifest["selected_source_entities"] == 2
+    assert (out / "customers.csv").exists()
+    assert (out / "articles.csv").exists()
+    assert (out / "interactions.csv").exists()
 
 
 def test_unsafe_archive_path_is_rejected(tmp_path: Path):

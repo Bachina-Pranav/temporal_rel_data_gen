@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build an H&M induced subset from complete active-customer histories."""
+"""Build a RelBench rel-hm induced subset from complete active-customer histories."""
 
 from __future__ import annotations
 
@@ -32,13 +32,17 @@ REQUIRED_TRANSACTION_COLUMNS = ["customer_id", "article_id", "t_dat", "price", "
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build the rel-hm 10k-active-customer induced subset.")
+    parser = argparse.ArgumentParser(description="Build the RelBench rel-hm 10k-active-customer induced subset.")
     parser.add_argument("--raw-root", default="data/raw")
+    parser.add_argument("--relbench-root", default="data/original")
     parser.add_argument("--processed-root", default="data/processed/interaction_benchmarks")
     parser.add_argument("--output-name", default="hm_10k_customers")
     parser.add_argument("--num-customers", "--num-source-entities", type=int, default=10_000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--chunk-size", type=int, default=500_000)
+    parser.add_argument("--archive", default=None, help="Optional legacy Kaggle H&M zip/archive to extract if RelBench CSVs are unavailable.")
+    parser.add_argument("--force-download", action="store_true", help="Force legacy adapter download when applicable.")
+    parser.add_argument("--no-download", action="store_true", help="Fail immediately if raw CSVs are missing.")
     return parser.parse_args()
 
 
@@ -46,11 +50,15 @@ def main() -> None:
     args = parse_args()
     manifest = build_hm_induced_subset(
         raw_root=args.raw_root,
+        relbench_root=args.relbench_root,
         processed_root=args.processed_root,
         output_name=args.output_name,
         num_customers=int(args.num_customers),
         seed=int(args.seed),
         chunk_size=int(args.chunk_size),
+        archive=args.archive,
+        force_download=bool(args.force_download),
+        download_if_missing=not bool(args.no_download),
     )
     print(json.dumps(manifest, sort_keys=True, default=str))
 
@@ -59,15 +67,26 @@ def build_hm_induced_subset(
     *,
     raw_root: str | Path,
     processed_root: str | Path,
+    relbench_root: str | Path = "data/original",
     output_name: str = "hm_10k_customers",
     num_customers: int = 10_000,
     seed: int = 42,
     chunk_size: int = 500_000,
+    archive: str | Path | None = None,
+    force_download: bool = False,
+    download_if_missing: bool = True,
 ) -> dict[str, Any]:
     raw_root = Path(raw_root)
+    relbench_root = Path(relbench_root)
     output_dir = Path(processed_root) / output_name
     output_dir.mkdir(parents=True, exist_ok=True)
-    raw_files = HMAdapter().locate_raw_files(raw_root).files
+    raw_files = locate_or_download_hm_raw(
+        raw_root,
+        relbench_root=relbench_root,
+        archive=archive,
+        force_download=force_download,
+        download_if_missing=download_if_missing,
+    )
 
     print("[hm] scanning raw tables", flush=True)
     raw_stats, raw_customer_counts = scan_raw_tables(raw_files, chunk_size=chunk_size)
@@ -123,6 +142,137 @@ def build_hm_induced_subset(
     write_readme(output_dir / "README.md", manifest)
     print(f"[hm] wrote {output_dir}", flush=True)
     return manifest
+
+
+def locate_or_download_hm_raw(
+    raw_root: Path,
+    *,
+    relbench_root: Path,
+    archive: str | Path | None = None,
+    force_download: bool = False,
+    download_if_missing: bool = True,
+) -> dict[str, Path]:
+    first_error: Exception | None = None
+    try:
+        return locate_hm_source_files(raw_root=raw_root, relbench_root=relbench_root, allow_legacy=False)
+    except FileNotFoundError as exc:
+        first_error = exc
+    if archive is not None:
+        adapter = HMAdapter()
+        print(f"[hm] source files missing; extracting local archive {archive}", flush=True)
+        result = adapter.download(raw_root, force=force_download, archive=archive)
+        print_download_result(result)
+        return locate_hm_source_files(raw_root=raw_root, relbench_root=relbench_root, allow_legacy=True)
+    if not download_if_missing:
+        raise FileNotFoundError(str(first_error))
+    target_dir = relbench_root / "rel-hm"
+    print(f"[hm] RelBench rel-hm files missing; attempting RelBench download/cache into {target_dir}", flush=True)
+    download_relbench_hm(target_dir)
+    try:
+        return locate_hm_source_files(raw_root=raw_root, relbench_root=relbench_root, allow_legacy=False)
+    except FileNotFoundError as second_error:
+        message = (
+            f"{second_error}. Attempted RelBench get_dataset('rel-hm') after: {first_error}. "
+            "Install relbench dependencies and ensure the dataset can be downloaded/cached, "
+            "or pass --archive only if you intentionally want to use the legacy Kaggle H&M CSV layout."
+        )
+        raise FileNotFoundError(message) from second_error
+
+
+def locate_hm_source_files(*, raw_root: Path, relbench_root: Path, allow_legacy: bool = False) -> dict[str, Path]:
+    candidates = [
+        {
+            "layout": "relbench",
+            "root": relbench_root / "rel-hm",
+            "transactions": "transactions.csv",
+            "customers": "customer.csv",
+            "articles": "article.csv",
+        },
+        {
+            "layout": "relbench",
+            "root": raw_root / "rel-hm",
+            "transactions": "transactions.csv",
+            "customers": "customer.csv",
+            "articles": "article.csv",
+        },
+    ]
+    if allow_legacy:
+        candidates.append(
+            {
+                "layout": "legacy_kaggle",
+                "root": raw_root / "hm",
+                "transactions": "transactions_train.csv",
+                "customers": "customers.csv",
+                "articles": "articles.csv",
+            }
+        )
+    attempted = []
+    for spec in candidates:
+        root = Path(spec["root"])
+        files = {
+            "transactions": find_named_file(root, str(spec["transactions"])),
+            "customers": find_named_file(root, str(spec["customers"])),
+            "articles": find_named_file(root, str(spec["articles"])),
+        }
+        attempted.append({key: str(value) if value is not None else str(root / str(spec[key])) for key, value in files.items()})
+        if all(files.values()):
+            print(f"[hm] using {spec['layout']} source files under {root}", flush=True)
+            return {key: path for key, path in files.items() if path is not None}
+    raise FileNotFoundError(f"Missing RelBench rel-hm CSV files. Tried: {attempted}")
+
+
+def find_named_file(root: Path, filename: str) -> Path | None:
+    if not root.exists():
+        return None
+    direct = root / filename
+    if direct.exists():
+        return direct
+    matches = list(root.rglob(filename))
+    return matches[0] if matches else None
+
+
+def download_relbench_hm(output_dir: Path) -> None:
+    try:
+        from relbench.datasets import get_dataset
+    except ImportError as exc:
+        raise RuntimeError("relbench is required to download rel-hm. Install project dependencies including relbench[full].") from exc
+    output_dir.mkdir(parents=True, exist_ok=True)
+    dataset = get_dataset("rel-hm")
+    db = dataset.get_db(upto_test_timestamp=True)
+    summary = {}
+    for table_name, table in db.table_dict.items():
+        frame = table.df.copy()
+        if table_name == "customer" and "postal_code" in frame.columns:
+            frame = frame.drop(columns=["postal_code"])
+        path = output_dir / f"{table_name}.csv"
+        frame.to_csv(path, index=False)
+        summary[str(table_name)] = {"rows": int(len(frame)), "columns": list(frame.columns), "path": str(path)}
+        print(f"[hm] wrote RelBench table {path} rows={len(frame):,}", flush=True)
+    write_json(
+        {
+            "dataset_name": "rel-hm",
+            "source": "relbench.datasets.get_dataset('rel-hm')",
+            "upto_test_timestamp": True,
+            "tables": summary,
+        },
+        output_dir / "relbench_export_summary.json",
+    )
+
+
+def print_download_result(result) -> None:
+    print(
+        json.dumps(
+            {
+                "dataset_name": result.dataset_name,
+                "download_status": result.status,
+                "raw_dir": str(result.raw_dir),
+                "message": result.message,
+                "metadata": result.metadata,
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
 
 
 def scan_raw_tables(raw_files: dict[str, Path], *, chunk_size: int) -> tuple[dict[str, Any], dict[str, int]]:
@@ -235,7 +385,7 @@ def materialize_transactions(path: Path, selected: set[str], *, chunk_size: int)
         if chunk_idx == 1 or chunk_idx % 10 == 0:
             print(f"[hm] materialize chunks={chunk_idx:,} rows={rows:,} retained={retained:,}", flush=True)
     if not pieces:
-        raise ValueError("No H&M transactions retained")
+        raise ValueError("No Rel-H&M transactions retained")
     return pd.concat(pieces, ignore_index=True)
 
 
@@ -634,7 +784,7 @@ def write_json(data: Any, path: Path) -> None:
 
 def write_statistics_markdown(stats: dict[str, Any], path: Path) -> None:
     lines = [
-        "# H&M 10k-Customer LSTM Subset Statistics",
+        "# Rel-H&M 10k-Customer LSTM Subset Statistics",
         "",
         f"- Customers: {stats['scale']['customers']:,}",
         f"- Articles: {stats['scale']['articles']:,}",
@@ -660,9 +810,9 @@ def write_statistics_markdown(stats: dict[str, Any], path: Path) -> None:
 
 
 def write_readme(path: Path, manifest: dict[str, Any]) -> None:
-    text = f"""# H&M 10k-Customer Induced Subdatabase
+    text = f"""# Rel-H&M 10k-Customer Induced Subdatabase
 
-This directory contains a complete-history induced subset for Rel-H&M / H&M.
+This directory contains a complete-history induced subset for RelBench `rel-hm`.
 
 - Selected active customers: {manifest['selected_source_entities']:,}
 - Referenced articles: {manifest['selected_destination_entities']:,}
