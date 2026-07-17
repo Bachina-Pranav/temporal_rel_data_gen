@@ -1037,6 +1037,11 @@ def run_lstm_fixed_steps(
     iterator = iter(train_loader)
     best_valid = float("inf")
     best_step = 0
+    training_cfg = config.raw.get("training", {}) if config is not None else {}
+    patience = int(training_cfg.get("early_stopping_patience", 0) or 0)
+    min_delta = float(training_cfg.get("early_stopping_min_delta", 0.0) or 0.0)
+    without_improvement = 0
+    stopped_early = False
     last_valid_metrics: dict[str, float] = {"total_loss": float("inf")}
     component_totals: dict[str, float] = {}
     component_counts: dict[str, float] = {}
