@@ -18,7 +18,7 @@ from data_preprocessing.interaction_datasets.validation import validate_subset  
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Validate induced interaction subsets.")
     parser.add_argument("--processed-root", default="data/processed/interaction_benchmarks")
-    parser.add_argument("--datasets", nargs="+", default=None, choices=[f"{name}_100k" for name in list_datasets()] + list_datasets())
+    parser.add_argument("--datasets", nargs="+", default=None, choices=[f"{name}_100k" for name in list_datasets()] + list_datasets() + ["hm_10k_customers"])
     return parser.parse_args()
 
 

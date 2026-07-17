@@ -20,6 +20,7 @@ import numpy as np
 import pandas as pd
 
 from attribute_generation.conditional_tabdlm.dataset import normalize_frame, validate_columns  # noqa: E402
+from attribute_generation.conditional_tabdlm.numerical import fit_numerical_transformers, transform_numerical_value  # noqa: E402
 from attribute_generation.conditional_tabdlm.schema import (  # noqa: E402
     ConditionalTABDLMConfig,
     ConditionalTABDLMSchema,
@@ -64,7 +65,7 @@ def main() -> None:
     save_split_indices(output_dir, split)
 
     print("[pretokenize] pass 2/3: fitting tokenizer and categorical vocabularies", flush=True)
-    tokenizer, vocabs = fit_tokenizer_and_vocabs(config, split, int(args.chunk_size))
+    tokenizer, vocabs, numerical_metadata = fit_tokenizer_vocabs_and_numerics(config, split, int(args.chunk_size))
     tokenizer_metadata = tokenizer.to_dict()
     tokenizer_metadata["text_max_lengths"] = dict(schema.text_max_lengths)
     for column in schema.text_targets:
@@ -73,9 +74,10 @@ def main() -> None:
     save_json(tokenizer_metadata, output_dir / "tokenizer_metadata.json")
     for column, vocab in vocabs.items():
         save_json(vocab.to_dict(), output_dir / f"vocab_{column}.json")
+    save_json(numerical_metadata, output_dir / "numerical_metadata.json")
 
     print("[pretokenize] pass 3/3: writing memmaps and arrays", flush=True)
-    metadata = write_arrays(config, output_dir, tokenizer, vocabs, timestamps_ns, int(args.chunk_size))
+    metadata = write_arrays(config, output_dir, tokenizer, vocabs, numerical_metadata, timestamps_ns, int(args.chunk_size))
     metadata.update(
         {
             "config_path": str(args.config),
@@ -143,11 +145,11 @@ def save_split_indices(output_dir: Path, split: dict[str, np.ndarray]) -> None:
         np.save(output_dir / f"{name}_indices.npy", indices.astype(np.int64, copy=False))
 
 
-def fit_tokenizer_and_vocabs(
+def fit_tokenizer_vocabs_and_numerics(
     config: ConditionalTABDLMConfig,
     split: dict[str, np.ndarray],
     chunk_size: int,
-) -> tuple[SimpleTextTokenizer, dict[str, CategoryVocab]]:
+) -> tuple[SimpleTextTokenizer, dict[str, CategoryVocab], dict[str, Any]]:
     schema = config.schema
     token_cfg = config.raw.get("tokenizer", {})
     tokenizer = SimpleTextTokenizer(lowercase=bool(token_cfg.get("lowercase", True)))
@@ -155,6 +157,7 @@ def fit_tokenizer_and_vocabs(
     categorical_counts: dict[str, Counter[str]] = {
         column: Counter() for column in schema.model_categorical_targets
     }
+    numerical_parts: dict[str, list[np.ndarray]] = {column: [] for column in schema.numerical_targets}
     train_mask = np.zeros(max(int(max(split["train"], default=-1)) + 1, 0), dtype=bool)
     if len(split["train"]):
         train_mask = np.zeros(int(max(max(split["train"]) + 1, len(train_mask))), dtype=bool)
@@ -173,16 +176,27 @@ def fit_tokenizer_and_vocabs(
             categorical_counts[column].update(normalize_category(value) for value in train_frame[column])
         for column in schema.auxiliary_categorical_targets:
             categorical_counts[column].update(auxiliary_values(train_frame, schema, tokenizer, column))
+        for column in schema.numerical_targets:
+            numerical_parts[column].append(pd.to_numeric(train_frame[column], errors="coerce").to_numpy(dtype=float))
     add_tokens_from_counts(
         tokenizer,
         token_counts,
         max_vocab_size=int(token_cfg.get("max_vocab_size", 30000)),
         min_frequency=int(token_cfg.get("min_frequency", 1)),
     )
+    numerical_metadata = {}
+    if schema.numerical_targets:
+        numerical_frame = pd.DataFrame(
+            {
+                column: np.concatenate(parts) if parts else np.asarray([], dtype=float)
+                for column, parts in numerical_parts.items()
+            }
+        )
+        numerical_metadata = fit_numerical_transformers(numerical_frame, config)
     return tokenizer, {
         column: vocab_from_counts(column, counts)
         for column, counts in categorical_counts.items()
-    }
+    }, numerical_metadata
 
 
 def write_arrays(
@@ -190,6 +204,7 @@ def write_arrays(
     output_dir: Path,
     tokenizer: SimpleTextTokenizer,
     vocabs: dict[str, CategoryVocab],
+    numerical_metadata: dict[str, Any],
     timestamps_ns: np.ndarray,
     chunk_size: int,
 ) -> dict[str, Any]:
@@ -212,6 +227,12 @@ def write_arrays(
         mode="w+",
         dtype=np.int64,
         shape=(n, len(schema.model_categorical_targets)),
+    )
+    nums = np.lib.format.open_memmap(
+        output_dir / "numerical_values.npy",
+        mode="w+",
+        dtype=np.float32,
+        shape=(n, len(schema.numerical_targets)),
     )
     np.save(output_dir / "review_time_ns.npy", timestamps_ns.astype(np.int64, copy=False))
     np.save(output_dir / "normalized_review_time.npy", (timestamps_ns.astype(np.float64) / 1e9).astype(np.float32))
@@ -251,6 +272,11 @@ def write_arrays(
         for col_idx, column in enumerate(schema.model_categorical_targets):
             values = auxiliary_values(frame, schema, tokenizer, column) if column in schema.auxiliary_categorical_targets else frame[column]
             cats[start:end, col_idx] = np.asarray([vocabs[column].encode(value) for value in values], dtype=np.int64)
+        for col_idx, column in enumerate(schema.numerical_targets):
+            nums[start:end, col_idx] = np.asarray(
+                [transform_numerical_value(value, numerical_metadata.get(column, {})) for value in frame[column]],
+                dtype=np.float32,
+            )
         for column in schema.text_targets:
             max_len = int(schema.text_max_lengths[column])
             rows = []
@@ -265,6 +291,7 @@ def write_arrays(
     fk.flush()
     dt.flush()
     cats.flush()
+    nums.flush()
     for arr in text_arrays.values():
         arr.flush()
     for col_idx, column in enumerate(schema.model_categorical_targets):
@@ -275,6 +302,8 @@ def write_arrays(
         "foreign_key_columns": list(schema.foreign_key_columns),
         "datetime_columns": list(schema.datetime_columns),
         "categorical_columns": list(schema.model_categorical_targets),
+        "numerical_columns": list(schema.numerical_targets),
+        "numerical_metadata_path": str(output_dir / "numerical_metadata.json") if schema.numerical_targets else None,
         "text_fields": text_meta,
         "model_family": "conditional_tabdlm_lstm_joint_full_text",
     }

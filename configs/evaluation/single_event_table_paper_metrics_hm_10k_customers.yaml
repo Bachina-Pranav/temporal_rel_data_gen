@@ -1,0 +1,105 @@
+dataset_name: hm_10k_customers
+paper_metrics_version: single_event_table_v1.1
+evaluation_level: single_event_table
+
+real_table_path: data/processed/interaction_benchmarks/hm_10k_customers/interactions.csv
+synthetic_table_path: outputs/hm-10k-customers/lstm_v53/samples/full_synthetic_interactions.csv
+
+row_count:
+  require_match_for_final: true
+  on_mismatch: warn
+
+categorical_canonicalization:
+  enabled: true
+
+datetime:
+  normalize_for_distance: true
+  report_human_readable_wasserstein: true
+
+shape:
+  headline_excludes_primary_keys: true
+  headline_excludes_foreign_keys: true
+
+trend:
+  exclude_primary_keys_from_headline: true
+  exclude_foreign_keys_from_headline: true
+  exclude_high_cardinality_ids_from_headline: true
+  high_cardinality_threshold: 100
+
+c2st:
+  balanced_sampling: true
+  save_feature_names: true
+  save_feature_importance: true
+  max_rows_for_c2st: 100000
+
+legacy_evaluator:
+  enabled: false
+
+table:
+  name: interactions
+  primary_key: event_id
+  columns:
+    event_id:
+      type: categorical
+      nullable: false
+    customer_id:
+      type: foreign_key
+      references:
+        table: customers
+        column: customer_id
+      parent_table_path: data/processed/interaction_benchmarks/hm_10k_customers/customers.csv
+      nullable: false
+    article_id:
+      type: foreign_key
+      references:
+        table: articles
+        column: article_id
+      parent_table_path: data/processed/interaction_benchmarks/hm_10k_customers/articles.csv
+      nullable: false
+    event_time:
+      type: datetime
+      nullable: false
+    price:
+      type: numerical
+      semantic_type: continuous_numerical
+      nullable: false
+      support:
+        min: 0.0
+    sales_channel_id:
+      type: categorical
+      nullable: false
+
+evaluation:
+  random_seed: 42
+  sample_size: null
+  max_rows_for_c2st: 100000
+  temporal:
+    timestamp_columns:
+      - event_time
+    binning:
+      modes:
+        - adaptive
+        - daily
+        - weekly
+        - monthly
+      adaptive_target_bins: 50
+    entity_inter_event:
+      enabled: true
+      entity_columns:
+        - customer_id
+        - article_id
+  text:
+    text_columns: []
+    max_text_rows: 0
+  c2st:
+    enabled: true
+    balanced_sampling: true
+    save_feature_names: true
+    save_feature_importance: true
+    max_rows_for_c2st: 100000
+    classifiers:
+      - logistic_regression
+      - random_forest
+      - gradient_boosting
+    n_splits: 5
+    metric: auc

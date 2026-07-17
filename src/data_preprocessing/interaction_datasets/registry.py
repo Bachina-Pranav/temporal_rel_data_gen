@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from .base import InteractionDatasetAdapter
-from .hm import HMAdapter
+from .hm import HM10KCustomersAdapter, HMAdapter
 from .movielens import MovieLensAdapter
 from .retailrocket import RetailRocketAdapter
 from .yelp import YelpAdapter
@@ -18,6 +18,7 @@ _ADAPTERS: dict[str, type[InteractionDatasetAdapter]] = {
     "retailrocket_100k": RetailRocketAdapter,
     "hm": HMAdapter,
     "hm_100k": HMAdapter,
+    "hm_10k_customers": HM10KCustomersAdapter,
     "h&m": HMAdapter,
 }
 

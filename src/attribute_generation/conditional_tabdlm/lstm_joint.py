@@ -788,6 +788,9 @@ def _train_lstm_fixed_step_from_config_once(
     pretokenized_dir = training.get("pretokenized_dir") or config.raw.get("paths", {}).get("pretokenized_dir")
     if pretokenized_dir:
         bundle = load_pretokenized_bundle(pretokenized_dir, config.schema)
+        if bundle.numerical_metadata:
+            config.raw["_numerical_metadata"] = bundle.numerical_metadata
+            save_json(bundle.numerical_metadata, ensure_dir(config.data_dir) / "numerical_metadata.json")
         train_dataset = PretokenizedLSTMDataset(bundle, "train")
         valid_dataset = PretokenizedLSTMDataset(bundle, "valid")
         categorical_vocabs = bundle.categorical_vocabs
@@ -925,18 +928,21 @@ def _train_lstm_fixed_step_from_config_once(
     elapsed = time.perf_counter() - start
     best_valid = float(train_metrics.get("best_valid_total_loss", best_valid))
     best_step = int(train_metrics.get("best_step", best_step))
+    steps_completed = int(train_metrics.get("steps_completed", max_steps))
     last_valid_metrics = dict(train_metrics.get("last_valid_metrics", last_valid_metrics))
     if not best_path.exists():
-        save_lstm_checkpoint(best_path, model, config, categorical_vocabs, tokenizer, max_steps, last_valid_metrics, graph_encoder=graph_encoder)
-    save_lstm_checkpoint(last_path, model, config, categorical_vocabs, tokenizer, max_steps, last_valid_metrics, graph_encoder=graph_encoder)
+        save_lstm_checkpoint(best_path, model, config, categorical_vocabs, tokenizer, steps_completed, last_valid_metrics, graph_encoder=graph_encoder)
+    save_lstm_checkpoint(last_path, model, config, categorical_vocabs, tokenizer, steps_completed, last_valid_metrics, graph_encoder=graph_encoder)
     if isinstance(sampler, TemporalStratifiedSampler):
         save_json(sampler.diagnostics().to_dict(), output_dir / "sampling_diagnostics.json")
-    train_rows_seen = int(max_steps * effective_batch_size)
+    train_rows_seen = int(steps_completed * effective_batch_size)
     train_subset_used = training.get("max_rows") not in (None, "all") or bool(pretokenized_dir)
     runtime = {
         "train_mode": "fixed_step",
         "epoch_mode": False,
         "max_steps": int(max_steps),
+        "steps_completed": int(steps_completed),
+        "stopped_early": bool(train_metrics.get("stopped_early", False)),
         "physical_batch_size": int(batch_size),
         "gradient_accumulation_steps": int(grad_accum),
         "effective_batch_size": int(effective_batch_size),
@@ -1046,6 +1052,7 @@ def run_lstm_fixed_steps(
     progress = tqdm(total=int(max_steps), desc="train_lstm_fixed_step") if tqdm is not None else None
     train_start = time.perf_counter()
     for step in range(1, int(max_steps) + 1):
+        steps_completed = step
         step_start = time.perf_counter()
         for _ in range(int(gradient_accumulation_steps)):
             load_start = time.perf_counter()
@@ -1132,10 +1139,11 @@ def run_lstm_fixed_steps(
             )
             last_valid_metrics = valid_metrics
             current = float(valid_metrics.get("total_loss", float("inf")))
-            improved = current < best_valid
+            improved = current < (best_valid - min_delta)
             if improved:
                 best_valid = current
                 best_step = step
+                without_improvement = 0
                 save_lstm_checkpoint(
                     checkpoint_dir / "best.pt",
                     model,
@@ -1146,6 +1154,8 @@ def run_lstm_fixed_steps(
                     valid_metrics,
                     graph_encoder=graph_encoder,
                 )
+            else:
+                without_improvement += 1
             train_metrics = finalize_lstm_component_metrics(component_totals, component_counts, component_corrects, model.schema, loss_weights, config)
             row = {
                 "step": int(step),
@@ -1154,6 +1164,8 @@ def run_lstm_fixed_steps(
                 **{f"valid_{key}": value for key, value in valid_metrics.items()},
                 "best_valid_total_loss": float(best_valid),
                 "best_step": int(best_step),
+                "early_stopping_patience": int(patience),
+                "steps_without_improvement": int(without_improvement),
                 "rows_seen_approx": int(step * int(gradient_accumulation_steps) * int(train_loader.batch_size or 1)),
                 "wall_clock_seconds": float(time.perf_counter() - train_start),
                 "step_seconds": float(time.perf_counter() - step_start),
@@ -1161,6 +1173,10 @@ def run_lstm_fixed_steps(
             append_jsonl(log_path, row)
             append_jsonl(metrics_log_path, row)
             print(json.dumps(jsonable(row), sort_keys=True), flush=True)
+            if patience > 0 and without_improvement >= patience:
+                stopped_early = True
+                print(f"Early stopping fixed-step LSTM at step={step}; best_valid_total_loss={best_valid:.6g}", flush=True)
+                break
         if should_ckpt:
             save_lstm_checkpoint(
                 checkpoint_dir / "last.pt",
@@ -1179,14 +1195,16 @@ def run_lstm_fixed_steps(
     return {
         "best_valid_total_loss": float(best_valid),
         "best_step": int(best_step),
+        "steps_completed": int(steps_completed),
+        "stopped_early": bool(stopped_early),
         "last_valid_metrics": last_valid_metrics,
-        "avg_step_seconds": float(total_seconds / max(int(max_steps), 1)),
+        "avg_step_seconds": float(total_seconds / max(int(steps_completed), 1)),
         "avg_batch_load_seconds": float(timer_totals["batch_load"] / denom),
         "avg_h2d_seconds": float(timer_totals["h2d"] / denom),
         "avg_graph_context_seconds": float(timer_totals["graph_context"] / denom),
         "avg_forward_seconds": float(timer_totals["forward"] / denom),
         "avg_backward_seconds": float(timer_totals["backward"] / denom),
-        "avg_optimizer_seconds": float(timer_totals["optimizer"] / max(int(max_steps), 1)),
+        "avg_optimizer_seconds": float(timer_totals["optimizer"] / max(int(steps_completed), 1)),
         "total_loop_seconds": float(total_seconds),
     }
 

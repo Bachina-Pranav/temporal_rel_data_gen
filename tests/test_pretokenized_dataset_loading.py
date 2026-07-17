@@ -22,12 +22,14 @@ def test_pretokenized_dataset_loads_memmap_without_raw_text_tokenization(tmp_pat
         foreign_key_columns=("customer_id", "product_id"),
         datetime_columns=("review_time",),
         categorical_targets=("rating",),
+        numerical_targets=("price",),
         text_targets=("summary",),
         text_max_lengths={"summary": 5},
     )
     root = tmp_path / "pretokenized"
     root.mkdir()
     save_json({"num_rows": 3, "text_fields": {"summary": {"shape": [3, 5], "dtype": "int32"}}}, root / "metadata.json")
+    save_json({"price": {"preprocessing": "standardize", "mean": 2.0, "std": 1.0}}, root / "numerical_metadata.json")
     tokenizer = SimpleTextTokenizer().fit(["alpha beta", "gamma"])
     save_json(tokenizer.to_dict(), root / "tokenizer_metadata.json")
     save_json(CategoryVocab.from_values("rating", ["5", "1"]).to_dict(), root / "vocab_rating.json")
@@ -36,6 +38,7 @@ def test_pretokenized_dataset_loads_memmap_without_raw_text_tokenization(tmp_pat
     np.save(root / "foreign_key_ids.npy", np.asarray([[1, 2], [3, 4], [5, 6]], dtype=np.int64))
     np.save(root / "datetime_values.npy", np.asarray([[1.0], [2.0], [3.0]], dtype=np.float32))
     np.save(root / "categorical_ids.npy", np.asarray([[0], [1], [0]], dtype=np.int64))
+    np.save(root / "numerical_values.npy", np.asarray([[0.0], [1.0], [2.0]], dtype=np.float32))
     np.save(root / "review_time_ns.npy", np.asarray([10, 20, 30], dtype=np.int64))
     token_ids = np.memmap(root / "summary_token_ids.memmap", dtype=np.int32, mode="w+", shape=(3, 5))
     token_ids[:] = np.asarray([[1, 6, 7, 4, 0], [1, 8, 4, 0, 0], [1, 6, 4, 0, 0]], dtype=np.int32)
@@ -51,3 +54,5 @@ def test_pretokenized_dataset_loads_memmap_without_raw_text_tokenization(tmp_pat
     assert sample["row_id"].item() == 2
     assert sample["text_ids"]["summary"].shape[0] == 5
     assert sample["foreign_key_ids"].tolist() == [5, 6]
+    assert sample["numerical_values"].tolist() == [2.0]
+    assert bundle.numerical_metadata["price"]["mean"] == 2.0

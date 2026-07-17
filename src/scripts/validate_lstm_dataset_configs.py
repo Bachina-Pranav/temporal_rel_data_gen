@@ -44,6 +44,7 @@ CONFIGS = {
     "yelp_100k": "configs/attribute_generation/lstm_yelp_100k.yaml",
     "retailrocket_100k": "configs/attribute_generation/lstm_retailrocket_100k.yaml",
     "hm_100k": "configs/attribute_generation/lstm_hm_100k.yaml",
+    "hm_10k_customers": "configs/attribute_generation/lstm_hm_10k_customers.yaml",
 }
 
 
@@ -55,12 +56,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", default="outputs/lstm_dataset_config_validation.json")
     parser.add_argument("--run-forward-pass", action="store_true")
     parser.add_argument("--run-loss-pass", action="store_true")
+    parser.add_argument("--run-optimizer-step", action="store_true")
     parser.add_argument("--run-sampling-smoke-test", action="store_true")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.run_optimizer_step:
+        args.run_loss_pass = True
     device = resolve_device(args.device)
     reports = {}
     failed = False
@@ -138,6 +142,7 @@ def validate_one(name: str, config_path: str, args: argparse.Namespace, device: 
         loss.backward()
         opt.step()
         report["loss_pass"] = "ok"
+        report["optimizer_step"] = "ok"
         report["loss"] = float(loss.detach().cpu())
         report["per_field_losses"] = component
     if args.run_sampling_smoke_test:

@@ -1,0 +1,147 @@
+experiment_name: lstm_hm_10k_customers
+dataset_name: hm_10k_customers
+
+dataset:
+  name: hm_10k_customers
+  interaction_table: interactions
+  source_entity_table: customers
+  destination_entity_table: articles
+
+event_spine:
+  source_fk: customer_id
+  destination_fk: article_id
+  timestamp: event_time
+
+generated_attributes:
+  price:
+    semantic_type: continuous_numerical
+    nullable: false
+  sales_channel_id:
+    semantic_type: categorical
+    nullable: false
+
+text_fields: []
+continuous_numerical_fields: [price]
+count_numerical_fields: []
+
+paths:
+  train_data_path: data/processed/interaction_benchmarks/hm_10k_customers/interactions.csv
+  synthetic_spine_path: data/processed/interaction_benchmarks/hm_10k_customers/interactions.csv
+  output_dir: outputs/hm-10k-customers/lstm_v53
+
+columns:
+  condition:
+    foreign_keys: [customer_id, article_id]
+    datetimes: [event_time]
+  target:
+    categorical: [sales_channel_id]
+    numerical: [price]
+    text: []
+
+schema:
+  fields:
+    customer_id: {role: source_foreign_key, semantic_type: foreign_key}
+    article_id: {role: destination_foreign_key, semantic_type: foreign_key}
+    event_time: {role: timestamp, semantic_type: datetime}
+    price:
+      role: generated_attribute
+      semantic_type: continuous_numerical
+      preprocessing: standardize
+      output_distribution: gaussian
+      clip_to_train_range: true
+      nullable: false
+    sales_channel_id:
+      role: generated_attribute
+      semantic_type: categorical
+      nullable: false
+
+numerical:
+  price:
+    transform: auto
+    preprocessing: standardize
+    output_distribution: gaussian
+    clip_to_train_range: true
+
+graph_conditioning:
+  enabled: true
+  mode: structure_only_temporal
+  node_types: [customer, article, transaction]
+  event_node_type: transaction
+  foreign_key_edges:
+    - {source_node_type: customer, source_column: customer_id, target_node_type: transaction, edge_type: customer_to_transaction}
+    - {source_node_type: article, source_column: article_id, target_node_type: transaction, edge_type: article_to_transaction}
+  temporal_filter:
+    enabled: true
+    mode: past_only
+    timestamp_column: event_time
+    allow_same_timestamp_events: false
+    exclude_target_event_from_neighbors: true
+    max_history_events_per_customer: 16
+    max_history_events_per_product: 32
+    history_sampling_strategy: recent
+  forbidden_node_features: [price, sales_channel_id, rating, verified, summary, review_text]
+  graph_uses_future_events: false
+  graph_uses_target_attributes: false
+  graph_encoder: {type: temporal_structure_ego_encoder, hidden_dim: 64, output_dim: 64, num_layers: 1, dropout: 0.1}
+
+text:
+  max_length: {}
+
+tokenizer: {enabled: false, max_vocab_size: 0, min_frequency: 1, lowercase: true}
+id_encoding: {type: hash_embedding, num_buckets: 262144, embedding_dim: 64}
+datetime_encoding: {type: continuous_time_fourier, embedding_dim: 32}
+
+model:
+  family: joint_lstm_generator
+  architecture: lstm_v53
+  row_hidden_dim: 128
+  latent_noise_dim: 32
+  categorical_context_dim: 16
+  dropout: 0.1
+  use_graph_context: true
+  graph_context_dim: 64
+
+text_decoder: {enabled: false, type: none, embedding_dim: 0, hidden_dim: 0, num_layers: 0, dropout: 0.0}
+review_text_decoder: {enabled: false, condition_on_summary: false}
+summary_decoder: {enabled: false}
+text_length_prediction: {enabled: false}
+numerical_heads: {enabled: true, distribution: gaussian}
+
+training:
+  seed: 42
+  epoch_mode: false
+  max_steps: 20000
+  steps_per_eval: 1000
+  steps_per_checkpoint: 5000
+  validation_max_batches: 50
+  sampling_mode: temporal_stratified
+  train_row_sampling: temporal_stratified
+  physical_batch_size: 512
+  batch_size: 512
+  target_effective_batch_size: 2048
+  gradient_accumulation_steps: 4
+  lr: 0.0005
+  weight_decay: 0.01
+  mixed_precision: true
+  amp_dtype: bf16
+  gradient_clip_norm: 1.0
+  num_workers: 0
+  pin_memory: true
+  auto_reduce_batch_size: true
+  min_batch_size: 128
+  early_stopping_patience: 12
+  early_stopping_min_delta: 0.0001
+  device: auto
+
+loss_weights:
+  price: 1.0
+  sales_channel_id: 1.0
+
+sampling:
+  num_rows: all
+  batch_size: auto
+  temperature: 0.9
+  top_p: 0.95
+  numerical_temperature: 1.0
+  seed: 42
+  device: auto

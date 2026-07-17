@@ -22,6 +22,7 @@ class PretokenizedBundle:
     schema: ConditionalTABDLMSchema
     categorical_vocabs: dict[str, CategoryVocab]
     tokenizer: SimpleTextTokenizer
+    numerical_metadata: dict[str, Any]
 
 
 class PretokenizedLSTMDataset(Dataset):
@@ -39,6 +40,12 @@ class PretokenizedLSTMDataset(Dataset):
         self.foreign_key_ids = np.load(self.root / "foreign_key_ids.npy", mmap_mode="r")
         self.datetime_values = np.load(self.root / "datetime_values.npy", mmap_mode="r")
         self.categorical_ids = np.load(self.root / "categorical_ids.npy", mmap_mode="r")
+        self.numerical_values = None
+        numerical_path = self.root / "numerical_values.npy"
+        if self.schema.numerical_targets:
+            if not numerical_path.exists():
+                raise FileNotFoundError(f"Missing pretokenized numerical values: {numerical_path}")
+            self.numerical_values = np.load(numerical_path, mmap_mode="r")
         self.review_time_ns = np.load(self.root / "review_time_ns.npy", mmap_mode="r")
         self.text_ids: dict[str, np.memmap] = {}
         self.text_lengths: dict[str, np.ndarray] = {}
@@ -68,7 +75,7 @@ class PretokenizedLSTMDataset(Dataset):
             column: torch.as_tensor(np.asarray(array[source_idx], dtype=np.int64).copy(), dtype=torch.long)
             for column, array in self.text_ids.items()
         }
-        return {
+        sample = {
             "foreign_key_ids": torch.as_tensor(
                 np.asarray(self.foreign_key_ids[source_idx], dtype=np.int64).copy(),
                 dtype=torch.long,
@@ -84,6 +91,12 @@ class PretokenizedLSTMDataset(Dataset):
             "text_ids": text_ids,
             "row_id": torch.tensor(source_idx, dtype=torch.long),
         }
+        if self.numerical_values is not None:
+            sample["numerical_values"] = torch.as_tensor(
+                np.asarray(self.numerical_values[source_idx], dtype=np.float32).copy(),
+                dtype=torch.float32,
+            )
+        return sample
 
 
 def load_pretokenized_bundle(root: str | Path, schema: ConditionalTABDLMSchema) -> PretokenizedBundle:
@@ -95,12 +108,15 @@ def load_pretokenized_bundle(root: str | Path, schema: ConditionalTABDLMSchema) 
         column: CategoryVocab.from_dict(load_json(root / f"vocab_{column}.json"))
         for column in schema.model_categorical_targets
     }
+    numerical_path = root / "numerical_metadata.json"
+    numerical_metadata = load_json(numerical_path) if numerical_path.exists() else {}
     return PretokenizedBundle(
         root=root,
         metadata=metadata,
         schema=schema,
         categorical_vocabs=vocabs,
         tokenizer=tokenizer,
+        numerical_metadata=numerical_metadata,
     )
 
 

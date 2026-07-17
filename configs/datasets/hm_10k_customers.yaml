@@ -1,0 +1,45 @@
+dataset:
+  name: hm_10k_customers
+  interaction_table: interactions
+  source_entity_table: customers
+  destination_entity_table: articles
+
+source_dataset: rel-hm
+domain: seasonal retail purchases
+processed_dir: data/processed/interaction_benchmarks/hm_10k_customers
+interaction_table: interactions.csv
+source_entity_table: customers.csv
+destination_entity_table: articles.csv
+
+event_spine:
+  source_fk: customer_id
+  destination_fk: article_id
+  timestamp: event_time
+
+source_id_column: customer_id
+destination_id_column: article_id
+timestamp_column: event_time
+
+generated_attributes:
+  price:
+    semantic_type: continuous_numerical
+    nullable: false
+    preprocessing: standardize
+    output_distribution: gaussian
+  sales_channel_id:
+    semantic_type: categorical
+    nullable: false
+
+text_fields: []
+continuous_numerical_fields:
+  - price
+count_numerical_fields: []
+categorical_fields:
+  - sales_channel_id
+
+method_scope: single_designated_temporal_interaction_table
+subset:
+  num_customers: 10000
+  seed: 42
+  require_active_customers: true
+  preserve_complete_histories: true

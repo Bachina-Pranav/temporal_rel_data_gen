@@ -82,6 +82,10 @@ class HMAdapter(InteractionDatasetAdapter):
         return filter_csv_by_ids(self.locate_raw_files(raw_root).files["articles"], "article_id", selected_ids)
 
 
+class HM10KCustomersAdapter(HMAdapter):
+    benchmark_name = "hm_10k_customers"
+
+
 def find_file(root: Path, filename: str) -> Path | None:
     matches = list(root.rglob(filename))
     return matches[0] if matches else None

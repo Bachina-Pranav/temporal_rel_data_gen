@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import importlib.util
 import json
 import sys
 import tarfile
@@ -32,6 +33,17 @@ from data_preprocessing.interaction_datasets.movielens import MovieLensAdapter  
 from data_preprocessing.interaction_datasets.retailrocket import RetailRocketAdapter  # noqa: E402
 from data_preprocessing.interaction_datasets.subset import build_interaction_subset, select_source_entities  # noqa: E402
 from data_preprocessing.interaction_datasets.yelp import YelpAdapter  # noqa: E402
+
+
+def load_hm_induced_builder():  # noqa: E402
+    spec = importlib.util.spec_from_file_location("build_hm_induced_subset", ROOT / "src" / "scripts" / "build_hm_induced_subset.py")
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module.build_hm_induced_subset
+
+
+build_hm_induced_subset = load_hm_induced_builder()
 
 
 def test_selection_preserves_complete_histories_and_is_deterministic():
@@ -138,6 +150,79 @@ def test_hm_date_and_price_validation(tmp_path: Path):
     assert manifest["foreign_key_valid"] is True
     assert pd.to_numeric(interactions["price"]).ge(0).all()
     assert pd.to_datetime(interactions["event_time"], utc=True).min() == pd.Timestamp("2020-09-01", tz="UTC")
+
+
+def test_hm_10k_customer_induced_subset_preserves_complete_histories_and_duplicates(tmp_path: Path):
+    raw = tmp_path / "raw" / "hm"
+    raw.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "customer_id": ["c1", "c2", "c3", "c4"],
+            "club_member_status": ["ACTIVE", "ACTIVE", "ACTIVE", "PRE-CREATE"],
+        }
+    ).to_csv(raw / "customers.csv", index=False)
+    pd.DataFrame(
+        {
+            "article_id": ["a1", "a2", "a3", "unused"],
+            "product_type_name": ["shirt", "dress", "pants", "hat"],
+        }
+    ).to_csv(raw / "articles.csv", index=False)
+    pd.DataFrame(
+        {
+            "t_dat": [
+                "2020-09-01",
+                "2020-09-01",
+                "2020-09-02",
+                "2020-09-03",
+            ],
+            "customer_id": ["c1", "c1", "c2", "c2"],
+            "article_id": ["a1", "a1", "a2", "a3"],
+            "price": [0.1, 0.1, 0.2, 0.3],
+            "sales_channel_id": [1, 1, 2, 1],
+        }
+    ).to_csv(raw / "transactions_train.csv", index=False)
+
+    manifest_a = build_hm_induced_subset(
+        raw_root=tmp_path / "raw",
+        processed_root=tmp_path / "processed_a",
+        num_customers=2,
+        seed=42,
+        chunk_size=2,
+    )
+    manifest_b = build_hm_induced_subset(
+        raw_root=tmp_path / "raw",
+        processed_root=tmp_path / "processed_b",
+        num_customers=2,
+        seed=42,
+        chunk_size=3,
+    )
+    out = tmp_path / "processed_a" / "hm_10k_customers"
+    interactions = pd.read_csv(out / "interactions.csv")
+    customers = pd.read_csv(out / "customers.csv")
+    articles = pd.read_csv(out / "articles.csv")
+    selected = (out / "selected_customer_ids.txt").read_text(encoding="utf-8").strip().splitlines()
+    raw_counts = pd.read_csv(raw / "transactions_train.csv").astype({"customer_id": str}).groupby("customer_id").size()
+    subset_counts = interactions.astype({"customer_id": str}).groupby("customer_id").size()
+
+    assert manifest_a["selected_source_entities"] == 2
+    assert manifest_a["complete_source_histories"] is True
+    assert manifest_a["foreign_key_valid"] is True
+    assert manifest_a["actual_interactions"] == sum(int(raw_counts[cid]) for cid in selected)
+    assert manifest_b["selected_customer_ids_path"] == "selected_customer_ids.txt"
+    assert (tmp_path / "processed_b" / "hm_10k_customers" / "selected_customer_ids.txt").read_text() == (out / "selected_customer_ids.txt").read_text()
+    assert set(subset_counts.index) == set(selected)
+    assert all(int(subset_counts[cid]) == int(raw_counts[cid]) for cid in selected)
+    assert set(interactions["article_id"].astype(str)).issubset(set(articles["article_id"].astype(str)))
+    assert "unused" not in set(articles["article_id"].astype(str))
+    assert set(interactions["customer_id"].astype(str)) == set(customers["customer_id"].astype(str))
+    assert interactions["event_id"].is_unique
+    assert interactions.duplicated(subset=["customer_id", "article_id", "event_time", "price", "sales_channel_id"]).sum() == 1
+    assert set(interactions["split"]) == {"train", "validation", "test"}
+    sorted_copy = interactions.sort_values(["event_time", "event_id"], kind="mergesort").reset_index(drop=True)
+    assert interactions["event_id"].tolist() == sorted_copy["event_id"].tolist()
+    assert (out / "schema.yaml").exists()
+    assert (out / "statistics.json").exists()
+    assert (out / "validation_report.json").exists()
 
 
 def test_unsafe_archive_path_is_rejected(tmp_path: Path):

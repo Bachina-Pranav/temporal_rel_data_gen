@@ -230,6 +230,8 @@ def load_text_tokenizer(config: ConditionalTABDLMConfig) -> SimpleTextTokenizer:
 
 
 def load_numerical_metadata(config: ConditionalTABDLMConfig) -> dict[str, Any]:
+    if config.raw.get("_numerical_metadata") is not None:
+        return dict(config.raw["_numerical_metadata"])
     path = config.data_dir / "numerical_metadata.json"
     if not path.exists():
         return {}
