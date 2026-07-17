@@ -1164,7 +1164,7 @@ def parameter_grad_norm(parameters: Any) -> float:
 
 def move_batch_to_device(value: Any, device: str) -> Any:
     if torch.is_tensor(value):
-        return value.to(device)
+        return value.to(device, non_blocking=True)
     if isinstance(value, dict):
         return {key: move_batch_to_device(item, device) for key, item in value.items()}
     return value

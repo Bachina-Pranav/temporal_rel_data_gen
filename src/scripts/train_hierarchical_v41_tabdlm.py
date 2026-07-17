@@ -23,12 +23,55 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", default=DEFAULT_CONFIG)
     parser.add_argument("--device", default=None)
     parser.add_argument("--resume", default=None)
+    parser.add_argument("--output-dir", default=None)
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--num-workers", type=int, default=None)
+    parser.add_argument("--prefetch-factor", type=int, default=None)
+    parser.add_argument("--persistent-workers", action="store_true")
+    parser.add_argument("--no-persistent-workers", dest="persistent_workers", action="store_false")
+    parser.set_defaults(persistent_workers=None)
+    parser.add_argument("--pin-memory", action="store_true")
+    parser.add_argument("--no-pin-memory", dest="pin_memory", action="store_false")
+    parser.set_defaults(pin_memory=None)
+    parser.add_argument("--fused-adamw", action="store_true")
+    parser.add_argument("--compile-model", action="store_true")
+    parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--max-train-batches", type=int, default=None)
+    parser.add_argument("--max-valid-batches", type=int, default=None)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    train_hierarchical_from_config(load_config(args.config), device=args.device, resume=args.resume)
+    config = load_config(args.config)
+    paths = config.raw.setdefault("paths", {})
+    training = config.raw.setdefault("training", {})
+    if args.output_dir is not None:
+        paths["output_dir"] = args.output_dir
+    if args.epochs is not None:
+        training["epochs"] = int(args.epochs)
+    if args.batch_size is not None:
+        training["batch_size"] = int(args.batch_size)
+    if args.num_workers is not None:
+        training["num_workers"] = int(args.num_workers)
+    if args.prefetch_factor is not None:
+        training["prefetch_factor"] = int(args.prefetch_factor)
+    if args.persistent_workers is not None:
+        training["persistent_workers"] = bool(args.persistent_workers)
+    if args.pin_memory is not None:
+        training["pin_memory"] = bool(args.pin_memory)
+    if args.fused_adamw:
+        training["fused_adamw"] = True
+    if args.compile_model:
+        training["compile_model"] = True
+    if args.profile:
+        training["profile"] = True
+    if args.max_train_batches is not None:
+        training["max_train_batches"] = int(args.max_train_batches)
+    if args.max_valid_batches is not None:
+        training["max_valid_batches"] = int(args.max_valid_batches)
+    train_hierarchical_from_config(config, device=args.device, resume=args.resume)
 
 
 if __name__ == "__main__":

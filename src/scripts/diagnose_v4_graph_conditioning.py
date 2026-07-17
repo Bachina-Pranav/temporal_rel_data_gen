@@ -200,14 +200,34 @@ def compare_logits(base: dict[str, Any], other: dict[str, Any]) -> dict[str, Any
 
 
 def tensor_compare(a: torch.Tensor, b: torch.Tensor) -> dict[str, float]:
-    a = a.float()
-    b = b.float()
-    p = torch.softmax(a.reshape(-1, a.shape[-1]), dim=-1).clamp_min(1e-12)
-    q = torch.softmax(b.reshape(-1, b.shape[-1]), dim=-1).clamp_min(1e-12)
+    a_flat = a.detach().reshape(-1, a.shape[-1])
+    b_flat = b.detach().reshape(-1, b.shape[-1])
+    if a_flat.shape != b_flat.shape:
+        raise ValueError(f"Cannot compare logits with different shapes: {tuple(a.shape)} vs {tuple(b.shape)}")
+    rows = int(a_flat.shape[0])
+    if rows == 0:
+        return {"mean_abs_change": 0.0, "mean_kl": 0.0, "top1_change_rate": 0.0}
+
+    chunk_size = max(1, min(256, rows))
+    abs_sum = 0.0
+    kl_sum = 0.0
+    top1_changed = 0.0
+    total_values = 0
+    total_rows = 0
+    for start in range(0, rows, chunk_size):
+        a_chunk = a_flat[start : start + chunk_size].float()
+        b_chunk = b_flat[start : start + chunk_size].float()
+        p = torch.softmax(a_chunk, dim=-1).clamp_min(1e-12)
+        q = torch.softmax(b_chunk, dim=-1).clamp_min(1e-12)
+        abs_sum += float((a_chunk - b_chunk).abs().sum().detach().cpu())
+        kl_sum += float((p * (p.log() - q.log())).sum(dim=-1).sum().detach().cpu())
+        top1_changed += float((a_chunk.argmax(dim=-1) != b_chunk.argmax(dim=-1)).float().sum().detach().cpu())
+        total_values += int(a_chunk.numel())
+        total_rows += int(a_chunk.shape[0])
     return {
-        "mean_abs_change": float((a - b).abs().mean().detach().cpu()),
-        "mean_kl": float((p * (p.log() - q.log())).sum(dim=-1).mean().detach().cpu()),
-        "top1_change_rate": float((a.argmax(dim=-1) != b.argmax(dim=-1)).float().mean().detach().cpu()),
+        "mean_abs_change": float(abs_sum / max(total_values, 1)),
+        "mean_kl": float(kl_sum / max(total_rows, 1)),
+        "top1_change_rate": float(top1_changed / max(total_rows, 1)),
     }
 
 

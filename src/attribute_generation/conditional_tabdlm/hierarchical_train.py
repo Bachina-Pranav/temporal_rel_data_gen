@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -74,8 +75,24 @@ def train_hierarchical_from_config(config: ConditionalTABDLMConfig, device: str 
         mask_schedule=str(diffusion.get("mask_schedule", "linear")),
     )
     batch_size = int(training.get("batch_size", 64))
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, num_workers=int(training.get("num_workers", 0)))
-    valid_loader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn, num_workers=int(training.get("num_workers", 0)))
+    num_workers = int(training.get("num_workers", 0))
+    loader_kwargs = dataloader_kwargs(training, device, num_workers)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        collate_fn=collate_fn,
+        num_workers=num_workers,
+        **loader_kwargs,
+    )
+    valid_loader = DataLoader(
+        valid_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=num_workers,
+        **loader_kwargs,
+    )
 
     model = build_model(config, categorical_vocabs, text_tokenizer).to(device)
     graph_encoder = build_graph_encoder(config, categorical_vocabs, text_tokenizer).to(device) if use_graph_context else None
@@ -197,6 +214,21 @@ def train_hierarchical_from_config(config: ConditionalTABDLMConfig, device: str 
     return best_path
 
 
+def dataloader_kwargs(training: dict[str, Any], device: str, num_workers: int) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "pin_memory": bool(training.get("pin_memory", str(device).startswith("cuda"))),
+    }
+    if num_workers > 0:
+        kwargs["persistent_workers"] = bool(training.get("persistent_workers", True))
+        timeout = int(training.get("dataloader_timeout_seconds", 0) or 0)
+        if timeout > 0:
+            kwargs["timeout"] = timeout
+        prefetch = training.get("prefetch_factor")
+        if prefetch is not None:
+            kwargs["prefetch_factor"] = int(prefetch)
+    return kwargs
+
+
 def run_hierarchical_epoch(
     model: torch.nn.Module,
     loader: DataLoader,
@@ -223,9 +255,31 @@ def run_hierarchical_epoch(
     totals: dict[str, float] = {}
     counts: dict[str, float] = {}
     mixture_counts = {"clean": 0, "corrupted": 0, "generated": 0}
+    profile = bool(config.raw.get("training", {}).get("profile", False))
+    max_batches_key = "max_train_batches" if training else "max_valid_batches"
+    max_batches = config.raw.get("training", {}).get(max_batches_key)
+    max_batches_int = int(max_batches) if max_batches not in (None, "all") else None
+    timing_totals: dict[str, float] = {
+        "batch_load": 0.0,
+        "h2d": 0.0,
+        "graph_context": 0.0,
+        "structured_forward_loss": 0.0,
+        "conditioning": 0.0,
+        "text_forward_loss": 0.0,
+        "backward_optimizer": 0.0,
+        "total_step": 0.0,
+    }
+    timed_batches = 0
     iterator = tqdm(loader, leave=False, desc="hier_train" if training else "hier_valid") if tqdm is not None else loader
-    for batch in iterator:
+    previous_batch_end = time.perf_counter()
+    for batch_idx, batch in enumerate(iterator):
+        step_start = time.perf_counter()
+        if profile:
+            timing_totals["batch_load"] += step_start - previous_batch_end
         batch = move_batch_to_device(batch, device)
+        h2d_end = time.perf_counter()
+        if profile:
+            timing_totals["h2d"] += h2d_end - step_start
         if optimizer is not None:
             optimizer.zero_grad(set_to_none=True)
         with torch.cuda.amp.autocast(enabled=use_amp):
@@ -239,6 +293,9 @@ def run_hierarchical_epoch(
                 config=config,
                 training=training,
             )
+            graph_end = time.perf_counter()
+            if profile:
+                timing_totals["graph_context"] += graph_end - h2d_end
             structured_loss, structured_component = structured_stage_loss(
                 model,
                 batch,
@@ -249,6 +306,9 @@ def run_hierarchical_epoch(
                 length_class_weights,
                 graph_context,
             )
+            structured_end = time.perf_counter()
+            if profile:
+                timing_totals["structured_forward_loss"] += structured_end - graph_end
             conditioning_mode = choose_text_conditioning_mode(config.raw.get("training", {}).get("text_conditioning", {}), training=training)
             mixture_counts[conditioning_mode] += int(batch["foreign_key_ids"].shape[0])
             cat_condition = structured_conditioning_values(
@@ -260,6 +320,9 @@ def run_hierarchical_epoch(
                 graph_context,
                 conditioning_mode,
             )
+            conditioning_end = time.perf_counter()
+            if profile:
+                timing_totals["conditioning"] += conditioning_end - structured_end
             text_loss, text_component = text_stage_loss(
                 model,
                 batch,
@@ -271,17 +334,28 @@ def run_hierarchical_epoch(
                 graph_context,
             )
             loss = structured_loss + text_loss
+            text_end = time.perf_counter()
+            if profile:
+                timing_totals["text_forward_loss"] += text_end - conditioning_end
         if optimizer is not None:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(trainable_parameters(model, graph_encoder), 1.0)
             scaler.step(optimizer)
             scaler.update()
+        step_end = time.perf_counter()
+        if profile:
+            timing_totals["backward_optimizer"] += step_end - text_end
+            timing_totals["total_step"] += step_end - step_start
+            timed_batches += 1
         for prefix, component in [("structured", structured_component), ("text", text_component)]:
             for key, stats in component.items():
                 name = f"{prefix}_{key}"
                 totals[name] = totals.get(name, 0.0) + float(stats["loss_sum"])
                 counts[name] = counts.get(name, 0.0) + float(stats["count"])
+        previous_batch_end = time.perf_counter()
+        if max_batches_int is not None and batch_idx + 1 >= max_batches_int:
+            break
     metrics = {
         f"loss_{key}": float(total / max(counts.get(key, 1.0), 1.0))
         for key, total in sorted(totals.items())
@@ -290,6 +364,10 @@ def run_hierarchical_epoch(
     total_rows = max(sum(mixture_counts.values()), 1)
     for key, value in mixture_counts.items():
         metrics[f"text_conditioning_{key}_rate"] = float(value / total_rows)
+    if profile and timed_batches > 0:
+        for key, value in sorted(timing_totals.items()):
+            metrics[f"runtime_{key}_seconds"] = float(value / timed_batches)
+        metrics["runtime_num_timed_batches"] = float(timed_batches)
     return metrics
 
 
