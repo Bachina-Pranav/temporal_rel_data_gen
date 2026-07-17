@@ -6,6 +6,7 @@ import gc
 import json
 import math
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -1409,34 +1410,37 @@ def run_lstm_epoch(
         batch = move_batch_to_device(batch, device)
         if training:
             optimizer.zero_grad(set_to_none=True)
-        with torch.cuda.amp.autocast(enabled=use_amp):
-            graph_context, _ = compute_graph_outputs(
-                graph_encoder,
-                graph_history_index,
-                batch,
-                device,
-                deterministic=graph_deterministic or not training,
-                row_id_offset=graph_row_id_offset,
-                config=config,
-                training=training,
-            )
-            logits = model(
-                batch["foreign_key_ids"],
-                batch["datetime_values"],
-                batch["categorical_ids"],
-                batch["text_ids"],
-                graph_context=graph_context,
-            )
-            loss, component = lstm_joint_loss(
-                logits,
-                batch,
-                model.schema,
-                loss_weights,
-                tokenizer,
-                length_class_weights,
-                config=config,
-                categorical_vocabs=getattr(model, "categorical_vocabs", None),
-            )
+        grad_context = nullcontext() if training else torch.no_grad()
+        with grad_context:
+            amp_dtype = amp_dtype_from_name(config.raw.get("training", {}).get("amp_dtype", "fp16") if config is not None else "fp16")
+            with torch.cuda.amp.autocast(enabled=use_amp, dtype=amp_dtype):
+                graph_context, _ = compute_graph_outputs(
+                    graph_encoder,
+                    graph_history_index,
+                    batch,
+                    device,
+                    deterministic=graph_deterministic or not training,
+                    row_id_offset=graph_row_id_offset,
+                    config=config,
+                    training=training,
+                )
+                logits = model(
+                    batch["foreign_key_ids"],
+                    batch["datetime_values"],
+                    batch["categorical_ids"],
+                    batch["text_ids"],
+                    graph_context=graph_context,
+                )
+                loss, component = lstm_joint_loss(
+                    logits,
+                    batch,
+                    model.schema,
+                    loss_weights,
+                    tokenizer,
+                    length_class_weights,
+                    config=config,
+                    categorical_vocabs=getattr(model, "categorical_vocabs", None),
+                )
         if training:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
