@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 
@@ -10,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "src" / "scripts"))
 
-from evaluation.paper_metrics.c2st import feature_importance  # noqa: E402
+from evaluation.paper_metrics.c2st import feature_importance, featurize_frame  # noqa: E402
 from evaluate_single_event_table_paper_metrics import evaluate_paper_metrics  # noqa: E402
 
 
@@ -71,3 +72,25 @@ def test_c2st_feature_importance_sanitizes_nonfinite_values():
     assert frame["importance"].tolist() == [0.0, 0.0, 0.0]
     assert frame["abs_importance"].tolist() == [0.0, 0.0, 0.0]
     assert frame["rank"].tolist() == [1, 2, 3]
+
+
+def test_c2st_datetime_features_normalize_mixed_offsets_to_utc():
+    frame = pd.DataFrame(
+        {
+            "event_ts": [
+                "2020-01-01T12:00:00+00:00",
+                "2020-01-01T13:00:00+01:00",
+                "2020-01-01T14:00:00+02:00",
+            ]
+        }
+    )
+
+    features, names = featurize_frame(
+        frame,
+        {"columns": {"event_ts": {"type": "datetime"}}},
+    )
+
+    assert features.shape == (3, 6)
+    assert np.isfinite(features).all()
+    assert features[:, 0].tolist() == [features[0, 0]] * 3
+    assert names[0] == "event_ts_seconds"

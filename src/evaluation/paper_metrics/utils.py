@@ -82,7 +82,7 @@ def numeric_series(series: pd.Series) -> pd.Series:
 
 
 def datetime_series(series: pd.Series) -> pd.Series:
-    return pd.to_datetime(series, errors="coerce")
+    return pd.to_datetime(series, errors="coerce", utc=True)
 
 
 def datetime_numeric(series: pd.Series) -> pd.Series:
