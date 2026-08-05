@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "src" / "scripts"))
 
+from evaluation.paper_metrics.c2st import feature_importance  # noqa: E402
 from evaluate_single_event_table_paper_metrics import evaluate_paper_metrics  # noqa: E402
 
 
@@ -55,3 +56,18 @@ def test_c2st_feature_importance_has_names_and_top_features(tmp_path):
     assert {"classifier", "feature_name", "importance", "abs_importance", "rank"}.issubset(feature_importance.columns)
     assert metrics["single_table_c2st"]["top_features"]
     assert "feature_name" in metrics["single_table_c2st"]["top_features"][0]
+
+
+def test_c2st_feature_importance_sanitizes_nonfinite_values():
+    frame = feature_importance(
+        {
+            "gradient_boosting": {
+                "feature_importances": [float("nan"), float("inf"), 0.0]
+            }
+        },
+        ["first", "second", "third"],
+    )
+
+    assert frame["importance"].tolist() == [0.0, 0.0, 0.0]
+    assert frame["abs_importance"].tolist() == [0.0, 0.0, 0.0]
+    assert frame["rank"].tolist() == [1, 2, 3]

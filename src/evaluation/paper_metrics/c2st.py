@@ -189,12 +189,20 @@ def run_binary_classifiers(
             results[name] = {"status": "failed", "reason": str(exc)}
             continue
         fitted = model.fit(x, y)
-        importances = getattr(fitted, "feature_importances_", None)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            importances = getattr(fitted, "feature_importances_", None)
         if importances is None and hasattr(fitted, "steps"):
             last = fitted.steps[-1][1]
             importances = getattr(last, "coef_", None)
             if importances is not None:
                 importances = np.abs(importances).reshape(-1)
+        if importances is not None:
+            importances = np.nan_to_num(
+                np.asarray(importances, dtype=float).reshape(-1),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
         results[name] = {
             "auc": auc,
             "accuracy": acc,
@@ -219,7 +227,14 @@ def feature_importance(results: dict[str, dict[str, Any]], feature_names: list[s
         if values is None:
             continue
         for feature_name, value in zip(feature_names, values):
-            importance = float(value)
+            importance = float(
+                np.nan_to_num(
+                    float(value),
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                )
+            )
             rows.append(
                 {
                     "classifier": classifier,
