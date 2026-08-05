@@ -1,0 +1,21 @@
+variants:
+  existing_behavior:
+    loss_group_weights:
+      structured: 1.0
+      summary: 1.0
+      review: 1.0
+      auxiliary: 1.0
+
+  structured_emphasis:
+    loss_group_weights:
+      structured: 2.0
+      summary: 1.0
+      review: 1.0
+      auxiliary: 2.0
+
+  text_emphasis:
+    loss_group_weights:
+      structured: 1.0
+      summary: 2.0
+      review: 2.0
+      auxiliary: 1.0

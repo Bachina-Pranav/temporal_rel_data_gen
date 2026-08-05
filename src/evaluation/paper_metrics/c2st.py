@@ -28,7 +28,13 @@ def single_table_c2st_metrics(real: pd.DataFrame, synthetic: pd.DataFrame, confi
     table_cfg = config.get("table") or {}
     classifiers = c2st_cfg.get("classifiers") or ["logistic_regression"]
     x, y, feature_names, balanced_n = featurize_real_synthetic(real, synthetic, table_cfg, max_rows=max_rows, seed=seed)
-    results = run_binary_classifiers(x, y, classifiers, seed=seed)
+    results = run_binary_classifiers(
+        x,
+        y,
+        classifiers,
+        seed=seed,
+        n_splits=int(c2st_cfg.get("n_splits", 5)),
+    )
     best_name = max(results, key=lambda name: results[name].get("auc", 0.5)) if results else None
     best = results.get(best_name, {}) if best_name else {}
     importance = feature_importance(results, feature_names)
@@ -42,6 +48,14 @@ def single_table_c2st_metrics(real: pd.DataFrame, synthetic: pd.DataFrame, confi
         "num_rows": int(len(y)),
         "balanced_eval_n_real": int(balanced_n),
         "balanced_eval_n_synthetic": int(balanced_n),
+        "classes_balanced": True,
+        "preprocessing_fit_scope": (
+            "StandardScaler is inside each classifier CV fold; categorical "
+            "and text hash features are fixed stateless transforms."
+        ),
+        "row_order_feature_included": False,
+        "classifier_random_seed": int(seed),
+        "cross_validation_splits": int(c2st_cfg.get("n_splits", 5)),
         "num_features": int(x.shape[1]) if x.ndim == 2 else 0,
         "feature_names": feature_names,
         "top_features": top_features,
@@ -72,40 +86,74 @@ def featurize_frame(frame: pd.DataFrame, table_cfg: dict[str, Any]) -> tuple[np.
             continue
         col_type = str((cfg or {}).get("type", "categorical")).lower()
         if col_type in {"numerical", "numeric", "number"}:
-            values = numeric_series(frame[column]).fillna(0.0).to_numpy(dtype=float)[:, None]
-            pieces.append(standardize(values))
-            names.append(column)
+            parsed = numeric_series(frame[column])
+            values = parsed.fillna(0.0).to_numpy(dtype=float)
+            pieces.append(
+                np.column_stack(
+                    [values, parsed.isna().to_numpy(dtype=float)]
+                )
+            )
+            names.extend([column, f"{column}_missing"])
         elif col_type == "datetime":
             parsed = datetime_series(frame[column])
-            values = datetime_normalized(frame[column], frame[column]).fillna(0.0)
+            seconds = parsed.array.asi8.astype(float) / 1e9
+            seconds = np.where(parsed.isna(), 0.0, seconds)
+            month = parsed.dt.month.fillna(0).to_numpy(dtype=float)
+            day = parsed.dt.dayofweek.fillna(0).to_numpy(dtype=float)
             extras = np.column_stack(
                 [
-                    values.to_numpy(dtype=float),
-                    parsed.dt.month.fillna(0).to_numpy(dtype=float),
-                    parsed.dt.dayofweek.fillna(0).to_numpy(dtype=float),
+                    seconds,
+                    np.sin(2.0 * np.pi * month / 12.0),
+                    np.cos(2.0 * np.pi * month / 12.0),
+                    np.sin(2.0 * np.pi * day / 7.0),
+                    np.cos(2.0 * np.pi * day / 7.0),
+                    parsed.isna().to_numpy(dtype=float),
                 ]
             )
-            pieces.append(standardize(extras))
-            names.extend([f"{column}_normalized", f"{column}_month", f"{column}_dayofweek"])
+            pieces.append(extras)
+            names.extend(
+                [
+                    f"{column}_seconds",
+                    f"{column}_month_sin",
+                    f"{column}_month_cos",
+                    f"{column}_dayofweek_sin",
+                    f"{column}_dayofweek_cos",
+                    f"{column}_missing",
+                ]
+            )
         elif col_type == "text":
             text_features = np.column_stack([token_lengths(frame[column]), char_lengths(frame[column])])
-            pieces.append(standardize(text_features))
+            pieces.append(text_features)
             names.extend([f"{column}_token_length", f"{column}_char_length"])
             emb = np.vstack([text_hash_embedding(value, dim=8) for value in frame[column]])
             pieces.append(emb)
             names.extend([f"{column}_hash_emb_{idx}" for idx in range(emb.shape[1])])
         else:
             values = categorical_values_for_c2st(frame[column], col_type, cfg or {})
-            freq = values.astype(str).map(values.astype(str).value_counts(normalize=True)).fillna(0.0)
-            buckets = values.astype(str).map(lambda value: stable_bucket(value, 16)).to_numpy(dtype=float)
-            pieces.append(standardize(np.column_stack([freq.to_numpy(dtype=float), buckets])))
-            names.extend([f"{column}_frequency", f"{column}_hash_bucket"])
+            num_buckets = int((cfg or {}).get("c2st_hash_buckets", 16))
+            buckets = values.astype(str).map(
+                lambda value: stable_bucket(value, num_buckets)
+            ).to_numpy(dtype=np.int64)
+            one_hot = np.eye(num_buckets, dtype=float)[buckets]
+            pieces.append(one_hot)
+            names.extend(
+                [
+                    f"{column}_hash_bucket_{idx}"
+                    for idx in range(num_buckets)
+                ]
+            )
     if not pieces:
         return np.zeros((len(frame), 1), dtype=float), ["constant"]
     return np.concatenate(pieces, axis=1), names
 
 
-def run_binary_classifiers(x: np.ndarray, y: np.ndarray, classifiers: list[str], seed: int = 42) -> dict[str, dict[str, Any]]:
+def run_binary_classifiers(
+    x: np.ndarray,
+    y: np.ndarray,
+    classifiers: list[str],
+    seed: int = 42,
+    n_splits: int = 5,
+) -> dict[str, dict[str, Any]]:
     try:
         from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
         from sklearn.linear_model import LogisticRegression
@@ -120,7 +168,7 @@ def run_binary_classifiers(x: np.ndarray, y: np.ndarray, classifiers: list[str],
         "random_forest": RandomForestClassifier(n_estimators=100, random_state=seed, n_jobs=1),
         "gradient_boosting": GradientBoostingClassifier(random_state=seed),
     }
-    splits = min(5, int(np.bincount(y).min()))
+    splits = min(int(n_splits), int(np.bincount(y).min()))
     if splits < 2:
         return {}
     cv = StratifiedKFold(n_splits=splits, shuffle=True, random_state=seed)

@@ -36,6 +36,9 @@ from .tokenization import CategoryVocab, SimpleTextTokenizer
 from .utils import ensure_dir, save_json, save_yaml, set_seed
 
 
+CHECKPOINT_FORMAT_VERSION = 2
+
+
 try:
     from tqdm.auto import tqdm
 except Exception:  # pragma: no cover
@@ -84,6 +87,9 @@ def train_from_config(config: ConditionalTABDLMConfig, device: str | None = None
         min_mask_prob=float(diffusion.get("min_mask_prob", 0.05)),
         max_mask_prob=float(diffusion.get("max_mask_prob", 0.95)),
         mask_schedule=str(diffusion.get("mask_schedule", "linear")),
+        mask_padding_in_attention=bool(
+            training.get("mask_padding_in_attention", False)
+        ),
     )
     batch_size = int(training.get("batch_size", 128))
     num_workers = int(training.get("num_workers", training.get("workers", 0)))
@@ -534,7 +540,9 @@ def denoising_loss(
     text_tokenizer: SimpleTextTokenizer | None = None,
     text_token_loss_weights: dict[str, dict[str, float]] | None = None,
     length_class_weights: dict[str, torch.Tensor] | None = None,
-) -> tuple[torch.Tensor, dict[str, dict[str, float | int]]]:
+    loss_group_weights: dict[str, float] | None = None,
+    field_loss_groups: dict[str, str] | None = None,
+) -> tuple[torch.Tensor, dict[str, dict[str, Any]]]:
     return _denoising_loss_impl(
         logits,
         batch,
@@ -543,6 +551,8 @@ def denoising_loss(
         text_tokenizer=text_tokenizer,
         text_token_loss_weights=text_token_loss_weights or {},
         length_class_weights=length_class_weights or {},
+        loss_group_weights=loss_group_weights or {},
+        field_loss_groups=field_loss_groups or {},
     )
 
 
@@ -554,7 +564,9 @@ def _denoising_loss_impl(
     text_tokenizer: SimpleTextTokenizer | None = None,
     text_token_loss_weights: dict[str, dict[str, float]] | None = None,
     length_class_weights: dict[str, torch.Tensor] | None = None,
-) -> tuple[torch.Tensor, dict[str, dict[str, float | int]]]:
+    loss_group_weights: dict[str, float] | None = None,
+    field_loss_groups: dict[str, str] | None = None,
+) -> tuple[torch.Tensor, dict[str, dict[str, Any]]]:
     losses: list[torch.Tensor] = []
     component: dict[str, dict[str, float | int]] = {}
     cat_labels = batch.get("categorical_labels")
@@ -574,10 +586,25 @@ def _denoising_loss_impl(
                 weight=class_weights,
             )
             mean_loss = loss_sum / max(count, 1)
-            losses.append(float(component_weight(column, loss_weights)) * mean_loss)
+            field_weight = float(component_weight(column, loss_weights))
+            group_name = field_loss_group(
+                column, schema, field_loss_groups or {}
+            )
+            group_weight = float((loss_group_weights or {}).get(group_name, 1.0))
+            weighted_mean = field_weight * group_weight * mean_loss
+            losses.append(weighted_mean)
             pred = logits["categorical"][column].argmax(dim=-1)
             correct = int((pred[mask] == labels[mask]).sum().detach().cpu())
-            component[column] = {"loss_sum": float(loss_sum.detach().cpu()), "count": count, "correct": correct}
+            component[column] = {
+                "loss_sum": float(loss_sum.detach().cpu()),
+                "count": count,
+                "correct": correct,
+                "mean_loss": float(mean_loss.detach().cpu()),
+                "field_weight": field_weight,
+                "group_weight": group_weight,
+                "weighted_mean_loss": float(weighted_mean.detach().cpu()),
+                "loss_group": group_name,
+            }
 
     for column in schema.text_targets:
         labels = batch["text_labels"][column]
@@ -603,8 +630,20 @@ def _denoising_loss_impl(
             )
             denom = torch.tensor(float(count), device=loss_sum.device)
         mean_loss = loss_sum / denom.clamp_min(1.0)
-        losses.append(float(component_weight(column, loss_weights)) * mean_loss)
-        component[column] = {"loss_sum": float(loss_sum.detach().cpu()), "count": float(max(float(denom.detach().cpu()), 1.0))}
+        field_weight = float(component_weight(column, loss_weights))
+        group_name = field_loss_group(column, schema, field_loss_groups or {})
+        group_weight = float((loss_group_weights or {}).get(group_name, 1.0))
+        weighted_mean = field_weight * group_weight * mean_loss
+        losses.append(weighted_mean)
+        component[column] = {
+            "loss_sum": float(loss_sum.detach().cpu()),
+            "count": float(max(float(denom.detach().cpu()), 1.0)),
+            "mean_loss": float(mean_loss.detach().cpu()),
+            "field_weight": field_weight,
+            "group_weight": group_weight,
+            "weighted_mean_loss": float(weighted_mean.detach().cpu()),
+            "loss_group": group_name,
+        }
 
     if not losses:
         zero = batch["foreign_key_ids"].float().sum() * 0.0
@@ -628,6 +667,21 @@ def component_metric_name(column: str) -> str:
 def component_weight(column: str, loss_weights: dict[str, float]) -> float:
     key = component_metric_name(column)
     return float(loss_weights.get(key, loss_weights.get(column, 1.0)))
+
+
+def field_loss_group(
+    column: str,
+    schema: Any,
+    field_loss_groups: dict[str, str],
+) -> str:
+    configured = field_loss_groups.get(str(column))
+    if configured:
+        return str(configured)
+    if column in schema.model_categorical_targets:
+        return "structured"
+    if column in schema.text_targets:
+        return "text"
+    return "auxiliary"
 
 
 def is_main_loss_component(column: str, schema) -> bool:
@@ -1038,6 +1092,7 @@ def save_checkpoint(
     checkpoint_model = unwrap_compiled_module(model)
     torch.save(
         {
+            "checkpoint_format_version": CHECKPOINT_FORMAT_VERSION,
             "model_state_dict": checkpoint_model.state_dict(),
             "model_config": checkpoint_model.to_config(),
             "raw_config": config.raw,

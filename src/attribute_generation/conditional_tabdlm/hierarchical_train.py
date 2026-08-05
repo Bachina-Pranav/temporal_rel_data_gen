@@ -47,6 +47,7 @@ except Exception:  # pragma: no cover
 
 
 def train_hierarchical_from_config(config: ConditionalTABDLMConfig, device: str | None = None, resume: str | Path | None = None) -> Path:
+    training_started = time.perf_counter()
     training = config.raw.get("training", {})
     diffusion = config.raw.get("diffusion", {})
     seed = int(training.get("seed", 42))
@@ -86,6 +87,9 @@ def train_hierarchical_from_config(config: ConditionalTABDLMConfig, device: str 
         min_mask_prob=float(diffusion.get("min_mask_prob", 0.05)),
         max_mask_prob=float(diffusion.get("max_mask_prob", 0.95)),
         mask_schedule=str(diffusion.get("mask_schedule", "linear")),
+        mask_padding_in_attention=bool(
+            training.get("mask_padding_in_attention", False)
+        ),
     )
     batch_size = int(training.get("batch_size", 64))
     num_workers = int(training.get("num_workers", 0))
@@ -171,7 +175,9 @@ def train_hierarchical_from_config(config: ConditionalTABDLMConfig, device: str 
     last_path = checkpoint_dir / "last.pt"
     skip_checkpoints = bool(training.get("skip_checkpoints", False))
 
+    completed_epoch = start_epoch - 1
     for epoch in range(start_epoch, epochs + 1):
+        completed_epoch = epoch
         train_metrics = run_hierarchical_epoch(
             model,
             train_loader,
@@ -247,6 +253,31 @@ def train_hierarchical_from_config(config: ConditionalTABDLMConfig, device: str 
         print(f"Skipped checkpoint writing; best checkpoint path would be {best_path}")
     else:
         print(f"Wrote best checkpoint to {best_path}")
+    save_json(
+        {
+            "total_training_seconds": float(
+                time.perf_counter() - training_started
+            ),
+            "start_epoch": int(start_epoch),
+            "completed_epoch": int(completed_epoch),
+            "configured_epochs": int(epochs),
+            "best_valid_total_loss": (
+                float(best_valid) if np.isfinite(best_valid) else None
+            ),
+            "early_stopping_patience": int(early_stopping_patience),
+            "early_stopping_min_delta": float(early_stopping_min_delta),
+            "train_rows": int(len(train_dataset)),
+            "validation_rows": int(len(valid_dataset)),
+            "batch_size": int(batch_size),
+            "device": str(device),
+            "mixed_precision": bool(use_amp),
+            "checkpoint_path": str(best_path),
+            "checkpoint_written": bool(
+                not skip_checkpoints and best_path.exists()
+            ),
+        },
+        output_dir / "metadata" / "training_runtime.json",
+    )
     return best_path
 
 
@@ -344,6 +375,15 @@ def run_hierarchical_epoch(
         graph_encoder.train(training)
     totals: dict[str, float] = {}
     counts: dict[str, float] = {}
+    weighted_totals: dict[str, float] = {}
+    weighted_counts: dict[str, float] = {}
+    group_totals: dict[str, float] = {}
+    objective_total = 0.0
+    structured_objective_total = 0.0
+    text_objective_total = 0.0
+    objective_rows = 0
+    gradient_audit_totals = {"structured": 0.0, "text": 0.0}
+    gradient_audit_counts = {"structured": 0, "text": 0}
     mixture_counts = {"clean": 0, "corrupted": 0, "generated": 0}
     profile = bool(config.raw.get("training", {}).get("profile", False))
     max_batches_key = "max_train_batches" if training else "max_valid_batches"
@@ -424,13 +464,44 @@ def run_hierarchical_epoch(
                 graph_context,
             )
             loss = structured_loss + text_loss
+            if not bool(torch.isfinite(loss).all()):
+                raise FloatingPointError(
+                    "Non-finite hierarchical diffusion loss: "
+                    f"structured={float(structured_loss.detach().cpu())}, "
+                    f"text={float(text_loss.detach().cpu())}"
+                )
             text_end = time.perf_counter()
             if profile:
                 timing_totals["text_forward_loss"] += text_end - conditioning_end
         if optimizer is not None:
+            gradient_audit_interval = int(
+                config.raw.get("training", {}).get(
+                    "modality_gradient_audit_interval", 0
+                )
+                or 0
+            )
+            if (
+                gradient_audit_interval > 0
+                and batch_idx % gradient_audit_interval == 0
+            ):
+                parameters = trainable_parameters(model, graph_encoder)
+                gradient_audit_totals["structured"] += loss_gradient_norm(
+                    structured_loss, parameters, retain_graph=True
+                )
+                gradient_audit_counts["structured"] += 1
+                gradient_audit_totals["text"] += loss_gradient_norm(
+                    text_loss, parameters, retain_graph=True
+                )
+                gradient_audit_counts["text"] += 1
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(trainable_parameters(model, graph_encoder), 1.0)
+            clipped_norm = torch.nn.utils.clip_grad_norm_(
+                trainable_parameters(model, graph_encoder), 1.0
+            )
+            if not bool(torch.isfinite(torch.as_tensor(clipped_norm)).all()):
+                raise FloatingPointError(
+                    "Non-finite gradient norm in hierarchical diffusion training"
+                )
             scaler.step(optimizer)
             scaler.update()
         step_end = time.perf_counter()
@@ -438,11 +509,32 @@ def run_hierarchical_epoch(
             timing_totals["backward_optimizer"] += step_end - text_end
             timing_totals["total_step"] += step_end - step_start
             timed_batches += 1
-        for prefix, component in [("structured", structured_component), ("text", text_component)]:
+        batch_rows = int(batch["foreign_key_ids"].shape[0])
+        objective_total += float(loss.detach().cpu()) * batch_rows
+        structured_objective_total += (
+            float(structured_loss.detach().cpu()) * batch_rows
+        )
+        text_objective_total += float(text_loss.detach().cpu()) * batch_rows
+        objective_rows += batch_rows
+        for prefix, component in [
+            ("structured", structured_component),
+            ("text", text_component),
+        ]:
             for key, stats in component.items():
                 name = f"{prefix}_{key}"
                 totals[name] = totals.get(name, 0.0) + float(stats["loss_sum"])
                 counts[name] = counts.get(name, 0.0) + float(stats["count"])
+                if "weighted_mean_loss" in stats:
+                    weighted_totals[name] = weighted_totals.get(
+                        name, 0.0
+                    ) + float(stats["weighted_mean_loss"]) * batch_rows
+                    weighted_counts[name] = weighted_counts.get(
+                        name, 0.0
+                    ) + batch_rows
+                    group = str(stats.get("loss_group", prefix))
+                    group_totals[group] = group_totals.get(group, 0.0) + (
+                        float(stats["weighted_mean_loss"]) * batch_rows
+                    )
         previous_batch_end = time.perf_counter()
         if max_batches_int is not None and batch_idx + 1 >= max_batches_int:
             break
@@ -450,7 +542,27 @@ def run_hierarchical_epoch(
         f"loss_{key}": float(total / max(counts.get(key, 1.0), 1.0))
         for key, total in sorted(totals.items())
     }
-    metrics["total_loss"] = float(sum(metrics.values()))
+    for key, total in sorted(weighted_totals.items()):
+        metrics[f"weighted_loss_{key}"] = float(
+            total / max(weighted_counts.get(key, 1.0), 1.0)
+        )
+    metrics["structured_objective_loss"] = float(
+        structured_objective_total / max(objective_rows, 1)
+    )
+    metrics["text_objective_loss"] = float(
+        text_objective_total / max(objective_rows, 1)
+    )
+    metrics["total_loss"] = float(objective_total / max(objective_rows, 1))
+    for group, total in sorted(group_totals.items()):
+        metrics[f"loss_group_{group}"] = float(
+            total / max(objective_rows, 1)
+        )
+    for modality, total in gradient_audit_totals.items():
+        count = gradient_audit_counts[modality]
+        if count:
+            metrics[f"gradient_norm_from_{modality}_loss"] = float(
+                total / count
+            )
     total_rows = max(sum(mixture_counts.values()), 1)
     for key, value in mixture_counts.items():
         metrics[f"text_conditioning_{key}_rate"] = float(value / total_rows)
@@ -470,14 +582,25 @@ def structured_stage_loss(
     loss_weights: dict[str, float],
     length_class_weights: dict[str, torch.Tensor] | None,
     graph_context: torch.Tensor | None,
-) -> tuple[torch.Tensor, dict[str, dict[str, float | int]]]:
+) -> tuple[torch.Tensor, dict[str, dict[str, Any]]]:
     cat_input = batch["categorical_input_ids"]
     text_input, text_attention = inactive_text_inputs(batch, config, text_tokenizer)
     logits = model(batch["foreign_key_ids"], batch["datetime_values"], cat_input, text_input, text_attention, batch["diffusion_t"], graph_context)
     text_labels = {column: torch.full_like(batch["text_labels"][column], -100) for column in config.schema.text_targets}
     loss_batch = dict(batch)
     loss_batch["text_labels"] = text_labels
-    return denoising_loss(logits, loss_batch, config.schema, loss_weights, text_tokenizer=text_tokenizer, length_class_weights=length_class_weights or {})
+    return denoising_loss(
+        logits,
+        loss_batch,
+        config.schema,
+        loss_weights,
+        text_tokenizer=text_tokenizer,
+        length_class_weights=length_class_weights or {},
+        loss_group_weights=dict(config.raw.get("loss_group_weights", {})),
+        field_loss_groups=dict(
+            config.raw.get("loss_groups", {}).get("field_groups", {})
+        ),
+    )
 
 
 def text_stage_loss(
@@ -489,7 +612,7 @@ def text_stage_loss(
     text_tokenizer: SimpleTextTokenizer,
     text_token_loss_weights: dict[str, dict[str, float]],
     graph_context: torch.Tensor | None,
-) -> tuple[torch.Tensor, dict[str, dict[str, float | int]]]:
+) -> tuple[torch.Tensor, dict[str, dict[str, Any]]]:
     logits = model(
         batch["foreign_key_ids"],
         batch["datetime_values"],
@@ -502,7 +625,18 @@ def text_stage_loss(
     cat_labels = torch.full_like(batch["categorical_labels"], -100)
     loss_batch = dict(batch)
     loss_batch["categorical_labels"] = cat_labels
-    return denoising_loss(logits, loss_batch, config.schema, loss_weights, text_tokenizer=text_tokenizer, text_token_loss_weights=text_token_loss_weights)
+    return denoising_loss(
+        logits,
+        loss_batch,
+        config.schema,
+        loss_weights,
+        text_tokenizer=text_tokenizer,
+        text_token_loss_weights=text_token_loss_weights,
+        loss_group_weights=dict(config.raw.get("loss_group_weights", {})),
+        field_loss_groups=dict(
+            config.raw.get("loss_groups", {}).get("field_groups", {})
+        ),
+    )
 
 
 def structured_conditioning_values(
@@ -517,7 +651,17 @@ def structured_conditioning_values(
     if mode == "clean":
         return batch["categorical_clean_ids"]
     if mode == "corrupted":
-        return corrupt_categorical_values(batch["categorical_clean_ids"], categorical_vocabs, config.schema)
+        corruption_cfg = (
+            config.raw.get("training", {})
+            .get("text_conditioning", {})
+            .get("corruption", {})
+        )
+        return corrupt_categorical_values(
+            batch["categorical_clean_ids"],
+            categorical_vocabs,
+            config.schema,
+            corruption_cfg,
+        )
     if mode == "generated":
         with torch.no_grad():
             cat_input = batch["categorical_input_ids"]
@@ -555,12 +699,101 @@ def choose_text_conditioning_mode(cfg: dict[str, Any], *, training: bool) -> str
     return "generated"
 
 
-def corrupt_categorical_values(clean: torch.Tensor, categorical_vocabs: dict[str, CategoryVocab], schema: Any) -> torch.Tensor:
+def corrupt_categorical_values(
+    clean: torch.Tensor,
+    categorical_vocabs: dict[str, CategoryVocab],
+    schema: Any,
+    corruption_config: dict[str, Any] | None = None,
+) -> torch.Tensor:
+    """Apply configurable, schema-valid condition corruption."""
+
+    cfg = dict(corruption_config or {})
+    default_replace = float(cfg.get("replacement_probability", 1.0))
+    default_mask = float(cfg.get("mask_probability", 0.0))
+    length_step_probability = float(
+        cfg.get("length_bucket_step_probability", 0.0)
+    )
+    per_field = dict(cfg.get("per_field", {}) or {})
     out = clean.clone()
     for idx, column in enumerate(schema.model_categorical_targets):
         vocab = categorical_vocabs[column]
-        replacement = torch.randint(0, vocab.size, (clean.shape[0],), dtype=torch.long, device=clean.device)
-        out[:, idx] = replacement
+        field_cfg = dict(per_field.get(column, {}) or {})
+        allow_missing_replacement = bool(
+            field_cfg.get(
+                "allow_missing_replacement",
+                cfg.get("allow_missing_replacement", False),
+            )
+        )
+        replace_probability = float(
+            field_cfg.get("replacement_probability", default_replace)
+        )
+        mask_probability = float(field_cfg.get("mask_probability", default_mask))
+        if column in schema.length_bucket_targets and length_step_probability > 0:
+            perturb = (
+                torch.rand(clean.shape[0], device=clean.device)
+                < float(
+                    field_cfg.get(
+                        "length_bucket_step_probability",
+                        length_step_probability,
+                    )
+                )
+            )
+            direction = torch.where(
+                torch.rand(clean.shape[0], device=clean.device) < 0.5,
+                -torch.ones(clean.shape[0], dtype=torch.long, device=clean.device),
+                torch.ones(clean.shape[0], dtype=torch.long, device=clean.device),
+            )
+            bucket_ids = [
+                vocab.token_to_id[name]
+                for name in schema.buckets_for_length_bucket(column)
+                if name in vocab.token_to_id
+            ]
+            if not bucket_ids:
+                raise ValueError(
+                    f"No configured length buckets are present in vocab {column!r}"
+                )
+            bucket_tensor = torch.tensor(
+                bucket_ids, dtype=torch.long, device=clean.device
+            )
+            distances = (
+                clean[:, idx].view(-1, 1) == bucket_tensor.view(1, -1)
+            )
+            current_position = distances.long().argmax(dim=1)
+            stepped_position = (current_position + direction).clamp(
+                0, len(bucket_ids) - 1
+            )
+            stepped = bucket_tensor[stepped_position]
+            out[perturb, idx] = stepped[perturb]
+        replace = (
+            torch.rand(clean.shape[0], device=clean.device)
+            < replace_probability
+        )
+        valid_ids = [
+            token_id
+            for token, token_id in vocab.token_to_id.items()
+            if allow_missing_replacement or token != "<missing>"
+        ]
+        if not valid_ids:
+            valid_ids = list(range(vocab.size))
+        candidate_ids = torch.tensor(
+            valid_ids, dtype=torch.long, device=clean.device
+        )
+        sampled_position = torch.randint(
+            0,
+            len(valid_ids),
+            (clean.shape[0],),
+            dtype=torch.long,
+            device=clean.device,
+        )
+        replacement = candidate_ids[sampled_position]
+        if len(valid_ids) > 1:
+            same = replacement == clean[:, idx]
+            replacement[same] = candidate_ids[
+                (sampled_position[same] + 1) % len(valid_ids)
+            ]
+        out[replace, idx] = replacement[replace]
+        mask = torch.rand(clean.shape[0], device=clean.device) < mask_probability
+        out[mask, idx] = vocab.mask_id
     return out
 
 
@@ -575,6 +808,28 @@ def inactive_text_inputs(batch: dict[str, Any], config: ConditionalTABDLMConfig,
         text_input[column] = values
         text_attention[column] = torch.zeros_like(clean, dtype=torch.long)
     return text_input, text_attention
+
+
+def loss_gradient_norm(
+    loss: torch.Tensor,
+    parameters: list[torch.nn.Parameter],
+    *,
+    retain_graph: bool,
+) -> float:
+    gradients = torch.autograd.grad(
+        loss,
+        parameters,
+        retain_graph=retain_graph,
+        allow_unused=True,
+    )
+    total = torch.zeros((), dtype=torch.float32, device=loss.device)
+    for gradient in gradients:
+        if gradient is not None:
+            total = total + gradient.detach().float().pow(2).sum()
+    value = total.sqrt()
+    if not bool(torch.isfinite(value)):
+        raise FloatingPointError("Non-finite modality gradient norm")
+    return float(value.cpu())
 
 
 def save_hierarchical_checkpoint(
@@ -599,11 +854,16 @@ def save_hierarchical_checkpoint(
         graph_encoder=graph_encoder,
     )
     checkpoint = torch.load(path, map_location="cpu")
+    checkpoint["hierarchical_diagnostics_version"] = 1
     checkpoint["optimizer_state_dict"] = optimizer.state_dict()
     checkpoint["scheduler_state_dict"] = None
     checkpoint["generation_plan"] = generation_plan_from_config(config.raw, config.schema).to_dict()
     checkpoint["training_conditioning_mixture"] = config.raw.get("training", {}).get("text_conditioning", {})
     checkpoint["loss_weights"] = config.raw.get("loss_weights", {})
+    checkpoint["loss_group_weights"] = config.raw.get(
+        "loss_group_weights", {}
+    )
+    checkpoint["loss_groups"] = config.raw.get("loss_groups", {})
     checkpoint["text_token_loss_weights"] = {
         "summary_token_loss_weights": config.raw.get("summary_token_loss_weights", {}),
         "review_text_token_loss_weights": config.raw.get("review_text_token_loss_weights", {}),

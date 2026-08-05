@@ -1,0 +1,61 @@
+experiment_name: hierarchical_diffusion_amazon_toy_diagnostics
+output_root: outputs/amazon-toy/hierarchical_diffusion_diagnostics
+
+benchmark:
+  manifest: outputs/amazon-toy/hierarchical_diffusion_benchmark/benchmark_manifest.json
+
+model:
+  config: configs/attribute_generation/conditional_tabdlm_amazon_toy_hierarchical_v41.yaml
+  checkpoint: outputs/amazon-toy/conditional_tabdlm_hierarchical_v41/checkpoints/best.pt
+
+evaluation:
+  config: configs/evaluation/single_event_table_paper_metrics_amazon_toy.yaml
+
+seeds: [17, 42, 73]
+enabled_matrices:
+  - progressive_conditioning
+
+graph_subgroup_evaluation:
+  enabled: true
+  groups: [cold, partial, warm]
+  min_rows: 100
+  max_rows: 10000
+
+sampling:
+  batch_size: 128
+  structured_steps: 25
+  text_steps: 25
+  timestep_spacing: uniform
+  inference_dtype: bfloat16
+  text_top_k: 512
+  top_p: 0.95
+  temperature: 1.0
+  minimum_text_content_tokens: 1
+  device: cuda
+
+matrices:
+  progressive_conditioning: [O1, O2, O3, O4, O5]
+
+  graph_context:
+    - {name: graph_none, mode: no_graph, use_real_history_prefix: true}
+    - {name: graph_user, mode: user_only, use_real_history_prefix: true}
+    - {name: graph_product, mode: product_only, use_real_history_prefix: true}
+    - {name: graph_both, mode: both, use_real_history_prefix: true}
+    - {name: graph_both_coverage, mode: both_with_coverage, use_real_history_prefix: true}
+    - {name: graph_shuffled, mode: shuffled, use_real_history_prefix: true}
+    - {name: graph_zero, mode: zero, use_real_history_prefix: true}
+
+  decoding_policy:
+    - {name: decode_current, policy: current, top_k: 512, top_p: 0.95, temperature: 1.0}
+    - {name: decode_greedy, policy: greedy}
+    - {name: decode_topk_50, policy: top_k, top_k: 50, temperature: 1.0}
+    - {name: decode_topk_256, policy: top_k, top_k: 256, temperature: 1.0}
+    - {name: decode_nucleus_090, policy: nucleus, top_p: 0.90, temperature: 1.0}
+    - {name: decode_nucleus_095, policy: nucleus, top_p: 0.95, temperature: 1.0}
+    - {name: decode_temperature_070, policy: temperature, temperature: 0.70}
+    - {name: decode_temperature_120, policy: temperature, temperature: 1.20}
+
+reference_metrics:
+  source: fixed_amazon_toy_result_supplied_for_this_diagnostic
+  lstm_text_embedding_c2st_error: 0.5481
+  lstm_single_table_c2st_error: 0.6341

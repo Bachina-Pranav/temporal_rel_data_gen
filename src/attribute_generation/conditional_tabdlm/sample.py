@@ -18,6 +18,7 @@ from .attribute_corruption import GraphAttributeStore, build_attribute_graph_bat
 from .constrained import (
     decode_category_id,
     mask_invalid_category_logits,
+    valid_category_ids,
     valid_category_values,
     validate_output_categoricals,
 )
@@ -1098,8 +1099,16 @@ def sample_length_bucket_logits(
 ) -> torch.Tensor:
     logits = mask_invalid_category_logits(logits, column, vocab)
     probs = calibrated_length_probs(logits, vocab, calibration, schema, column=column)
+    valid_ids = valid_category_ids(column, vocab)
+    valid_mask = torch.zeros(
+        vocab.size, dtype=torch.bool, device=probs.device
+    )
+    valid_mask[valid_ids] = True
+    probs[:, ~valid_mask] = 0.0
+    probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
     if temperature != 1.0:
         logits = torch.log(probs.clamp_min(1e-12)) / max(float(temperature), 1e-6)
+        logits[:, ~valid_mask] = -float("inf")
         probs = torch.softmax(logits, dim=-1)
     return torch.multinomial(probs, num_samples=1).squeeze(1)
 
@@ -1110,8 +1119,16 @@ def sample_categorical_logits(
     vocab: CategoryVocab,
     temperature: float = 1.0,
 ) -> torch.Tensor:
-    constrained = mask_invalid_category_logits(logits, column, vocab)
-    return sample_logits(constrained, temperature=temperature, top_p=1.0)
+    valid_ids = valid_category_ids(column, vocab)
+    valid_id_tensor = torch.tensor(
+        valid_ids, dtype=torch.long, device=logits.device
+    )
+    local = sample_logits(
+        logits.index_select(dim=-1, index=valid_id_tensor),
+        temperature=temperature,
+        top_p=1.0,
+    )
+    return valid_id_tensor[local]
 
 
 def calibrated_length_probs(

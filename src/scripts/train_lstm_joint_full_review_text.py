@@ -103,8 +103,9 @@ def load_config_with_overrides(args: argparse.Namespace) -> ConditionalTABDLMCon
         training["steps_per_eval"] = int(args.steps_per_eval)
     if args.steps_per_checkpoint is not None:
         training["steps_per_checkpoint"] = int(args.steps_per_checkpoint)
-    if args.validation_max_batches is not None:
-        training["validation_max_batches"] = int(args.validation_max_batches)
+    validation_max_batches = getattr(args, "validation_max_batches", None)
+    if validation_max_batches is not None:
+        training["validation_max_batches"] = int(validation_max_batches)
     if args.epoch_mode is not None:
         training["epoch_mode"] = args.epoch_mode == "true"
     if args.sampling_mode is not None:
@@ -131,8 +132,9 @@ def load_config_with_overrides(args: argparse.Namespace) -> ConditionalTABDLMCon
         paths["neighbor_cache_dir"] = args.neighbor_cache_dir
     if args.amp_dtype is not None:
         training["amp_dtype"] = args.amp_dtype
-    if args.resume_from is not None:
-        training["resume_from"] = args.resume_from
+    resume_from = getattr(args, "resume_from", None)
+    if resume_from is not None:
+        training["resume_from"] = resume_from
     if args.profile:
         training["profile"] = True
     raw = resolve_auto_review_text_config(raw)

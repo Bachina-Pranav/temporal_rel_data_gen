@@ -284,16 +284,75 @@ class TemporalHistoryIndex:
         if sample_size is not None and self.num_rows > int(sample_size):
             rng = random.Random(17)
             rows = sorted(rng.sample(rows, int(sample_size)))
-        customer_counts = np.asarray([len(self.history_for_row(row, kind="customer")) for row in rows], dtype=float)
-        product_counts = np.asarray([len(self.history_for_row(row, kind="product")) for row in rows], dtype=float)
+        return self.diagnostics_for_rows(rows)
+
+    def diagnostics_for_rows(
+        self, row_indices: list[int] | np.ndarray
+    ) -> TemporalHistoryStats:
+        coverage = self.coverage_frame_for_rows(row_indices)
+        customer_counts = coverage["customer_history_count"].to_numpy(
+            dtype=float
+        )
+        product_counts = coverage["product_history_count"].to_numpy(
+            dtype=float
+        )
         any_counts = (customer_counts > 0) | (product_counts > 0)
+        count = int(len(coverage))
         return TemporalHistoryStats(
-            num_rows=int(len(rows)),
-            fraction_rows_with_customer_history=float(np.mean(customer_counts > 0)) if len(rows) else 0.0,
-            fraction_rows_with_product_history=float(np.mean(product_counts > 0)) if len(rows) else 0.0,
-            fraction_rows_with_any_history=float(np.mean(any_counts)) if len(rows) else 0.0,
-            mean_customer_history_count_used=float(np.mean(customer_counts)) if len(rows) else 0.0,
-            mean_product_history_count_used=float(np.mean(product_counts)) if len(rows) else 0.0,
-            p90_customer_history_count_used=float(np.quantile(customer_counts, 0.9)) if len(rows) else 0.0,
-            p90_product_history_count_used=float(np.quantile(product_counts, 0.9)) if len(rows) else 0.0,
+            num_rows=count,
+            fraction_rows_with_customer_history=float(np.mean(customer_counts > 0)) if count else 0.0,
+            fraction_rows_with_product_history=float(np.mean(product_counts > 0)) if count else 0.0,
+            fraction_rows_with_any_history=float(np.mean(any_counts)) if count else 0.0,
+            mean_customer_history_count_used=float(np.mean(customer_counts)) if count else 0.0,
+            mean_product_history_count_used=float(np.mean(product_counts)) if count else 0.0,
+            p90_customer_history_count_used=float(np.quantile(customer_counts, 0.9)) if count else 0.0,
+            p90_product_history_count_used=float(np.quantile(product_counts, 0.9)) if count else 0.0,
+        )
+
+    def coverage_frame_for_rows(
+        self, row_indices: list[int] | np.ndarray
+    ) -> pd.DataFrame:
+        """Return deterministic per-query history coverage for subgroup audits."""
+
+        rows = [int(row) for row in row_indices]
+        invalid = [row for row in rows if row < 0 or row >= self.num_rows]
+        if invalid:
+            raise IndexError(
+                f"Graph diagnostic row indices are out of range: {invalid[:5]}"
+            )
+        customer_counts = np.asarray(
+            [
+                len(self.history_for_row(row, kind="customer"))
+                for row in rows
+            ],
+            dtype=np.int64,
+        )
+        product_counts = np.asarray(
+            [
+                len(self.history_for_row(row, kind="product"))
+                for row in rows
+            ],
+            dtype=np.int64,
+        )
+        customer_present = customer_counts > 0
+        product_present = product_counts > 0
+        history_group = np.where(
+            customer_present & product_present,
+            "warm",
+            np.where(
+                customer_present | product_present,
+                "partial",
+                "cold",
+            ),
+        )
+        return pd.DataFrame(
+            {
+                "graph_row_index": rows,
+                "customer_history_count": customer_counts,
+                "product_history_count": product_counts,
+                "has_customer_history": customer_present,
+                "has_product_history": product_present,
+                "has_any_history": customer_present | product_present,
+                "history_group": history_group,
+            }
         )

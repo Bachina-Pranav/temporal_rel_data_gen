@@ -267,12 +267,33 @@ training:
   length_calibration_interval: 1
   checkpoint_interval: 1
   save_best_by: valid/loss_total
+  mask_padding_in_attention: true
+  modality_gradient_audit_interval: 200
   text_conditioning:
     mode: mixed
     clean_probability: 0.5
     corrupted_probability: 0.25
     generated_probability: 0.25
+    corruption:
+      replacement_probability: 0.8
+      mask_probability: 0.1
+      length_bucket_step_probability: 0.5
   device: auto
+
+loss_group_weights:
+  structured: 1.0
+  summary: 1.0
+  review: 1.0
+  auxiliary: 1.0
+
+loss_groups:
+  field_groups:
+    rating: structured
+    verified: structured
+    summary_length_bucket: auxiliary
+    review_text_length_bucket: auxiliary
+    summary: summary
+    review_text: review
 
 loss_weights:
   rating: 2.0
@@ -289,6 +310,7 @@ sampling:
   structured_steps: 10
   text_steps: 25
   graph_mode: correct
+  minimum_text_content_tokens: 1
   inference_dtype: float32
   compile_model: false
   profile: false

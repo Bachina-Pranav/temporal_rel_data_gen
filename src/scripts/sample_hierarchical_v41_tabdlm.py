@@ -33,8 +33,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-p", type=float, default=None)
     parser.add_argument("--text-top-k", type=int, default=None)
     parser.add_argument("--inference-dtype", choices=["float32", "float16", "bfloat16"], default=None)
-    parser.add_argument("--graph-mode", choices=["correct", "zero", "shuffled", "no_graph"], default="correct")
+    parser.add_argument(
+        "--graph-mode",
+        choices=[
+            "correct",
+            "both",
+            "both_with_coverage",
+            "customer_only",
+            "user_only",
+            "product_only",
+            "zero",
+            "shuffled",
+            "no_graph",
+        ],
+        default="correct",
+    )
     parser.add_argument("--oracle-structured-table", default=None)
+    parser.add_argument("--oracle-structured-columns", nargs="*", default=None)
+    parser.add_argument("--oracle-length-columns", nargs="*", default=None)
+    parser.add_argument("--graph-history-prefix", default=None)
+    parser.add_argument(
+        "--conditioning-mode",
+        choices=["O1", "O2", "O3", "O4", "O5"],
+        default=None,
+    )
+    parser.add_argument(
+        "--decoding-policy",
+        choices=["current", "greedy", "top_k", "nucleus", "temperature"],
+        default=None,
+    )
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--profile-output", default=None)
     parser.add_argument("--device", default=None)
@@ -69,6 +96,11 @@ def main() -> None:
         profile_output=args.profile_output,
         debug_write_aux_targets=args.debug_write_aux_targets,
         oracle_structured_table_path=args.oracle_structured_table,
+        conditioning_mode=args.conditioning_mode,
+        oracle_structured_columns=args.oracle_structured_columns,
+        oracle_length_columns=args.oracle_length_columns,
+        graph_history_prefix_path=args.graph_history_prefix,
+        decoding_policy=args.decoding_policy,
     )
 
 

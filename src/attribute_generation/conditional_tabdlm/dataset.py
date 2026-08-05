@@ -314,6 +314,7 @@ def make_collate_fn(
     min_mask_prob: float,
     max_mask_prob: float,
     mask_schedule: str = "linear",
+    mask_padding_in_attention: bool = False,
 ) -> Callable[[list[dict[str, Any]]], dict[str, Any]]:
     def collate(samples: list[dict[str, Any]]) -> dict[str, Any]:
         return collate_and_mask(
@@ -324,6 +325,7 @@ def make_collate_fn(
             min_mask_prob=min_mask_prob,
             max_mask_prob=max_mask_prob,
             mask_schedule=mask_schedule,
+            mask_padding_in_attention=mask_padding_in_attention,
         )
 
     return collate
@@ -337,6 +339,7 @@ def collate_and_mask(
     min_mask_prob: float,
     max_mask_prob: float,
     mask_schedule: str = "linear",
+    mask_padding_in_attention: bool = False,
 ) -> dict[str, Any]:
     foreign_key_ids = torch.stack([sample["foreign_key_ids"] for sample in samples], dim=0)
     datetime_values = torch.stack([sample["datetime_values"] for sample in samples], dim=0)
@@ -368,6 +371,8 @@ def collate_and_mask(
             # Match SimpleTextTokenizer.encode, which marks padded positions as
             # attended so configured pad-token losses remain unchanged.
             attention = torch.ones_like(clean, dtype=torch.long)
+        if mask_padding_in_attention:
+            attention = (clean != text_tokenizer.pad_id).long()
         candidate = attention.bool()
         if candidate.shape[1] > 0:
             candidate[:, 0] = False

@@ -120,6 +120,11 @@ class TemporalStructureOnlyGraphEncoder(nn.Module):
             ],
             dim=1,
         )
+        include_coverage = graph_batch.get("_include_coverage_metadata")
+        if include_coverage is not None and not bool(
+            include_coverage.reshape(-1)[0].item()
+        ):
+            count_features = torch.zeros_like(count_features)
         return self.fusion(torch.cat([target, customer_hist, product_hist, count_features], dim=1))
 
     def _encode_target(self, customer_hash: torch.Tensor, product_hash: torch.Tensor, timestamp: torch.Tensor) -> torch.Tensor:

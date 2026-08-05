@@ -206,7 +206,8 @@ class ConditionalTABDLMConfig:
 
     @property
     def data_dir(self) -> Path:
-        return self.output_dir / "data"
+        prepared = self.raw.get("paths", {}).get("prepared_data_dir")
+        return Path(prepared) if prepared else self.output_dir / "data"
 
     @property
     def checkpoint_dir(self) -> Path:

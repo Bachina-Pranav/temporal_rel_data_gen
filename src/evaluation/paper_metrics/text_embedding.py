@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 from typing import Any
 
@@ -59,9 +61,24 @@ def text_embedding_c2st_metrics(real: pd.DataFrame, synthetic: pd.DataFrame, con
 
 
 def embed_texts(texts: list[Any], model_name: str, output_dir: str | Path, cache_key: str, cache: bool) -> np.ndarray:
-    cache_path = Path(output_dir) / "embedding_cache" / f"{cache_key}.npy"
-    if cache and cache_path.exists():
-        return np.load(cache_path)
+    fingerprint = text_embedding_fingerprint(texts, model_name)
+    cache_path = (
+        Path(output_dir)
+        / "embedding_cache"
+        / f"{cache_key}_{fingerprint[:16]}.npy"
+    )
+    metadata_path = cache_path.with_suffix(".json")
+    if cache and cache_path.exists() and metadata_path.exists():
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            metadata = {}
+        if (
+            metadata.get("fingerprint") == fingerprint
+            and metadata.get("embedding_model") == model_name
+            and int(metadata.get("num_texts", -1)) == len(texts)
+        ):
+            return np.load(cache_path)
     embeddings: np.ndarray
     if model_name not in {"dummy", "deterministic_hash", "hash"}:
         try:
@@ -76,9 +93,29 @@ def embed_texts(texts: list[Any], model_name: str, output_dir: str | Path, cache
     if cache:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         np.save(cache_path, embeddings)
-        write_json({"embedding_model": model_name, "cache_key": cache_key, "shape": list(embeddings.shape)}, cache_path.with_suffix(".json"))
+        write_json(
+            {
+                "embedding_model": model_name,
+                "cache_key": cache_key,
+                "shape": list(embeddings.shape),
+                "num_texts": int(len(texts)),
+                "fingerprint": fingerprint,
+            },
+            metadata_path,
+        )
     return embeddings
 
 
 def hash_embeddings(texts: list[Any], dim: int = 64) -> np.ndarray:
     return np.vstack([text_hash_embedding(text, dim=dim) for text in texts])
+
+
+def text_embedding_fingerprint(texts: list[Any], model_name: str) -> str:
+    digest = hashlib.sha256()
+    digest.update(str(model_name).encode("utf-8"))
+    digest.update(str(len(texts)).encode("ascii"))
+    for text in texts:
+        encoded = str(text).encode("utf-8", errors="surrogatepass")
+        digest.update(len(encoded).to_bytes(8, "little"))
+        digest.update(encoded)
+    return digest.hexdigest()
