@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import re
 import time
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -28,6 +29,7 @@ from .lstm_joint import (
     select_state,
     scatter_state,
 )
+from .numerical import inverse_transform_numerical, sample_gaussian_params
 from .runtime_profiler import RuntimeProfiler
 from .schema import ConditionalTABDLMConfig, ConditionalTABDLMSchema
 from .tokenization import CategoryVocab, SimpleTextTokenizer, stable_hash_bucket
@@ -111,6 +113,7 @@ class BatchSample:
     text_ids: dict[str, torch.Tensor]
     text: dict[str, list[str]]
     text_lengths: dict[str, list[int]]
+    numerical: dict[str, list[float]] = field(default_factory=dict)
 
 
 @torch.inference_mode()
@@ -122,6 +125,7 @@ def sample_lstm_fast_from_config(
     batch_size: int | str | None = None,
     device: str | None = None,
     synthetic_spine_path: str | Path | None = None,
+    graph_history_prefix_path: str | Path | None = None,
     options: FastSamplerOptions | None = None,
 ) -> Path:
     options = options or FastSamplerOptions()
@@ -138,6 +142,8 @@ def sample_lstm_fast_from_config(
     seed = int(options.seed if options.seed is not None else sampling.get("seed", 42))
     set_seed(seed)
     device = resolve_device(device or str(sampling.get("device", "auto")))
+    if str(device).startswith("cuda"):
+        torch.cuda.reset_peak_memory_stats(device)
     profiler = RuntimeProfiler(enabled=options.profile)
     profiler.start_total()
 
@@ -169,6 +175,16 @@ def sample_lstm_fast_from_config(
     top_p = options.categorical_top_p
     if top_p is None:
         top_p = sampling_scalar(sampling, "top_p", "categorical", 0.95)
+    numerical_temperature = float(
+        sampling.get("numerical_temperature", sampling.get("temperature", 0.9))
+    )
+    numerical_metadata = (
+        ckpt_config.raw.get("_numerical_metadata")
+        or {
+            column: {}
+            for column in ckpt_config.schema.numerical_targets
+        }
+    )
     text_temperatures = {
         "summary": (
             float(options.summary_temperature)
@@ -219,14 +235,46 @@ def sample_lstm_fast_from_config(
     graph_cache_memory_mb = 0.0
     graph_cache_hits = 0
     graph_cache_requests = 0
+    graph_query_offset = 0
     if graph_encoder is not None:
         with profiler.timer("graph_context_cache_build_seconds"):
-            graph_history_index = build_temporal_history_index(spine, ckpt_config, seed=seed)
+            if graph_history_prefix_path is not None:
+                graph_history_prefix = pd.read_csv(graph_history_prefix_path)
+                missing = [
+                    column
+                    for column in ckpt_config.schema.condition_columns
+                    if column not in graph_history_prefix.columns
+                ]
+                if missing:
+                    raise ValueError(
+                        f"Graph history prefix is missing condition columns: {missing}"
+                    )
+                graph_query_offset = int(len(graph_history_prefix))
+                graph_frame = pd.concat(
+                    [
+                        graph_history_prefix.loc[
+                            :, list(ckpt_config.schema.condition_columns)
+                        ],
+                        spine.loc[:, list(ckpt_config.schema.condition_columns)],
+                    ],
+                    ignore_index=True,
+                )
+            else:
+                graph_frame = spine
+            graph_history_index = build_temporal_history_index(
+                graph_frame,
+                ckpt_config,
+                seed=seed,
+            )
             write_temporal_graph_metadata(
-                spine,
+                graph_frame,
                 ckpt_config,
                 output_path.parent / "graph",
-                source="synthetic_spine",
+                source=(
+                    "condition_only_history_prefix_plus_synthetic_spine"
+                    if graph_history_prefix_path is not None
+                    else "synthetic_spine"
+                ),
                 seed=seed,
                 real_graph_used_at_sampling=False,
             )
@@ -241,6 +289,7 @@ def sample_lstm_fast_from_config(
                     profiler,
                     use_amp,
                     dtype,
+                    row_offset=graph_query_offset,
                 )
             graph_cache_memory_mb = float(graph_cache.numel() * graph_cache.element_size() / (1024**2))
 
@@ -263,6 +312,7 @@ def sample_lstm_fast_from_config(
                     ckpt_config.schema,
                     frame,
                     row_start=start,
+                    graph_query_offset=graph_query_offset,
                     vocabs=vocabs,
                     tokenizer=tokenizer,
                     num_hash_buckets=num_hash_buckets,
@@ -273,6 +323,8 @@ def sample_lstm_fast_from_config(
                     profiler=profiler,
                     temperature=temperature,
                     top_p=top_p,
+                    numerical_temperature=numerical_temperature,
+                    numerical_metadata=numerical_metadata,
                     text_temperatures=text_temperatures,
                     text_top_ps=text_top_ps,
                     min_tokens=min_tokens,
@@ -355,6 +407,13 @@ def sample_lstm_fast_from_config(
         total_seconds,
         text_temperatures=text_temperatures,
         text_top_ps=text_top_ps,
+        device=device,
+        graph_history_prefix_path=(
+            Path(graph_history_prefix_path)
+            if graph_history_prefix_path is not None
+            else None
+        ),
+        graph_history_prefix_rows=graph_query_offset,
     )
     save_json(metadata, metadata_dir / "fast_sampler_metadata.json")
     save_json(metadata, output_path.parent / "sample_metadata.json")
@@ -369,6 +428,7 @@ def sample_lstm_fast_batch(
     frame: pd.DataFrame,
     *,
     row_start: int,
+    graph_query_offset: int = 0,
     vocabs: dict[str, CategoryVocab],
     tokenizer: SimpleTextTokenizer,
     num_hash_buckets: int,
@@ -379,6 +439,8 @@ def sample_lstm_fast_batch(
     profiler: RuntimeProfiler,
     temperature: float,
     top_p: float,
+    numerical_temperature: float,
+    numerical_metadata: dict[str, Any],
     text_temperatures: dict[str, float],
     text_top_ps: dict[str, float],
     min_tokens: dict[str, int],
@@ -392,6 +454,7 @@ def sample_lstm_fast_batch(
             schema,
             frame,
             row_start=row_start,
+            graph_query_offset=graph_query_offset,
             vocabs=vocabs,
             tokenizer=tokenizer,
             num_hash_buckets=num_hash_buckets,
@@ -402,6 +465,8 @@ def sample_lstm_fast_batch(
             profiler=profiler,
             temperature=temperature,
             top_p=top_p,
+            numerical_temperature=numerical_temperature,
+            numerical_metadata=numerical_metadata,
             text_temperatures=text_temperatures,
             text_top_ps=text_top_ps,
             min_tokens=min_tokens,
@@ -414,6 +479,7 @@ def sample_lstm_fast_batch(
         graph_history_index,
         graph_cache,
         row_start,
+        graph_query_offset,
         len(frame),
         device,
         profiler,
@@ -422,6 +488,22 @@ def sample_lstm_fast_batch(
         condition = model.encode_condition(foreign_key_ids, datetime_values, graph_context=graph_context)
     with profiler.timer("row_latent_seconds"):
         row = model.row_latent(condition)
+    decoded_numerical: dict[str, list[float]] = {}
+    with profiler.timer("numerical_sampling_seconds"):
+        for column, params in model.numerical_params(row).items():
+            sampled = sample_gaussian_params(
+                params,
+                temperature=numerical_temperature,
+            )
+            decoded_numerical[column] = (
+                inverse_transform_numerical(
+                    sampled,
+                    numerical_metadata.get(column, {}),
+                )
+                .detach()
+                .cpu()
+                .tolist()
+            )
     sampled_cat_columns: list[torch.Tensor] = []
     decoded_cats: dict[str, list[Any]] = {}
     with profiler.timer("categorical_sampling_seconds"):
@@ -488,7 +570,14 @@ def sample_lstm_fast_batch(
         text_lengths[column] = content_lengths_from_tensor(tokenizer, ids)
         if column == "summary" and getattr(model, "review_text_conditioned_on_summary", False):
             summary_repr_by_field[column] = model.summary_representation_from_ids(context, ids)
-    return BatchSample(frame=frame, categorical=decoded_cats, text_ids=text_ids, text={}, text_lengths=text_lengths)
+    return BatchSample(
+        frame=frame,
+        categorical=decoded_cats,
+        text_ids=text_ids,
+        text={},
+        text_lengths=text_lengths,
+        numerical=decoded_numerical,
+    )
 
 
 def sample_lstm_naive_batch(
@@ -497,6 +586,7 @@ def sample_lstm_naive_batch(
     frame: pd.DataFrame,
     *,
     row_start: int,
+    graph_query_offset: int = 0,
     vocabs: dict[str, CategoryVocab],
     tokenizer: SimpleTextTokenizer,
     num_hash_buckets: int,
@@ -507,6 +597,8 @@ def sample_lstm_naive_batch(
     profiler: RuntimeProfiler,
     temperature: float,
     top_p: float,
+    numerical_temperature: float,
+    numerical_metadata: dict[str, Any],
     min_tokens: dict[str, int],
     repetition_penalty: dict[str, float],
     text_temperatures: dict[str, float] | None = None,
@@ -519,6 +611,7 @@ def sample_lstm_naive_batch(
         graph_history_index,
         graph_cache,
         row_start,
+        graph_query_offset,
         len(frame),
         device,
         profiler,
@@ -544,6 +637,21 @@ def sample_lstm_naive_batch(
         text_ids=generated["text_ids"],
         text=generated["text"],
         text_lengths=generated["text_lengths"],
+        numerical={
+            column: (
+                inverse_transform_numerical(
+                    sample_gaussian_params(
+                        generated["numerical_params"][column],
+                        temperature=numerical_temperature,
+                    ),
+                    numerical_metadata.get(column, {}),
+                )
+                .detach()
+                .cpu()
+                .tolist()
+            )
+            for column in schema.numerical_targets
+        },
     )
 
 
@@ -721,9 +829,16 @@ def materialize_batch_output(
     profiler: RuntimeProfiler,
     options: FastSamplerOptions,
 ) -> pd.DataFrame:
-    output = batch.frame.loc[:, list(schema.condition_columns)].copy()
+    output_columns = [
+        column
+        for column in ["event_id", *schema.condition_columns]
+        if column in batch.frame.columns
+    ]
+    output = batch.frame.loc[:, output_columns].copy()
     for column in schema.categorical_targets:
         output[column] = batch.categorical[column]
+    for column in schema.numerical_targets:
+        output[column] = batch.numerical[column]
     with profiler.timer("detokenization_seconds"):
         for column in schema.text_targets:
             if column in batch.text and batch.text[column]:
@@ -755,7 +870,18 @@ def write_pending_chunks(
 ) -> None:
     with profiler.timer("csv_writing_seconds"):
         frame = pd.concat(chunks, ignore_index=True)
-        frame = frame.loc[:, list(schema.condition_columns + schema.categorical_targets + schema.text_targets)]
+        columns = [
+            column
+            for column in [
+                "event_id",
+                *schema.condition_columns,
+                *schema.categorical_targets,
+                *schema.numerical_targets,
+                *schema.text_targets,
+            ]
+            if column in frame.columns
+        ]
+        frame = frame.loc[:, columns]
         frame.to_csv(output_path, index=False, mode="a" if append else "w", header=not append)
 
 
@@ -764,6 +890,7 @@ def get_graph_context(
     graph_history_index: Any | None,
     graph_cache: torch.Tensor | None,
     row_start: int,
+    graph_query_offset: int,
     batch_size: int,
     device: str,
     profiler: RuntimeProfiler,
@@ -776,7 +903,12 @@ def get_graph_context(
                 return graph_cache[row_start : row_start + batch_size].to(device=device, non_blocking=True)
             if graph_history_index is None:
                 raise ValueError("graph_history_index is required when graph_encoder is enabled")
-            row_indices = list(range(row_start, row_start + batch_size))
+            row_indices = list(
+                range(
+                    graph_query_offset + row_start,
+                    graph_query_offset + row_start + batch_size,
+                )
+            )
             return graph_encoder(graph_history_index.build_batch(row_indices, device=device, deterministic=True))
 
 
@@ -789,12 +921,13 @@ def build_full_graph_context_cache(
     profiler: RuntimeProfiler,
     use_amp: bool,
     dtype: torch.dtype | None,
+    row_offset: int = 0,
 ) -> torch.Tensor:
     chunks: list[torch.Tensor] = []
     with profiler.timer("graph_context_total_seconds"):
         for start in range(0, rows, batch_size):
             end = min(start + batch_size, rows)
-            row_indices = list(range(start, end))
+            row_indices = list(range(row_offset + start, row_offset + end))
             with autocast_context(device, use_amp, dtype):
                 encoded = graph_encoder(graph_history_index.build_batch(row_indices, device=device, deterministic=True))
             chunks.append(encoded.detach().cpu())
@@ -1466,11 +1599,29 @@ def fast_sampler_metadata(
     total_seconds: float,
     text_temperatures: dict[str, float] | None = None,
     text_top_ps: dict[str, float] | None = None,
+    device: str = "cpu",
+    graph_history_prefix_path: Path | None = None,
+    graph_history_prefix_rows: int = 0,
 ) -> dict[str, Any]:
     return {
         "checkpoint_path": str(checkpoint_path),
+        "checkpoint_sha256": file_sha256(checkpoint_path) if checkpoint_path.exists() else None,
         "synthetic_spine_path": str(spine_path),
+        "synthetic_spine_sha256": file_sha256(spine_path) if spine_path.exists() else None,
+        "graph_history_prefix_path": (
+            str(graph_history_prefix_path)
+            if graph_history_prefix_path is not None
+            else None
+        ),
+        "graph_history_prefix_sha256": (
+            file_sha256(graph_history_prefix_path)
+            if graph_history_prefix_path is not None
+            and graph_history_prefix_path.exists()
+            else None
+        ),
+        "graph_history_prefix_rows": int(graph_history_prefix_rows),
         "output_path": str(output_path),
+        "synthetic_output_sha256": file_sha256(output_path) if output_path.exists() else None,
         "num_rows": int(rows),
         "batch_size": int(batch_size),
         "temperature": float(temperature),
@@ -1493,6 +1644,12 @@ def fast_sampler_metadata(
         "mixed_precision_used": bool(mixed_precision_used),
         "torch_compile_used": bool(torch_compile_used),
         "total_sampling_seconds": float(total_seconds),
+        "rows_per_second": float(rows / total_seconds) if total_seconds > 0 else None,
+        "peak_gpu_memory_mb": (
+            float(torch.cuda.max_memory_allocated() / (1024**2))
+            if str(device).startswith("cuda")
+            else None
+        ),
         **privacy_summary_fields(options),
         "joint_generation": True,
         "review_text_generated_jointly": "review_text" in config.schema.text_targets,
@@ -1503,7 +1660,11 @@ def fast_sampler_metadata(
         "uses_transformer_backbone": False,
         "text_decoder_type": config.raw.get("text_decoder", {}).get("type", "lstm"),
         **graph_metadata(config.raw, real_graph_used_at_sampling=False),
-        "synthetic_graph_history_source": "synthetic_spine",
+        "synthetic_graph_history_source": (
+            "condition_only_history_prefix_plus_synthetic_spine"
+            if graph_history_prefix_path is not None
+            else "synthetic_spine"
+        ),
         "graph_uses_clean_target_attributes": False,
         "graph_uses_clean_future_attributes": False,
         "valid_categorical_values": {
@@ -1512,3 +1673,11 @@ def fast_sampler_metadata(
             if column in vocabs
         },
     }
+
+
+def file_sha256(path: str | Path, chunk_size: int = 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()

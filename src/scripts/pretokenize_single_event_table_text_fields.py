@@ -60,8 +60,8 @@ def main() -> None:
     save_json(schema.to_dict(), output_dir / "schema.json")
 
     print("[pretokenize] pass 1/3: counting valid rows and timestamps", flush=True)
-    timestamps_ns = collect_timestamps(config, int(args.chunk_size))
-    split = split_indices_from_timestamps(timestamps_ns)
+    timestamps_ns, split_labels = collect_split_inputs(config, int(args.chunk_size))
+    split = split_indices_from_timestamps(timestamps_ns, split_labels)
     save_split_indices(output_dir, split)
 
     print("[pretokenize] pass 2/3: fitting tokenizer and categorical vocabularies", flush=True)
@@ -87,6 +87,7 @@ def main() -> None:
             "train_rows": int(len(split["train"])),
             "valid_rows": int(len(split["valid"])),
             "test_rows": int(len(split["test"])),
+            "split_source": "explicit_split_column" if split_labels is not None else "legacy_time_aware_90_5_5",
         }
     )
     save_json(metadata, output_dir / "metadata.json")
@@ -99,6 +100,9 @@ def iter_valid_chunks(
 ) -> Iterator[pd.DataFrame]:
     schema = config.schema
     required = list(dict.fromkeys(schema.required_columns))
+    available = pd.read_csv(config.train_data_path, nrows=0).columns.tolist()
+    if "split" in available:
+        required.append("split")
     first = True
     for chunk in pd.read_csv(
         config.train_data_path,
@@ -118,18 +122,73 @@ def iter_valid_chunks(
 
 
 def collect_timestamps(config: ConditionalTABDLMConfig, chunk_size: int) -> np.ndarray:
+    timestamps_ns, _ = collect_split_inputs(config, chunk_size)
+    return timestamps_ns
+
+
+def collect_split_inputs(
+    config: ConditionalTABDLMConfig,
+    chunk_size: int,
+) -> tuple[np.ndarray, np.ndarray | None]:
     timestamp_col = config.schema.datetime_columns[0]
     pieces: list[np.ndarray] = []
+    split_pieces: list[np.ndarray] = []
+    saw_split: bool | None = None
     for frame in iter_valid_chunks(config, chunk_size):
         pieces.append(frame[timestamp_col].to_numpy(dtype="datetime64[ns]").astype(np.int64))
+        has_split = "split" in frame.columns
+        if saw_split is not None and has_split != saw_split:
+            raise ValueError("split column availability changed across input chunks")
+        saw_split = has_split
+        if has_split:
+            split_pieces.append(frame["split"].astype(str).to_numpy(dtype=str))
         print(f"[pretokenize] valid rows counted: {sum(len(piece) for piece in pieces):,}", flush=True)
     if not pieces:
         raise ValueError("No valid rows found for pretokenization")
-    return np.concatenate(pieces).astype(np.int64, copy=False)
+    timestamps = np.concatenate(pieces).astype(np.int64, copy=False)
+    labels = np.concatenate(split_pieces) if split_pieces else None
+    return timestamps, labels
 
 
-def split_indices_from_timestamps(timestamps_ns: np.ndarray) -> dict[str, np.ndarray]:
+def split_indices_from_timestamps(
+    timestamps_ns: np.ndarray,
+    split_labels: np.ndarray | None = None,
+) -> dict[str, np.ndarray]:
     n = int(len(timestamps_ns))
+    if split_labels is not None:
+        if len(split_labels) != n:
+            raise ValueError(
+                f"split label count ({len(split_labels)}) does not match valid row count ({n})"
+            )
+        aliases = {
+            "train": "train",
+            "training": "train",
+            "valid": "valid",
+            "val": "valid",
+            "validation": "valid",
+            "test": "test",
+        }
+        normalized = np.asarray(
+            [aliases.get(str(value).strip().lower(), "") for value in split_labels],
+            dtype=str,
+        )
+        unknown = sorted(
+            {
+                str(value)
+                for value, parsed in zip(split_labels, normalized)
+                if not parsed
+            }
+        )
+        if unknown:
+            raise ValueError(f"Unknown explicit split labels: {unknown}")
+        result = {
+            name: np.flatnonzero(normalized == name).astype(np.int64)
+            for name in ("train", "valid", "test")
+        }
+        empty = [name for name, indices in result.items() if len(indices) == 0]
+        if empty:
+            raise ValueError(f"Explicit split column has no rows for: {empty}")
+        return result
     order = np.argsort(timestamps_ns, kind="mergesort")
     train_end = int(n * 0.90)
     valid_end = int(n * 0.95)

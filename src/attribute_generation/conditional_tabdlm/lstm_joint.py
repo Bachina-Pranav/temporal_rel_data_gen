@@ -636,6 +636,8 @@ def _train_lstm_from_config_once(
     device = resolve_device(device or str(training.get("device", "auto")))
     model = build_lstm_model(config, categorical_vocabs, tokenizer).to(device)
     graph_encoder = build_graph_encoder(config, categorical_vocabs, tokenizer).to(device) if use_graph_context else None
+    if str(device).startswith("cuda"):
+        torch.cuda.reset_peak_memory_stats(device)
     train_history_index = build_temporal_history_index(train_frame, config, seed=seed) if use_graph_context else None
     valid_graph_frame = pd.concat([train_frame, valid_frame], ignore_index=True) if use_graph_context else valid_frame
     valid_history_index = build_temporal_history_index(valid_graph_frame, config, seed=seed + 1) if use_graph_context else None
@@ -937,7 +939,15 @@ def _train_lstm_fixed_step_from_config_once(
     if isinstance(sampler, TemporalStratifiedSampler):
         save_json(sampler.diagnostics().to_dict(), output_dir / "sampling_diagnostics.json")
     train_rows_seen = int(steps_completed * effective_batch_size)
-    train_subset_used = training.get("max_rows") not in (None, "all") or bool(pretokenized_dir)
+    train_subset_used = training.get("max_rows") not in (None, "all")
+    parameter_count = sum(parameter.numel() for parameter in model.parameters())
+    if graph_encoder is not None:
+        parameter_count += sum(parameter.numel() for parameter in graph_encoder.parameters())
+    peak_gpu_memory_mb = (
+        float(torch.cuda.max_memory_allocated(device) / (1024**2))
+        if str(device).startswith("cuda")
+        else None
+    )
     runtime = {
         "train_mode": "fixed_step",
         "epoch_mode": False,
@@ -958,6 +968,8 @@ def _train_lstm_fixed_step_from_config_once(
         "best_checkpoint_path": str(best_path),
         "best_valid_total_loss": float(best_valid),
         "best_step": int(best_step),
+        "parameter_count": int(parameter_count),
+        "peak_gpu_memory_mb": peak_gpu_memory_mb,
         "total_training_seconds": float(elapsed),
         "train_batch_size_requested": int(requested_batch_size if requested_batch_size is not None else batch_size),
         "train_batch_size_used": int(batch_size),
@@ -1055,6 +1067,7 @@ def run_lstm_fixed_steps(
         "optimizer": 0.0,
     }
     microbatches = 0
+    last_gradient_norm = float("nan")
     progress = tqdm(total=int(max_steps), desc="train_lstm_fixed_step") if tqdm is not None else None
     train_start = time.perf_counter()
     for step in range(1, int(max_steps) + 1):
@@ -1103,6 +1116,10 @@ def run_lstm_fixed_steps(
                 )
                 loss = loss / max(int(gradient_accumulation_steps), 1)
                 timer_totals["forward"] += time.perf_counter() - forward_start
+            if not bool(torch.isfinite(loss).all()):
+                raise FloatingPointError(
+                    f"Non-finite LSTM loss at optimizer step {step}"
+                )
             backward_start = time.perf_counter()
             scaler.scale(loss).backward()
             timer_totals["backward"] += time.perf_counter() - backward_start
@@ -1110,7 +1127,12 @@ def run_lstm_fixed_steps(
             microbatches += 1
         optimizer_start = time.perf_counter()
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(list(model.parameters()) + (list(graph_encoder.parameters()) if graph_encoder is not None else []), clip_norm)
+        gradient_norm = torch.nn.utils.clip_grad_norm_(
+            list(model.parameters())
+            + (list(graph_encoder.parameters()) if graph_encoder is not None else []),
+            clip_norm,
+        )
+        last_gradient_norm = float(gradient_norm.detach().cpu())
         scaler.step(optimizer)
         scaler.update()
         optimizer.zero_grad(set_to_none=True)
@@ -1159,6 +1181,8 @@ def run_lstm_fixed_steps(
                     step,
                     valid_metrics,
                     graph_encoder=graph_encoder,
+                    optimizer=optimizer,
+                    scaler=scaler,
                 )
             else:
                 without_improvement += 1
@@ -1166,6 +1190,16 @@ def run_lstm_fixed_steps(
             row = {
                 "step": int(step),
                 "max_steps": int(max_steps),
+                "epoch": float(
+                    (
+                        step
+                        * int(gradient_accumulation_steps)
+                        * int(train_loader.batch_size or 1)
+                    )
+                    / max(len(train_loader.dataset), 1)
+                ),
+                "learning_rate": float(optimizer.param_groups[0]["lr"]),
+                "gradient_norm": float(last_gradient_norm),
                 **{f"train_{key}": value for key, value in train_metrics.items()},
                 **{f"valid_{key}": value for key, value in valid_metrics.items()},
                 "best_valid_total_loss": float(best_valid),
@@ -1193,6 +1227,8 @@ def run_lstm_fixed_steps(
                 step,
                 last_valid_metrics,
                 graph_encoder=graph_encoder,
+                optimizer=optimizer,
+                scaler=scaler,
             )
     if progress is not None:
         progress.close()
@@ -1204,6 +1240,7 @@ def run_lstm_fixed_steps(
         "steps_completed": int(steps_completed),
         "stopped_early": bool(stopped_early),
         "last_valid_metrics": last_valid_metrics,
+        "last_gradient_norm": float(last_gradient_norm),
         "avg_step_seconds": float(total_seconds / max(int(steps_completed), 1)),
         "avg_batch_load_seconds": float(timer_totals["batch_load"] / denom),
         "avg_h2d_seconds": float(timer_totals["h2d"] / denom),

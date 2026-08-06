@@ -55,6 +55,7 @@ def main() -> None:
     if "event_id" in frame.columns:
         sort_cols.append("event_id")
     summary: dict[str, Any] = {"source_table": str(table_path), "splits": {}}
+    spine_frames: dict[str, pd.DataFrame] = {}
     for split_name in ["train", "validation", "test"]:
         split = frame.loc[frame["split"] == split_name].copy()
         split[timestamp_col] = pd.to_datetime(split[timestamp_col], errors="coerce")
@@ -65,6 +66,7 @@ def main() -> None:
         spine_path = output_dir / f"{split_name}_spine.csv"
         split.loc[:, real_cols].to_csv(real_path, index=False)
         split.loc[:, spine_cols].to_csv(spine_path, index=False)
+        spine_frames[split_name] = split.loc[:, spine_cols].copy()
         timestamps = pd.to_datetime(split[timestamp_col], errors="coerce")
         summary["splits"][split_name] = {
             "rows": int(len(split)),
@@ -75,6 +77,15 @@ def main() -> None:
         }
         print(f"Wrote {real_path}")
         print(f"Wrote {spine_path}")
+    history_prefix_path = output_dir / "history_prefix_spine.csv"
+    history_prefix = pd.concat(
+        [spine_frames["train"], spine_frames["validation"]],
+        ignore_index=True,
+    )
+    history_prefix.to_csv(history_prefix_path, index=False)
+    summary["history_prefix_spine_path"] = str(history_prefix_path)
+    summary["history_prefix_rows"] = int(len(history_prefix))
+    print(f"Wrote {history_prefix_path}")
     summary_path = output_dir / "split_spines_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(f"Wrote {summary_path}")

@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -62,6 +64,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--neighbor-cache-dir", default=None)
     parser.add_argument("--amp-dtype", choices=["fp16", "bf16"], default=None)
     parser.add_argument("--resume-from", default=None)
+    parser.add_argument("--seed", type=int, default=None)
     return parser.parse_args()
 
 
@@ -132,6 +135,8 @@ def load_config_with_overrides(args: argparse.Namespace) -> ConditionalTABDLMCon
         paths["neighbor_cache_dir"] = args.neighbor_cache_dir
     if args.amp_dtype is not None:
         training["amp_dtype"] = args.amp_dtype
+    if args.seed is not None:
+        training["seed"] = int(args.seed)
     resume_from = getattr(args, "resume_from", None)
     if resume_from is not None:
         training["resume_from"] = resume_from
@@ -184,6 +189,9 @@ def write_training_metadata(config: ConditionalTABDLMConfig, best_path: Path, el
         "amp_dtype": runtime.get("amp_dtype", training.get("amp_dtype", "fp16")),
         "total_training_seconds": runtime.get("total_training_seconds", float(elapsed)),
         "validation_metrics": best_validation_metrics(config.output_dir / "train_log.jsonl"),
+        "dataset_fingerprint_sha256": sha256_file(config.train_data_path),
+        "configuration_fingerprint_sha256": sha256_json(config.to_dict()),
+        "git_commit": git_revision(),
     }
     metadata.update({key: value for key, value in runtime.items() if key not in metadata})
     save_json(metadata, config.output_dir / "training_metadata.json")
@@ -214,6 +222,30 @@ def best_validation_metrics(path: Path) -> dict[str, Any]:
     if not rows:
         return {}
     return min(rows, key=lambda row: float(row.get("valid_total_loss", row.get("best_valid_total_loss", float("inf")))))
+
+
+def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def sha256_json(value: Any) -> str:
+    payload = json.dumps(value, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def git_revision() -> str | None:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        return None
 
 
 if __name__ == "__main__":

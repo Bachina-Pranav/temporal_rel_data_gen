@@ -41,7 +41,17 @@ def main() -> None:
             failed = True
             continue
         report = validate_subset(adapter, subset_dir)
-        (root / adapter.benchmark_name / "validation_report.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        report_path = root / adapter.benchmark_name / "basic_validation_report.json"
+        report_path.write_text(
+            json.dumps(report, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        legacy_path = root / adapter.benchmark_name / "validation_report.json"
+        if not legacy_path.exists():
+            legacy_path.write_text(
+                json.dumps(report, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
         print(json.dumps(report, sort_keys=True))
         failed = failed or not report["valid"]
     if failed:

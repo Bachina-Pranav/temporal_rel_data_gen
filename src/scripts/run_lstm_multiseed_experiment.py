@@ -1,0 +1,918 @@
+#!/usr/bin/env python3
+"""Run a reproducible multi-seed LSTM attribute-generation experiment."""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pandas as pd
+import yaml
+
+
+ROOT = Path(__file__).resolve().parents[2]
+if not __package__:
+    sys.path.insert(0, str(ROOT / "src"))
+
+from attribute_generation.conditional_tabdlm.schema import (  # noqa: E402
+    ConditionalTABDLMConfig,
+    ConditionalTABDLMSchema,
+)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--evaluation-config", required=True)
+    parser.add_argument("--output-root", required=True)
+    parser.add_argument("--pretokenized-dir", required=True)
+    parser.add_argument("--neighbor-cache-dir", required=True)
+    parser.add_argument("--seeds", nargs="+", type=int, default=[17, 42, 73])
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--sample-batch-size", default="8192")
+    parser.add_argument("--smoke-rows", type=int, default=64)
+    parser.add_argument("--skip-smoke", action="store_true")
+    parser.add_argument("--smoke-only", action="store_true")
+    parser.add_argument("--skip-existing", action="store_true")
+    parser.add_argument("--rebuild-precomputed", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--comparison-metrics", nargs="*", default=[])
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    base_config_path = Path(args.config)
+    eval_config_path = Path(args.evaluation_config)
+    output_root = Path(args.output_root)
+    shared = output_root / "shared"
+    logs = output_root / "logs"
+    for path in [output_root, shared, logs]:
+        path.mkdir(parents=True, exist_ok=True)
+
+    base = load_yaml(base_config_path)
+    schema = ConditionalTABDLMSchema.from_config_dict(base)
+    config = ConditionalTABDLMConfig(
+        raw=base,
+        schema=schema,
+        config_path=base_config_path,
+    )
+    require_file(config.train_data_path, "prepared interaction table")
+    require_file(eval_config_path, "paper-metrics config")
+    inventory = experiment_inventory(config, base_config_path, eval_config_path)
+    write_json(inventory, shared / "repository_inventory.json")
+    print(json.dumps(inventory, indent=2, sort_keys=True), flush=True)
+
+    run_stage(
+        [
+            python(),
+            "src/scripts/audit_lstm_interaction_experiment.py",
+            "--config",
+            str(base_config_path),
+            "--evaluation-config",
+            str(eval_config_path),
+            "--output-dir",
+            str(shared / "audit"),
+        ],
+        logs / "audit.log",
+        args,
+    )
+    run_stage(
+        [
+            python(),
+            "src/scripts/materialize_interaction_lstm_splits.py",
+            "--config",
+            str(base_config_path),
+            "--output-dir",
+            str(shared / "spines"),
+        ],
+        logs / "materialize_spines.log",
+        args,
+    )
+    if args.dry_run:
+        expected_splits = {}
+    else:
+        expected_splits = load_json(
+            shared / "spines" / "split_spines_summary.json"
+        )["splits"]
+
+    ensure_pretokenized(
+        base_config_path,
+        config.train_data_path,
+        Path(args.pretokenized_dir),
+        expected_splits,
+        args,
+        logs,
+    )
+    ensure_neighbor_cache(
+        base_config_path,
+        config.train_data_path,
+        Path(args.neighbor_cache_dir),
+        len(pd.read_csv(config.train_data_path, usecols=[schema.datetime_columns[0]]))
+        if not args.dry_run
+        else None,
+        args,
+        logs,
+    )
+    run_stage(
+        [
+            python(),
+            "src/scripts/audit_c2st_integrity.py",
+            "--config",
+            str(eval_config_path),
+            "--real-table",
+            str(shared / "spines" / "test_real.csv"),
+            "--output",
+            str(shared / "c2st_integrity_audit.json"),
+            "--max-rows-per-side",
+            "5000",
+            "--seed",
+            "42",
+        ],
+        logs / "c2st_integrity.log",
+        args,
+    )
+
+    if not args.skip_smoke:
+        run_seed(
+            seed=int(args.seeds[0]),
+            base=base,
+            eval_template=load_yaml(eval_config_path),
+            output_dir=output_root / "smoke",
+            shared=shared,
+            pretokenized_dir=Path(args.pretokenized_dir),
+            neighbor_cache_dir=Path(args.neighbor_cache_dir),
+            args=args,
+            smoke=True,
+        )
+    if args.smoke_only or args.dry_run:
+        print(
+            "Smoke/dry-run phase complete; full seed training was not launched.",
+            flush=True,
+        )
+        return
+
+    per_seed = []
+    for seed in args.seeds:
+        per_seed.append(
+            run_seed(
+                seed=int(seed),
+                base=base,
+                eval_template=load_yaml(eval_config_path),
+                output_dir=output_root / "runs" / f"seed_{int(seed)}",
+                shared=shared,
+                pretokenized_dir=Path(args.pretokenized_dir),
+                neighbor_cache_dir=Path(args.neighbor_cache_dir),
+                args=args,
+                smoke=False,
+            )
+        )
+    write_aggregate_outputs(
+        per_seed,
+        output_root,
+        args.comparison_metrics,
+    )
+    print(f"Completed all seeds. Results: {output_root / 'results'}", flush=True)
+
+
+def run_seed(
+    *,
+    seed: int,
+    base: dict[str, Any],
+    eval_template: dict[str, Any],
+    output_dir: Path,
+    shared: Path,
+    pretokenized_dir: Path,
+    neighbor_cache_dir: Path,
+    args: argparse.Namespace,
+    smoke: bool,
+) -> dict[str, Any]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    resolved = resolve_seed_config(
+        base,
+        seed,
+        output_dir,
+        shared / "spines" / "test_spine.csv",
+        pretokenized_dir,
+        neighbor_cache_dir,
+        smoke=smoke,
+    )
+    config_path = output_dir / "config_resolved.yaml"
+    write_yaml(resolved, config_path)
+    eval_resolved = resolve_evaluation_config(
+        eval_template,
+        shared / "spines" / "train_real.csv",
+        shared / "spines" / "test_real.csv",
+        output_dir / "samples" / "synthetic_interactions.csv",
+        ConditionalTABDLMSchema.from_config_dict(resolved),
+        seed,
+    )
+    eval_path = output_dir / "evaluation_config_resolved.yaml"
+    write_yaml(eval_resolved, eval_path)
+    checkpoint = output_dir / "checkpoints" / "best.pt"
+    synthetic = output_dir / "samples" / "synthetic_interactions.csv"
+    paper_metrics = output_dir / "evaluation" / "paper_grade" / "metrics.json"
+    if (
+        args.skip_existing
+        and checkpoint.exists()
+        and synthetic.exists()
+        and paper_metrics.exists()
+    ):
+        print(f"[seed {seed}] reusing completed run at {output_dir}", flush=True)
+        return collect_seed_result(seed, output_dir)
+
+    train_command = [
+        python(),
+        "src/scripts/train_lstm_joint_full_review_text.py",
+        "--config",
+        str(config_path),
+        "--pretokenized-dir",
+        str(pretokenized_dir),
+        "--neighbor-cache-dir",
+        str(neighbor_cache_dir),
+        "--output-dir",
+        str(output_dir),
+        "--device",
+        args.device,
+        "--mixed-precision",
+        "--seed",
+        str(seed),
+    ]
+    run_stage(
+        train_command,
+        output_dir / "logs" / "train.log",
+        args,
+    )
+    if not args.dry_run:
+        require_file(checkpoint, f"best checkpoint for seed {seed}")
+
+    sample_rows = str(args.smoke_rows) if smoke else "all"
+    run_stage(
+        [
+            python(),
+            "src/scripts/sample_lstm_joint_full_review_text_fast.py",
+            "--config",
+            str(config_path),
+            "--checkpoint",
+            str(checkpoint),
+            "--synthetic-spine",
+            str(shared / "spines" / "test_spine.csv"),
+            "--graph-history-prefix",
+            str(shared / "spines" / "history_prefix_spine.csv"),
+            "--output",
+            str(synthetic),
+            "--num-rows",
+            sample_rows,
+            "--batch-size",
+            str(args.sample_batch_size),
+            "--device",
+            args.device,
+            "--seed",
+            str(seed),
+            "--mixed-precision",
+            "--cache-graph-context",
+            "--profile",
+        ],
+        output_dir / "logs" / "sample.log",
+        args,
+    )
+    if not args.dry_run:
+        validation = validate_sampled_table(
+            shared / "spines" / "test_spine.csv",
+            synthetic,
+            shared / "spines" / "train_real.csv",
+            ConditionalTABDLMSchema.from_config_dict(resolved),
+            num_rows=int(args.smoke_rows) if smoke else None,
+        )
+        write_json(validation, output_dir / "sampling_validation.json")
+        if not validation["valid"]:
+            raise RuntimeError(
+                f"Sample validation failed for seed {seed}: {validation['errors']}"
+            )
+
+    real_for_eval = shared / "spines" / "test_real.csv"
+    eval_command = [
+        python(),
+        "src/scripts/evaluate_single_event_table_paper_metrics.py",
+        "--config",
+        str(eval_path),
+        "--real-table",
+        str(real_for_eval),
+        "--synthetic-table",
+        str(synthetic),
+        "--output-dir",
+        str(output_dir / "evaluation" / "paper_grade"),
+        "--seed",
+        str(seed),
+    ]
+    if smoke:
+        eval_command.extend(["--sample-size", str(args.smoke_rows)])
+    run_stage(
+        eval_command,
+        output_dir / "logs" / "evaluate.log",
+        args,
+    )
+    run_stage(
+        [
+            python(),
+            "src/scripts/evaluate_lstm_attribute_diagnostics.py",
+            "--config",
+            str(config_path),
+            "--train-real",
+            str(shared / "spines" / "train_real.csv"),
+            "--evaluation-real",
+            str(real_for_eval),
+            "--synthetic",
+            str(synthetic),
+            "--graph-history-prefix",
+            str(shared / "spines" / "history_prefix_spine.csv"),
+            "--output",
+            str(
+                output_dir
+                / "evaluation"
+                / "attribute_diagnostics.json"
+            ),
+            "--seed",
+            str(seed),
+        ],
+        output_dir / "logs" / "attribute_diagnostics.log",
+        args,
+    )
+    return collect_seed_result(seed, output_dir)
+
+
+def resolve_seed_config(
+    base: dict[str, Any],
+    seed: int,
+    output_dir: Path,
+    test_spine: Path,
+    pretokenized_dir: Path,
+    neighbor_cache_dir: Path,
+    *,
+    smoke: bool,
+) -> dict[str, Any]:
+    resolved = copy.deepcopy(base)
+    paths = resolved.setdefault("paths", {})
+    paths["output_dir"] = str(output_dir)
+    paths["synthetic_spine_path"] = str(test_spine)
+    paths["pretokenized_dir"] = str(pretokenized_dir)
+    paths["neighbor_cache_dir"] = str(neighbor_cache_dir)
+    training = resolved.setdefault("training", {})
+    training["seed"] = int(seed)
+    sampling = resolved.setdefault("sampling", {})
+    sampling["seed"] = int(seed)
+    sampling["num_rows"] = "all"
+    if smoke:
+        training["max_steps"] = 2
+        training["steps_per_eval"] = 1
+        training["steps_per_checkpoint"] = 1
+        training["validation_max_batches"] = 2
+        training["early_stopping_patience"] = 2
+    resolved.setdefault("experiment_metadata", {})["seed"] = int(seed)
+    resolved["experiment_metadata"]["baseline_architecture_changed"] = False
+    return resolved
+
+
+def resolve_evaluation_config(
+    template: dict[str, Any],
+    train_real_path: Path,
+    test_real_path: Path,
+    synthetic_path: Path,
+    schema: ConditionalTABDLMSchema,
+    seed: int,
+) -> dict[str, Any]:
+    resolved = copy.deepcopy(template)
+    resolved["real_table_path"] = str(test_real_path)
+    resolved["synthetic_table_path"] = str(synthetic_path)
+    resolved.setdefault("evaluation", {})["random_seed"] = int(seed)
+    train = pd.read_csv(train_real_path, low_memory=False)
+    columns = resolved.setdefault("table", {}).setdefault("columns", {})
+    for column in schema.categorical_targets:
+        if column in train and column in columns:
+            values = train[column].dropna().drop_duplicates().tolist()
+            columns[column]["valid_values"] = [
+                value.item() if isinstance(value, np.generic) else value
+                for value in values
+            ]
+    for column in schema.numerical_targets:
+        if column in train and column in columns:
+            values = pd.to_numeric(train[column], errors="coerce").dropna()
+            if len(values):
+                columns[column]["support"] = {
+                    "min": float(values.min()),
+                    "max": float(values.max()),
+                }
+    return resolved
+
+
+def validate_sampled_table(
+    spine_path: Path,
+    synthetic_path: Path,
+    train_path: Path,
+    schema: ConditionalTABDLMSchema,
+    num_rows: int | None,
+) -> dict[str, Any]:
+    spine = pd.read_csv(spine_path, low_memory=False)
+    if num_rows is not None:
+        spine = spine.head(int(num_rows)).copy()
+    synthetic = pd.read_csv(synthetic_path, low_memory=False)
+    train = pd.read_csv(train_path, low_memory=False)
+    errors = []
+    expected_columns = [
+        *(
+            ["event_id"]
+            if "event_id" in spine.columns
+            else []
+        ),
+        *schema.condition_columns,
+        *schema.target_columns,
+    ]
+    if list(synthetic.columns) != list(expected_columns):
+        errors.append(
+            f"Output columns differ: expected={expected_columns}, got={list(synthetic.columns)}"
+        )
+    if len(synthetic) != len(spine):
+        errors.append(
+            f"Row-count mismatch: spine={len(spine)}, synthetic={len(synthetic)}"
+        )
+    for column in [
+        *(["event_id"] if "event_id" in spine.columns else []),
+        *schema.foreign_key_columns,
+    ]:
+        if column not in synthetic:
+            continue
+        if not np.array_equal(
+            spine[column].astype(str).to_numpy(),
+            synthetic[column].astype(str).to_numpy(),
+        ):
+            errors.append(f"Pass-through column changed or was reordered: {column}")
+    for column in schema.datetime_columns:
+        if column not in synthetic:
+            continue
+        real_time = pd.to_datetime(spine[column], errors="coerce", utc=True)
+        syn_time = pd.to_datetime(synthetic[column], errors="coerce", utc=True)
+        if not real_time.equals(syn_time):
+            errors.append(f"Timestamp column changed or was reordered: {column}")
+    categorical = {}
+    for column in schema.categorical_targets:
+        domain = set(train[column].dropna().astype(str))
+        invalid = ~synthetic[column].astype(str).isin(domain)
+        categorical[column] = {
+            "train_domain": sorted(domain),
+            "invalid_count": int(invalid.sum()),
+        }
+        if invalid.any():
+            errors.append(
+                f"Categorical target {column!r} has {int(invalid.sum())} invalid values"
+            )
+    numerical = {}
+    for column in schema.numerical_targets:
+        train_values = pd.to_numeric(train[column], errors="coerce").dropna()
+        values = pd.to_numeric(synthetic[column], errors="coerce")
+        invalid = (
+            values.isna()
+            | ~np.isfinite(values)
+            | (values < train_values.min())
+            | (values > train_values.max())
+        )
+        numerical[column] = {
+            "train_min": float(train_values.min()),
+            "train_max": float(train_values.max()),
+            "invalid_or_out_of_range_count": int(invalid.sum()),
+        }
+        if invalid.any():
+            errors.append(
+                f"Numerical target {column!r} has {int(invalid.sum())} invalid/out-of-range values"
+            )
+    return {
+        "valid": not errors,
+        "errors": errors,
+        "row_count": int(len(synthetic)),
+        "expected_row_count": int(len(spine)),
+        "event_spine_preserved": not any(
+            "changed or was reordered" in error for error in errors
+        ),
+        "categorical_targets": categorical,
+        "numerical_targets": numerical,
+        "synthetic_sha256": file_sha256(synthetic_path),
+    }
+
+
+def ensure_pretokenized(
+    config_path: Path,
+    table_path: Path,
+    output_dir: Path,
+    expected_splits: dict[str, Any],
+    args: argparse.Namespace,
+    logs: Path,
+) -> None:
+    metadata_path = output_dir / "metadata.json"
+    valid = False
+    if metadata_path.exists() and not args.dry_run:
+        metadata = load_json(metadata_path)
+        expected = {
+            "train_rows": int(expected_splits["train"]["rows"]),
+            "valid_rows": int(expected_splits["validation"]["rows"]),
+            "test_rows": int(expected_splits["test"]["rows"]),
+        }
+        valid = all(int(metadata.get(key, -1)) == value for key, value in expected.items())
+        if valid:
+            print(
+                f"[pretokenized] reusing {output_dir}; split counts match {expected}",
+                flush=True,
+            )
+    if valid:
+        return
+    if output_dir.exists() and any(output_dir.iterdir()):
+        if not args.rebuild_precomputed:
+            raise RuntimeError(
+                f"Pretokenized cache at {output_dir} does not match the explicit split. "
+                "Rerun with --rebuild-precomputed."
+            )
+        shutil.rmtree(output_dir)
+    run_stage(
+        [
+            python(),
+            "src/scripts/pretokenize_single_event_table_text_fields.py",
+            "--config",
+            str(config_path),
+            "--real-table",
+            str(table_path),
+            "--output-dir",
+            str(output_dir),
+            "--chunk-size",
+            "500000",
+        ],
+        logs / "pretokenize.log",
+        args,
+    )
+
+
+def ensure_neighbor_cache(
+    config_path: Path,
+    table_path: Path,
+    output_dir: Path,
+    expected_rows: int | None,
+    args: argparse.Namespace,
+    logs: Path,
+) -> None:
+    metadata_path = output_dir / "metadata.json"
+    valid = False
+    if metadata_path.exists() and expected_rows is not None:
+        metadata = load_json(metadata_path)
+        safety = metadata.get("temporal_safety_sample") or {}
+        valid = (
+            int(metadata.get("num_rows", -1)) == int(expected_rows)
+            and int(safety.get("future_or_same_time_violations", 1)) == 0
+        )
+        if valid:
+            print(f"[neighbor-cache] reusing verified cache at {output_dir}", flush=True)
+    if valid:
+        return
+    if output_dir.exists() and any(output_dir.iterdir()):
+        if not args.rebuild_precomputed:
+            raise RuntimeError(
+                f"Neighbor cache at {output_dir} is stale or unsafe. "
+                "Rerun with --rebuild-precomputed."
+            )
+        shutil.rmtree(output_dir)
+    run_stage(
+        [
+            python(),
+            "src/scripts/precompute_temporal_neighbor_cache.py",
+            "--config",
+            str(config_path),
+            "--real-table",
+            str(table_path),
+            "--output-dir",
+            str(output_dir),
+            "--chunk-size",
+            "500000",
+        ],
+        logs / "neighbor_cache.log",
+        args,
+    )
+
+
+def collect_seed_result(seed: int, output_dir: Path) -> dict[str, Any]:
+    metrics = load_json(output_dir / "evaluation" / "paper_grade" / "metrics.json")
+    training = load_json(output_dir / "training_metadata.json")
+    sampling = load_json(
+        output_dir / "samples" / "metadata" / "runtime_sampling_fast.json"
+    )
+    summary = metrics.get("paper_metrics_summary") or {}
+    return {
+        "dataset": metrics.get("dataset", {}).get("dataset_name"),
+        "model": "lstm_v53",
+        "seed": int(seed),
+        "constraint_violation": summary.get("constraint_violation_rate"),
+        "fk_similarity": summary.get("fk_cardinality_similarity"),
+        "shape_error": summary.get("shape_error"),
+        "single_table_c2st": summary.get("single_table_c2st_error"),
+        "temporal_event_distance": summary.get("temporal_event_distance"),
+        "trend_error": summary.get("trend_error"),
+        "text_embedding_c2st": summary.get("text_embedding_c2st_error"),
+        "training_time_seconds": training.get(
+            "total_training_seconds",
+            training.get("train_time_seconds"),
+        ),
+        "sampling_time_seconds": sampling.get("total_sampling_seconds"),
+        "rows_per_second": sampling.get("rows_per_second"),
+        "peak_training_gpu_memory_mb": training.get("peak_gpu_memory_mb"),
+        "peak_sampling_gpu_memory_mb": sampling.get("peak_gpu_memory_mb"),
+        "best_checkpoint": training.get("best_checkpoint_path"),
+        "synthetic_table": str(
+            output_dir / "samples" / "synthetic_interactions.csv"
+        ),
+        "metrics_path": str(
+            output_dir / "evaluation" / "paper_grade" / "metrics.json"
+        ),
+        "resolved_config": str(output_dir / "config_resolved.yaml"),
+    }
+
+
+def write_aggregate_outputs(
+    rows: list[dict[str, Any]],
+    output_root: Path,
+    comparison_metrics: list[str],
+) -> None:
+    results_dir = output_root / "results"
+    results_dir.mkdir(parents=True, exist_ok=True)
+    frame = pd.DataFrame(rows)
+    frame.to_csv(results_dir / "per_seed_metrics.csv", index=False)
+    numeric = [
+        column
+        for column in frame.select_dtypes(include="number").columns
+        if column != "seed"
+    ]
+    aggregate: dict[str, Any] = {
+        "Dataset": frame["dataset"].iloc[0] if len(frame) else None,
+        "Model": frame["model"].iloc[0] if len(frame) else None,
+        "Seeds": ",".join(str(seed) for seed in frame["seed"].tolist()),
+        "num_seeds": int(frame["seed"].nunique()),
+    }
+    for column in numeric:
+        values = pd.to_numeric(frame[column], errors="coerce").dropna()
+        aggregate[f"{column}_mean"] = float(values.mean()) if len(values) else None
+        aggregate[f"{column}_std"] = (
+            float(values.std(ddof=1)) if len(values) > 1 else 0.0
+        )
+    aggregate_frame = pd.DataFrame([aggregate])
+    aggregate_frame.to_csv(results_dir / "aggregate_mean_std.csv", index=False)
+    summary = {
+        "per_seed": rows,
+        "aggregate": aggregate,
+        "metric_direction": {
+            "constraint_violation": "lower is better; zero is ideal",
+            "fk_similarity": "higher is better",
+            "shape_error": "lower is better",
+            "single_table_c2st": "lower is better; zero corresponds to chance AUC",
+            "temporal_event_distance": "lower is better",
+            "trend_error": "lower is better",
+        },
+    }
+    write_json(summary, results_dir / "summary.json")
+    (results_dir / "report.md").write_text(
+        aggregate_markdown(frame, aggregate),
+        encoding="utf-8",
+    )
+    if comparison_metrics:
+        write_comparison(comparison_metrics, frame, results_dir)
+
+
+def aggregate_markdown(
+    per_seed: pd.DataFrame,
+    aggregate: dict[str, Any],
+) -> str:
+    lines = [
+        "# Multi-seed LSTM Attribute Experiment",
+        "",
+        f"- Dataset: {aggregate.get('Dataset')}",
+        f"- Model: {aggregate.get('Model')}",
+        f"- Seeds: {aggregate.get('Seeds')}",
+        "",
+        "## Aggregate",
+        "",
+        "| Metric | Mean | Std |",
+        "| --- | ---: | ---: |",
+    ]
+    for metric in [
+        "constraint_violation",
+        "fk_similarity",
+        "shape_error",
+        "single_table_c2st",
+        "temporal_event_distance",
+        "trend_error",
+        "training_time_seconds",
+        "sampling_time_seconds",
+        "rows_per_second",
+    ]:
+        lines.append(
+            f"| {metric} | {format_value(aggregate.get(metric + '_mean'))} | "
+            f"{format_value(aggregate.get(metric + '_std'))} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Interpretation",
+            "",
+            "- Structural FK and timestamp metrics are evaluated on a fixed held-out event spine; they verify preservation rather than event-spine generation quality.",
+            "- Rel-HM is a text-free mixed-attribute task: `price` is numerical and `sales_channel_id` is categorical.",
+            "- Compare stability and validity across datasets, but do not rank datasets solely by raw C2ST because their schemas differ.",
+            "",
+            "## Per-seed artifacts",
+            "",
+        ]
+    )
+    for _, row in per_seed.iterrows():
+        lines.append(
+            f"- Seed {int(row['seed'])}: checkpoint `{row['best_checkpoint']}`, "
+            f"synthetic table `{row['synthetic_table']}`, metrics `{row['metrics_path']}`"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def write_comparison(
+    paths: list[str],
+    rel_hm: pd.DataFrame,
+    results_dir: Path,
+) -> None:
+    rows = []
+    for raw_path in paths:
+        path = Path(raw_path)
+        if not path.exists():
+            continue
+        metrics = load_json(path)
+        summary = metrics.get("paper_metrics_summary") or {}
+        rows.append(
+            {
+                "dataset": metrics.get("dataset", {}).get("dataset_name"),
+                "metrics_path": str(path),
+                **summary,
+            }
+        )
+    rows.append(
+        {
+            "dataset": rel_hm["dataset"].iloc[0],
+            "metrics_path": "three-seed aggregate; see aggregate_mean_std.csv",
+            "constraint_violation_rate": rel_hm["constraint_violation"].mean(),
+            "fk_cardinality_similarity": rel_hm["fk_similarity"].mean(),
+            "shape_error": rel_hm["shape_error"].mean(),
+            "single_table_c2st_error": rel_hm["single_table_c2st"].mean(),
+            "temporal_event_distance": rel_hm["temporal_event_distance"].mean(),
+            "trend_error": rel_hm["trend_error"].mean(),
+        }
+    )
+    pd.DataFrame(rows).to_csv(
+        results_dir / "cross_dataset_context.csv",
+        index=False,
+    )
+
+
+def experiment_inventory(
+    config: ConditionalTABDLMConfig,
+    config_path: Path,
+    eval_config_path: Path,
+) -> dict[str, Any]:
+    table = config.train_data_path
+    header = pd.read_csv(table, nrows=0)
+    return {
+        "model_config": str(config_path),
+        "evaluation_config": str(eval_config_path),
+        "interaction_table": str(table),
+        "interaction_columns": list(header.columns),
+        "event_spine_columns": list(config.schema.condition_columns),
+        "generated_attributes": list(config.schema.target_columns),
+        "configured_output_dir": str(config.output_dir),
+        "existing_checkpoints": sorted(
+            str(path)
+            for path in config.output_dir.rglob("*.pt")
+        )
+        if config.output_dir.exists()
+        else [],
+        "existing_synthetic_tables": sorted(
+            str(path)
+            for path in config.output_dir.rglob("*synthetic*.csv")
+        )
+        if config.output_dir.exists()
+        else [],
+        "git_commit": git_revision(),
+        "config_sha256": file_sha256(config_path),
+        "table_sha256": file_sha256(table),
+    }
+
+
+def run_stage(
+    command: list[str],
+    log_path: Path,
+    args: argparse.Namespace,
+) -> None:
+    print("$ " + " ".join(command), flush=True)
+    if args.dry_run:
+        return
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    with log_path.open("w", encoding="utf-8") as log:
+        process = subprocess.Popen(
+            command,
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            env=env,
+        )
+        assert process.stdout is not None
+        for line in process.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            log.write(line)
+            log.flush()
+        return_code = process.wait()
+    if return_code:
+        raise subprocess.CalledProcessError(return_code, command)
+
+
+def require_file(path: Path, description: str) -> None:
+    if not path.is_file():
+        raise FileNotFoundError(f"Missing {description}: {path}")
+
+
+def load_yaml(path: str | Path) -> dict[str, Any]:
+    with Path(path).open(encoding="utf-8") as handle:
+        return yaml.safe_load(handle)
+
+
+def write_yaml(value: dict[str, Any], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        yaml.safe_dump(value, sort_keys=False),
+        encoding="utf-8",
+    )
+
+
+def load_json(path: str | Path) -> dict[str, Any]:
+    with Path(path).open(encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def write_json(value: Any, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(value, indent=2, sort_keys=True, default=json_scalar) + "\n",
+        encoding="utf-8",
+    )
+
+
+def json_scalar(value: Any) -> Any:
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, Path):
+        return str(value)
+    raise TypeError(f"Cannot serialize {type(value).__name__}")
+
+
+def file_sha256(path: str | Path, chunk_size: int = 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def git_revision() -> str | None:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=ROOT,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        return None
+
+
+def python() -> str:
+    return sys.executable
+
+
+def format_value(value: Any) -> str:
+    try:
+        return f"{float(value):.6f}"
+    except (TypeError, ValueError):
+        return "NA"
+
+
+if __name__ == "__main__":
+    main()

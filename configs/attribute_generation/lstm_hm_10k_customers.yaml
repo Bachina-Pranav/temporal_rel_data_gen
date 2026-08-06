@@ -40,6 +40,7 @@ columns:
 
 schema:
   fields:
+    event_id: {role: primary_key, semantic_type: id}
     customer_id: {role: source_foreign_key, semantic_type: foreign_key}
     article_id: {role: destination_foreign_key, semantic_type: foreign_key}
     event_time: {role: timestamp, semantic_type: datetime}
@@ -54,6 +55,7 @@ schema:
       role: generated_attribute
       semantic_type: categorical
       nullable: false
+    split: {role: split, semantic_type: categorical}
 
 numerical:
   price:

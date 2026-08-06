@@ -15,6 +15,7 @@ from attribute_generation.conditional_tabdlm.lstm_fast_sampler import (  # noqa:
     FastSamplerOptions,
     materialize_batch_output,
 )
+from attribute_generation.conditional_tabdlm.schema import ConditionalTABDLMSchema  # noqa: E402
 from attribute_generation.conditional_tabdlm.runtime_profiler import RuntimeProfiler  # noqa: E402
 from lstm_fast_sampler_test_utils import make_lstm_fast_fixture  # noqa: E402
 
@@ -39,3 +40,43 @@ def test_lstm_fast_sampler_output_schema():
     output = materialize_batch_output(batch, config.schema, vocabs, tokenizer, RuntimeProfiler(), FastSamplerOptions())
 
     assert list(output.columns) == ["customer_id", "product_id", "review_time", "rating", "verified", "summary", "review_text"]
+
+
+def test_lstm_fast_sampler_preserves_event_id_and_materializes_numerical_targets():
+    frame, _, vocabs, tokenizer, _ = make_lstm_fast_fixture()
+    frame.insert(0, "event_id", ["e1", "e2", "e3", "e4"])
+    schema = ConditionalTABDLMSchema(
+        foreign_key_columns=("customer_id", "product_id"),
+        datetime_columns=("review_time",),
+        categorical_targets=("rating", "verified"),
+        numerical_targets=("price",),
+    )
+    batch = BatchSample(
+        frame=frame.head(2),
+        categorical={"rating": [5, 4], "verified": ["True", "False"]},
+        numerical={"price": [0.10, 0.20]},
+        text_ids={},
+        text={},
+        text_lengths={},
+    )
+
+    output = materialize_batch_output(
+        batch,
+        schema,
+        vocabs,
+        tokenizer,
+        RuntimeProfiler(),
+        FastSamplerOptions(),
+    )
+
+    assert list(output.columns) == [
+        "event_id",
+        "customer_id",
+        "product_id",
+        "review_time",
+        "rating",
+        "verified",
+        "price",
+    ]
+    assert output["event_id"].tolist() == ["e1", "e2"]
+    assert output["price"].tolist() == [0.10, 0.20]
