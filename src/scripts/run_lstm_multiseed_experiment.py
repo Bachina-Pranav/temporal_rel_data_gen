@@ -198,6 +198,12 @@ def run_seed(
     smoke: bool,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
+    real_for_eval = prepare_evaluation_real(
+        shared / "spines" / "test_real.csv",
+        output_dir,
+        smoke_rows=int(args.smoke_rows) if smoke else None,
+        dry_run=bool(args.dry_run),
+    )
     resolved = resolve_seed_config(
         base,
         seed,
@@ -212,7 +218,7 @@ def run_seed(
     eval_resolved = resolve_evaluation_config(
         eval_template,
         shared / "spines" / "train_real.csv",
-        shared / "spines" / "test_real.csv",
+        real_for_eval,
         output_dir / "samples" / "synthetic_interactions.csv",
         ConditionalTABDLMSchema.from_config_dict(resolved),
         seed,
@@ -222,11 +228,15 @@ def run_seed(
     checkpoint = output_dir / "checkpoints" / "best.pt"
     synthetic = output_dir / "samples" / "synthetic_interactions.csv"
     paper_metrics = output_dir / "evaluation" / "paper_grade" / "metrics.json"
+    attribute_diagnostics = output_dir / "evaluation" / "attribute_diagnostics.json"
     if (
         args.skip_existing
         and checkpoint.exists()
         and synthetic.exists()
         and paper_metrics.exists()
+        and attribute_diagnostics.exists()
+        and (output_dir / "sampling_validation.json").exists()
+        and (output_dir / "training_metadata.json").exists()
     ):
         print(f"[seed {seed}] reusing completed run at {output_dir}", flush=True)
         return collect_seed_result(seed, output_dir)
@@ -300,7 +310,6 @@ def run_seed(
                 f"Sample validation failed for seed {seed}: {validation['errors']}"
             )
 
-    real_for_eval = shared / "spines" / "test_real.csv"
     eval_command = [
         python(),
         "src/scripts/evaluate_single_event_table_paper_metrics.py",
@@ -349,6 +358,27 @@ def run_seed(
         args,
     )
     return collect_seed_result(seed, output_dir)
+
+
+def prepare_evaluation_real(
+    test_real_path: Path,
+    output_dir: Path,
+    *,
+    smoke_rows: int | None,
+    dry_run: bool,
+) -> Path:
+    if smoke_rows is None:
+        return test_real_path
+    smoke_path = output_dir / "evaluation_real_smoke.csv"
+    if not dry_run:
+        real = pd.read_csv(
+            test_real_path,
+            nrows=int(smoke_rows),
+            low_memory=False,
+        )
+        smoke_path.parent.mkdir(parents=True, exist_ok=True)
+        real.to_csv(smoke_path, index=False)
+    return smoke_path
 
 
 def resolve_seed_config(
@@ -606,12 +636,16 @@ def ensure_neighbor_cache(
 
 def collect_seed_result(seed: int, output_dir: Path) -> dict[str, Any]:
     metrics = load_json(output_dir / "evaluation" / "paper_grade" / "metrics.json")
+    attribute_diagnostics_path = (
+        output_dir / "evaluation" / "attribute_diagnostics.json"
+    )
+    attribute_diagnostics = load_json(attribute_diagnostics_path)
     training = load_json(output_dir / "training_metadata.json")
     sampling = load_json(
         output_dir / "samples" / "metadata" / "runtime_sampling_fast.json"
     )
     summary = metrics.get("paper_metrics_summary") or {}
-    return {
+    result = {
         "dataset": metrics.get("dataset", {}).get("dataset_name"),
         "model": "lstm_v53",
         "seed": int(seed),
@@ -637,8 +671,40 @@ def collect_seed_result(seed: int, output_dir: Path) -> dict[str, Any]:
         "metrics_path": str(
             output_dir / "evaluation" / "paper_grade" / "metrics.json"
         ),
+        "attribute_diagnostics_path": str(attribute_diagnostics_path),
         "resolved_config": str(output_dir / "config_resolved.yaml"),
     }
+    result.update(
+        flatten_numeric_scalars(
+            attribute_diagnostics,
+            prefix="attribute",
+        )
+    )
+    return result
+
+
+def flatten_numeric_scalars(
+    value: Any,
+    *,
+    prefix: str,
+) -> dict[str, float | int]:
+    flattened: dict[str, float | int] = {}
+    if isinstance(value, dict):
+        for key, child in value.items():
+            child_prefix = f"{prefix}.{key}" if prefix else str(key)
+            flattened.update(
+                flatten_numeric_scalars(child, prefix=child_prefix)
+            )
+    elif isinstance(value, (int, float, np.integer, np.floating)):
+        numeric = float(value)
+        if np.isfinite(numeric):
+            flattened[prefix] = (
+                int(value)
+                if isinstance(value, (int, np.integer))
+                and not isinstance(value, bool)
+                else numeric
+            )
+    return flattened
 
 
 def write_aggregate_outputs(

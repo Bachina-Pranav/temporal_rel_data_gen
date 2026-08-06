@@ -175,8 +175,11 @@ def sample_lstm_fast_from_config(
     top_p = options.categorical_top_p
     if top_p is None:
         top_p = sampling_scalar(sampling, "top_p", "categorical", 0.95)
-    numerical_temperature = float(
-        sampling.get("numerical_temperature", sampling.get("temperature", 0.9))
+    numerical_temperature = sampling_scalar(
+        sampling,
+        "numerical_temperature",
+        "numerical",
+        sampling_scalar(sampling, "temperature", "numerical", 0.9),
     )
     numerical_metadata = (
         ckpt_config.raw.get("_numerical_metadata")

@@ -1133,6 +1133,10 @@ def run_lstm_fixed_steps(
             clip_norm,
         )
         last_gradient_norm = float(gradient_norm.detach().cpu())
+        if not math.isfinite(last_gradient_norm):
+            raise FloatingPointError(
+                f"Non-finite LSTM gradient norm at optimizer step {step}"
+            )
         scaler.step(optimizer)
         scaler.update()
         optimizer.zero_grad(set_to_none=True)

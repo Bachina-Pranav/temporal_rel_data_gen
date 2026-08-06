@@ -81,10 +81,18 @@ def featurize_real_synthetic(
 def featurize_frame(frame: pd.DataFrame, table_cfg: dict[str, Any]) -> tuple[np.ndarray, list[str]]:
     pieces: list[np.ndarray] = []
     names: list[str] = []
+    primary_key = table_cfg.get("primary_key")
+    primary_keys = (
+        {str(value) for value in primary_key}
+        if isinstance(primary_key, (list, tuple, set))
+        else ({str(primary_key)} if primary_key else set())
+    )
     for column, cfg in (table_cfg.get("columns", {}) or {}).items():
         if column not in frame:
             continue
         col_type = str((cfg or {}).get("type", "categorical")).lower()
+        if column in primary_keys or col_type in {"primary_key", "id"}:
+            continue
         if col_type in {"numerical", "numeric", "number"}:
             parsed = numeric_series(frame[column])
             values = parsed.fillna(0.0).to_numpy(dtype=float)

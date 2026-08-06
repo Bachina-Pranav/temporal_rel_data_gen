@@ -135,8 +135,9 @@ def load_config_with_overrides(args: argparse.Namespace) -> ConditionalTABDLMCon
         paths["neighbor_cache_dir"] = args.neighbor_cache_dir
     if args.amp_dtype is not None:
         training["amp_dtype"] = args.amp_dtype
-    if args.seed is not None:
-        training["seed"] = int(args.seed)
+    seed = getattr(args, "seed", None)
+    if seed is not None:
+        training["seed"] = int(seed)
     resume_from = getattr(args, "resume_from", None)
     if resume_from is not None:
         training["resume_from"] = resume_from

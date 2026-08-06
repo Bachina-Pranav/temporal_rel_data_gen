@@ -158,6 +158,53 @@ Graph conditioning is leakage-safe:
 
 ## Commands
 
+### Rigorous Three-Seed Experiment
+
+The primary paper experiment uses the fixed chronological test spine, preserves
+its event IDs, foreign keys, timestamps, and order, and provides the training
+and validation spines only as past-history context. It first runs a two-step
+smoke test and proceeds to seeds 17, 42, and 73 only when the smoke test,
+sampling validation, and evaluation all pass:
+
+```bash
+bash run_rel_hm_lstm_three_seed.sh full
+```
+
+The script reuses the prepared Rel-HM tables and verified neighbor cache. It
+uses a separate `pretokenized_lstm_explicit_split` directory because older
+pretokenized caches used a legacy 90/5/5 split rather than the prepared
+70/15/15 split.
+
+To run only the smoke phase:
+
+```bash
+bash run_rel_hm_lstm_three_seed.sh smoke
+```
+
+To resume while reusing seeds that have all required artifacts:
+
+```bash
+bash run_rel_hm_lstm_three_seed.sh resume
+```
+
+The consolidated outputs are written under:
+
+```text
+outputs/hm-10k-customers/lstm_v53_three_seed/
+```
+
+In particular:
+
+- `shared/audit/`: strict dataset audit JSON, CSV, and Markdown
+- `shared/c2st_integrity_audit.json`: C2ST controls
+- `runs/seed_{17,42,73}/`: resolved configs, checkpoints, samples, logs, and metrics
+- `results/per_seed_metrics.csv`: one row per seed
+- `results/aggregate_mean_std.csv`: mean and standard deviation
+- `results/summary.json`: machine-readable consolidated result
+- `results/report.md`: paper-facing interpretation
+
+### Individual Preparation Commands
+
 Build the subset:
 
 ```bash
