@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from scripts import run_lstm_multiseed_experiment as multiseed  # noqa: E402
 from scripts.run_lstm_multiseed_experiment import (  # noqa: E402
     attribute_diagnostics_command,
+    completed_stage,
     flatten_numeric_scalars,
     pretokenized_split_counts,
     prepare_evaluation_real,
@@ -114,6 +115,38 @@ def test_seed_config_uses_materialized_training_table_for_numerical_head():
         resolved["paths"]["numerical_head_training_table_path"]
         == "train_real.csv"
     )
+
+
+def test_smoke_seed_config_caps_epoch_and_fixed_step_training():
+    resolved = resolve_seed_config(
+        {
+            "paths": {},
+            "training": {"epochs": 50, "max_steps": 20_000},
+            "sampling": {},
+        },
+        42,
+        Path("run"),
+        Path("test_spine.csv"),
+        Path("pretokenized"),
+        Path("neighbor_cache"),
+        smoke=True,
+    )
+
+    assert resolved["training"]["epochs"] == 2
+    assert resolved["training"]["max_steps"] == 2
+
+
+def test_completed_stage_requires_skip_flag_and_every_artifact(
+    tmp_path: Path,
+):
+    first = tmp_path / "first.json"
+    second = tmp_path / "second.json"
+    first.write_text("{}\n", encoding="utf-8")
+
+    assert not completed_stage(True, first, second)
+    second.write_text("{}\n", encoding="utf-8")
+    assert not completed_stage(False, first, second)
+    assert completed_stage(True, first, second)
 
 
 def test_pretokenized_split_counts_read_actual_index_arrays(

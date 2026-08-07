@@ -535,6 +535,12 @@ def dependency_metrics(
             for column in schema.categorical_targets
         }
     )
+    columns.update(
+        {
+            column: {"type": "text"}
+            for column in schema.text_targets
+        }
+    )
     timestamp = schema.datetime_columns[0]
     columns[timestamp] = {"type": "datetime"}
     pairs = []

@@ -277,26 +277,26 @@ def run_seed(
     eval_path = output_dir / "evaluation_config_resolved.yaml"
     write_yaml(eval_resolved, eval_path)
     checkpoint = output_dir / "checkpoints" / "best.pt"
+    training_metadata = output_dir / "training_metadata.json"
     synthetic = output_dir / "samples" / "synthetic_interactions.csv"
+    sampling_runtime = (
+        output_dir / "samples" / "metadata" / "runtime_sampling_fast.json"
+    )
+    sampling_validation = output_dir / "sampling_validation.json"
     paper_metrics = output_dir / "evaluation" / "paper_grade" / "metrics.json"
     attribute_diagnostics = output_dir / "evaluation" / "attribute_diagnostics.json"
     if (
         args.skip_existing
-        and checkpoint.exists()
-        and synthetic.exists()
-        and paper_metrics.exists()
-        and attribute_diagnostics.exists()
-        and (output_dir / "sampling_validation.json").exists()
-        and (output_dir / "training_metadata.json").exists()
+        and checkpoint.is_file()
+        and training_metadata.is_file()
+        and synthetic.is_file()
+        and sampling_runtime.is_file()
+        and sampling_validation.is_file()
+        and paper_metrics.is_file()
+        and attribute_diagnostics.is_file()
     ):
         print(f"[seed {seed}] reusing completed run at {output_dir}", flush=True)
         return collect_seed_result(seed, output_dir)
-    if not args.dry_run:
-        require_free_disk_space(
-            output_dir,
-            minimum_gb=float(args.minimum_free_disk_gb),
-            context=f"seed {seed} training",
-        )
 
     train_command = [
         python(),
@@ -315,11 +315,25 @@ def run_seed(
         "--seed",
         str(seed),
     ]
-    run_stage(
-        train_command,
-        output_dir / "logs" / "train.log",
-        args,
+    training_reused = completed_stage(
+        args.skip_existing,
+        checkpoint,
+        training_metadata,
     )
+    if training_reused:
+        print(f"[seed {seed}] reusing completed training", flush=True)
+    else:
+        if not args.dry_run:
+            require_free_disk_space(
+                output_dir,
+                minimum_gb=float(args.minimum_free_disk_gb),
+                context=f"seed {seed} training",
+            )
+        run_stage(
+            train_command,
+            output_dir / "logs" / "train.log",
+            args,
+        )
     if not args.dry_run:
         require_file(checkpoint, f"best checkpoint for seed {seed}")
 
@@ -356,20 +370,32 @@ def run_seed(
             "src/scripts/"
             "sample_lstm_joint_length_preserving_privacy_fast.py"
         )
-    run_stage(
-        sample_command,
-        output_dir / "logs" / "sample.log",
-        args,
+    sampling_reused = completed_stage(
+        args.skip_existing,
+        synthetic,
+        sampling_runtime,
     )
-    if not args.dry_run:
-        validation = validate_sampled_table(
-            Path(evaluation_scope["spine"]),
-            synthetic,
-            shared / "spines" / "train_real.csv",
-            ConditionalTABDLMSchema.from_config_dict(resolved),
-            num_rows=int(args.smoke_rows) if smoke else None,
+    if sampling_reused:
+        print(f"[seed {seed}] reusing completed sampling", flush=True)
+    else:
+        run_stage(
+            sample_command,
+            output_dir / "logs" / "sample.log",
+            args,
         )
-        write_json(validation, output_dir / "sampling_validation.json")
+    if not args.dry_run:
+        if sampling_reused and sampling_validation.is_file():
+            print(f"[seed {seed}] reusing sampling validation", flush=True)
+            validation = load_json(sampling_validation)
+        else:
+            validation = validate_sampled_table(
+                Path(evaluation_scope["spine"]),
+                synthetic,
+                shared / "spines" / "train_real.csv",
+                ConditionalTABDLMSchema.from_config_dict(resolved),
+                num_rows=int(args.smoke_rows) if smoke else None,
+            )
+            write_json(validation, sampling_validation)
         if not validation["valid"]:
             raise RuntimeError(
                 f"Sample validation failed for seed {seed}: {validation['errors']}"
@@ -391,34 +417,46 @@ def run_seed(
     ]
     if smoke:
         eval_command.extend(["--sample-size", str(args.smoke_rows)])
-    run_stage(
-        eval_command,
-        output_dir / "logs" / "evaluate.log",
-        args,
+    evaluation_reused = (
+        sampling_reused
+        and completed_stage(args.skip_existing, paper_metrics)
     )
-    run_stage(
-        attribute_diagnostics_command(
-            config_path=config_path,
-            evaluation_config_path=eval_path,
-            train_real_path=shared / "spines" / "train_real.csv",
-            evaluation_real_path=real_for_eval,
-            synthetic_path=synthetic,
-            graph_history_prefix_path=(
-                Path(graph_history_prefix)
-                if graph_history_prefix is not None
-                else None
+    if evaluation_reused:
+        print(f"[seed {seed}] reusing paper-grade evaluation", flush=True)
+    else:
+        run_stage(
+            eval_command,
+            output_dir / "logs" / "evaluate.log",
+            args,
+        )
+    if completed_stage(args.skip_existing, attribute_diagnostics):
+        print(f"[seed {seed}] reusing attribute diagnostics", flush=True)
+    else:
+        run_stage(
+            attribute_diagnostics_command(
+                config_path=config_path,
+                evaluation_config_path=eval_path,
+                train_real_path=shared / "spines" / "train_real.csv",
+                evaluation_real_path=real_for_eval,
+                synthetic_path=synthetic,
+                graph_history_prefix_path=(
+                    Path(graph_history_prefix)
+                    if graph_history_prefix is not None
+                    else None
+                ),
+                output_path=attribute_diagnostics,
+                seed=seed,
             ),
-            output_path=(
-                output_dir
-                / "evaluation"
-                / "attribute_diagnostics.json"
-            ),
-            seed=seed,
-        ),
-        output_dir / "logs" / "attribute_diagnostics.log",
-        args,
-    )
+            output_dir / "logs" / "attribute_diagnostics.log",
+            args,
+        )
+    if args.dry_run:
+        return {"seed": int(seed), "dry_run": True}
     return collect_seed_result(seed, output_dir)
+
+
+def completed_stage(skip_existing: bool, *artifacts: Path) -> bool:
+    return bool(skip_existing and all(path.is_file() for path in artifacts))
 
 
 def resolve_evaluation_scope(
@@ -532,6 +570,8 @@ def resolve_seed_config(
     sampling["num_rows"] = "all"
     if smoke:
         training["max_steps"] = 2
+        if "epochs" in training:
+            training["epochs"] = min(int(training["epochs"]), 2)
         training["steps_per_eval"] = 1
         training["steps_per_checkpoint"] = 1
         training["validation_max_batches"] = 2

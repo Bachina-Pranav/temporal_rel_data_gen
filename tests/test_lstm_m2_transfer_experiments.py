@@ -11,7 +11,10 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from scripts.evaluate_lstm_attribute_diagnostics import numerical_metrics  # noqa: E402
+from scripts.evaluate_lstm_attribute_diagnostics import (  # noqa: E402
+    dependency_metrics,
+    numerical_metrics,
+)
 from scripts.materialize_interaction_lstm_splits import resolve_split_labels  # noqa: E402
 from scripts.run_lstm_m2_transfer_experiments import (  # noqa: E402
     collect_metrics,
@@ -177,6 +180,33 @@ def test_numerical_metrics_include_support_tv_and_unique_count():
     assert metrics["support_total_variation"] == 0.25
     assert metrics["num_unique_real"] == 3
     assert metrics["num_unique_synthetic"] == 3
+
+
+def test_dependency_metrics_include_text_targets():
+    schema = ConditionalTABDLMSchema(
+        foreign_key_columns=("customer_id", "product_id"),
+        datetime_columns=("review_time",),
+        categorical_targets=("verified",),
+        numerical_targets=("rating",),
+        text_targets=("summary", "review_text"),
+    )
+    config = ConditionalTABDLMConfig(raw={}, schema=schema)
+    real = pd.DataFrame(
+        {
+            "review_time": pd.date_range("2020-01-01", periods=4),
+            "rating": [1.0, 2.0, 4.0, 5.0],
+            "verified": [False, True, True, False],
+            "summary": ["bad", "okay", "good", "great"],
+            "review_text": ["not good", "it is okay", "very good", "really great"],
+        }
+    )
+    synthetic = real.copy()
+
+    result = dependency_metrics(real, synthetic, config)
+
+    pairs = {(row["left"], row["right"]): row for row in result["pairs"]}
+    assert ("summary", "review_text") in pairs
+    assert pairs[("summary", "review_text")]["error"] == 0.0
 
 
 def test_full_spine_diagnostics_omit_history_prefix():
