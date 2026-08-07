@@ -30,11 +30,17 @@ def parse_args() -> argparse.Namespace:
         "--stage",
         choices=[
             "write-configs",
+            "comparability",
             "calibration",
+            "baseline-full",
             "baseline-eval",
             "smoke",
             "one-seed",
             "full",
+            "m2-support-analysis",
+            "m2-posthoc",
+            "router-regression",
+            "freeze-report",
             "summarize",
         ],
         required=True,
@@ -69,6 +75,11 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
     )
+    parser.add_argument(
+        "--tests-passed",
+        action="store_true",
+        help="Record a successful test run in the final freeze report.",
+    )
     return parser.parse_args()
 
 
@@ -88,6 +99,28 @@ def main() -> None:
     )
     if args.stage == "write-configs":
         print_paths(config_paths)
+        return
+    if args.stage == "comparability":
+        run(
+            [
+                python(),
+                "src/scripts/audit_lstm_run_comparability.py",
+                "--legacy-root",
+                str(
+                    matrix.get(
+                        "calibration_baseline_experiment_root",
+                        matrix["baseline_experiment_root"],
+                    )
+                ),
+                "--candidate-root",
+                str(matrix["baseline_experiment_root"]),
+                "--output",
+                str(output_root / "comparability_report.json"),
+                "--seeds",
+                *[str(seed) for seed in matrix["seeds"]],
+            ],
+            args,
+        )
         return
     if args.stage == "calibration":
         calibration_root = matrix.get(
@@ -115,6 +148,36 @@ def main() -> None:
         return
     if args.stage == "baseline-eval":
         refresh_baseline_evaluation(matrix, args)
+        return
+    if args.stage == "baseline-full":
+        run_baseline(matrix, args)
+        return
+    if args.stage == "m2-support-analysis":
+        run_m2_support_analysis(matrix, args)
+        return
+    if args.stage == "m2-posthoc":
+        run_m2_posthoc(matrix, args)
+        return
+    if args.stage == "router-regression":
+        run(
+            [
+                python(),
+                "src/scripts/audit_lstm_numerical_router_regressions.py",
+            ],
+            args,
+        )
+        return
+    if args.stage == "freeze-report":
+        command = [
+            python(),
+            "src/scripts/"
+            "summarize_lstm_numerical_architecture_freeze.py",
+            "--experiment-config",
+            str(args.experiment_config),
+        ]
+        if args.tests_passed:
+            command.append("--tests-passed")
+        run(command, args)
         return
     if args.stage == "summarize":
         run(
@@ -279,6 +342,157 @@ def run_context_diagnostic(
         ],
         args,
     )
+
+
+def run_baseline(
+    matrix: dict[str, Any],
+    args: argparse.Namespace,
+) -> None:
+    command = [
+        python(),
+        "src/scripts/run_lstm_multiseed_experiment.py",
+        "--config",
+        str(matrix["base_config"]),
+        "--evaluation-config",
+        str(matrix["evaluation_config"]),
+        "--output-root",
+        str(matrix["baseline_experiment_root"]),
+        "--pretokenized-dir",
+        str(matrix["pretokenized_dir"]),
+        "--neighbor-cache-dir",
+        str(matrix["neighbor_cache_dir"]),
+        "--device",
+        args.device,
+        "--sample-batch-size",
+        str(args.sample_batch_size),
+        "--seeds",
+        *[str(seed) for seed in matrix["seeds"]],
+        "--skip-smoke",
+        "--skip-existing",
+    ]
+    if args.rebuild_precomputed:
+        command.append("--rebuild-precomputed")
+    if args.dry_run:
+        command.append("--dry-run")
+    run(command, args)
+    if not args.dry_run:
+        refresh_baseline_evaluation(matrix, args)
+
+
+def run_m2_support_analysis(
+    matrix: dict[str, Any],
+    args: argparse.Namespace,
+) -> None:
+    root = Path(matrix["output_root"]) / "M2_global_support"
+    shared = root / "shared" / "spines"
+    generated = []
+    for seed in matrix["seeds"]:
+        output = (
+            root
+            / "diagnostics"
+            / "validation_generation"
+            / f"seed_{seed}.csv"
+        )
+        if not (args.skip_existing and output.exists()):
+            run(
+                [
+                    python(),
+                    "src/scripts/sample_lstm_joint_full_review_text_fast.py",
+                    "--config",
+                    str(
+                        root
+                        / "runs"
+                        / f"seed_{seed}"
+                        / "config_resolved.yaml"
+                    ),
+                    "--checkpoint",
+                    str(
+                        root
+                        / "runs"
+                        / f"seed_{seed}"
+                        / "checkpoints"
+                        / "best.pt"
+                    ),
+                    "--synthetic-spine",
+                    str(shared / "validation_spine.csv"),
+                    "--graph-history-prefix",
+                    str(shared / "train_spine.csv"),
+                    "--output",
+                    str(output),
+                    "--num-rows",
+                    "all",
+                    "--batch-size",
+                    str(args.sample_batch_size),
+                    "--device",
+                    args.device,
+                    "--seed",
+                    str(seed),
+                    "--mixed-precision",
+                    "--cache-graph-context",
+                ],
+                args,
+            )
+        generated.append(f"seed_{seed}={output}")
+    command = [
+        python(),
+        "src/scripts/analyze_m2_support_calibration.py",
+        "--train-real",
+        str(shared / "train_real.csv"),
+        "--validation-real",
+        str(shared / "validation_real.csv"),
+        "--synthetic",
+        *generated,
+        "--numerical-columns",
+        *numerical_columns(matrix["base_config"]),
+        "--output-dir",
+        str(
+            Path(matrix["output_root"])
+            / "m2_support_calibration"
+        ),
+    ]
+    run(command, args)
+
+
+def run_m2_posthoc(
+    matrix: dict[str, Any],
+    args: argparse.Namespace,
+) -> None:
+    run(
+        [
+            python(),
+            "src/scripts/run_m2_posthoc_support_calibration.py",
+            "--experiment-root",
+            str(
+                Path(matrix["output_root"]) / "M2_global_support"
+            ),
+            "--seed",
+            str(matrix["first_seed"]),
+            "--output-dir",
+            str(
+                Path(matrix["output_root"])
+                / "M2C_posthoc_calibrated_support"
+                / f"seed_{matrix['first_seed']}"
+            ),
+            "--device",
+            args.device,
+            "--batch-size",
+            str(args.sample_batch_size),
+        ],
+        args,
+    )
+
+
+def numerical_columns(config_path: str | Path) -> list[str]:
+    config = load_yaml(config_path)
+    return [
+        str(column)
+        for column in (
+            ((config.get("columns") or {}).get("target") or {}).get(
+                "numerical",
+                [],
+            )
+        )
+    ]
 
 
 def refresh_baseline_evaluation(

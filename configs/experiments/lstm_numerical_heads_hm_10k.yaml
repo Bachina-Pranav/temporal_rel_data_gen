@@ -44,7 +44,7 @@ variants:
   M2_global_support:
     description: Training-derived support output with the original shared row conditioning.
     numerical_heads:
-      mode: auto
+      mode: support
       conditioning:
         explicit_destination: false
       prior:
@@ -53,7 +53,7 @@ variants:
   M3_destination_support:
     description: Support output plus explicit gated destination conditioning.
     numerical_heads:
-      mode: auto
+      mode: support
       conditioning:
         explicit_destination: true
       prior:
@@ -62,7 +62,7 @@ variants:
   M4_destination_support_prior:
     description: M3 plus smoothed destination/frequency/time/global support priors.
     numerical_heads:
-      mode: auto
+      mode: support
       conditioning:
         explicit_destination: true
       prior:
@@ -76,3 +76,75 @@ variants:
         frequency_smoothing: 100.0
         destination_smoothing: 20.0
         epsilon: 1.0e-8
+
+  M2P_R0_global_prior:
+    description: Pure smoothed empirical training-support prior with no neural residual.
+    numerical_heads:
+      mode: support_prior
+      class_frequency_weighting: none
+      conditioning:
+        explicit_destination: false
+      prior:
+        enabled: false
+      global_prior:
+        enabled: true
+        alpha: 1.0
+        smoothing: 1.0
+        residual_weight: 0.0
+        residual_temperature: 1.0
+        residual_norm_clip: 10.0
+        residual_init_scale: 0.001
+
+  M2P_R1_weak_residual:
+    description: Smoothed empirical training-support prior with residual weight 0.25.
+    numerical_heads:
+      mode: support_prior
+      class_frequency_weighting: none
+      conditioning:
+        explicit_destination: false
+      prior:
+        enabled: false
+      global_prior:
+        enabled: true
+        alpha: 1.0
+        smoothing: 1.0
+        residual_weight: 0.25
+        residual_temperature: 1.0
+        residual_norm_clip: 10.0
+        residual_init_scale: 0.001
+
+  M2P_R2_moderate_residual:
+    description: Smoothed empirical training-support prior with residual weight 0.5.
+    numerical_heads:
+      mode: support_prior
+      class_frequency_weighting: none
+      conditioning:
+        explicit_destination: false
+      prior:
+        enabled: false
+      global_prior:
+        enabled: true
+        alpha: 1.0
+        smoothing: 1.0
+        residual_weight: 0.5
+        residual_temperature: 1.0
+        residual_norm_clip: 10.0
+        residual_init_scale: 0.001
+
+  M2P_R3_full_residual:
+    description: Smoothed empirical training-support prior with full neural residual.
+    numerical_heads:
+      mode: support_prior
+      class_frequency_weighting: none
+      conditioning:
+        explicit_destination: false
+      prior:
+        enabled: false
+      global_prior:
+        enabled: true
+        alpha: 1.0
+        smoothing: 1.0
+        residual_weight: 1.0
+        residual_temperature: 1.0
+        residual_norm_clip: 10.0
+        residual_init_scale: 0.001

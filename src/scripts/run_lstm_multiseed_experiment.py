@@ -124,6 +124,16 @@ def main() -> None:
         args,
         logs,
     )
+    if not args.dry_run:
+        write_comparability_manifest(
+            output_root=output_root,
+            config_path=base_config_path,
+            evaluation_config_path=eval_config_path,
+            spines=shared / "spines",
+            pretokenized_dir=Path(args.pretokenized_dir),
+            neighbor_cache_dir=Path(args.neighbor_cache_dir),
+            expected_splits=expected_splits,
+        )
     run_stage(
         [
             python(),
@@ -951,6 +961,77 @@ def experiment_inventory(
         "config_sha256": file_sha256(config_path),
         "table_sha256": file_sha256(table),
     }
+
+
+def write_comparability_manifest(
+    *,
+    output_root: Path,
+    config_path: Path,
+    evaluation_config_path: Path,
+    spines: Path,
+    pretokenized_dir: Path,
+    neighbor_cache_dir: Path,
+    expected_splits: dict[str, Any],
+) -> None:
+    split_files = (
+        "train_real.csv",
+        "validation_real.csv",
+        "test_real.csv",
+        "test_spine.csv",
+        "history_prefix_spine.csv",
+    )
+    index_files = (
+        "train_indices.npy",
+        "valid_indices.npy",
+        "test_indices.npy",
+    )
+    manifest = {
+        "version": 1,
+        "git_commit": git_revision(),
+        "config_sha256": file_sha256(config_path),
+        "evaluation_config_sha256": file_sha256(
+            evaluation_config_path
+        ),
+        "c2st_source_sha256": file_sha256(
+            ROOT / "src/evaluation/paper_metrics/c2st.py"
+        ),
+        "controlled_source_fingerprints": {
+            path: file_sha256(ROOT / path)
+            for path in (
+                "src/attribute_generation/conditional_tabdlm/lstm_joint.py",
+                "src/attribute_generation/conditional_tabdlm/numerical.py",
+                "src/attribute_generation/conditional_tabdlm/numerical_head.py",
+                "src/attribute_generation/conditional_tabdlm/schema.py",
+                "src/evaluation/paper_metrics/c2st.py",
+                "src/scripts/evaluate_lstm_attribute_diagnostics.py",
+            )
+        },
+        "expected_splits": expected_splits,
+        "split_fingerprints": {
+            name: file_sha256(spines / name)
+            for name in split_files
+            if (spines / name).exists()
+        },
+        "precomputed_split_fingerprints": {
+            name: file_sha256(pretokenized_dir / name)
+            for name in index_files
+            if (pretokenized_dir / name).exists()
+        },
+        "pretokenized_metadata_sha256": (
+            file_sha256(pretokenized_dir / "metadata.json")
+            if (pretokenized_dir / "metadata.json").exists()
+            else None
+        ),
+        "neighbor_cache_metadata_sha256": (
+            file_sha256(neighbor_cache_dir / "metadata.json")
+            if (neighbor_cache_dir / "metadata.json").exists()
+            else None
+        ),
+    }
+    write_json(
+        manifest,
+        output_root / "shared" / "comparability_manifest.json",
+    )
 
 
 def run_stage(

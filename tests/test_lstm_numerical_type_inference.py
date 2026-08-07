@@ -23,7 +23,7 @@ def test_infers_low_cardinality_discrete_numerical():
     )
 
     assert report["label"] == "low_cardinality_discrete_numerical"
-    assert report["recommended_head"] == "discrete_support"
+    assert report["recommended_head"] == "support_prior"
     assert report["training_only"] is True
 
 
@@ -33,7 +33,7 @@ def test_infers_repeated_quantized_direct_support():
     report = infer_numerical_column_type(pd.Series(values))
 
     assert report["label"] == "repeated_or_quantized"
-    assert report["recommended_head"] == "discrete_support"
+    assert report["recommended_head"] == "support_prior"
     assert report["structured_signal_count"] >= 3
 
 
@@ -51,7 +51,7 @@ def test_infers_high_cardinality_structured_support():
     )
 
     assert report["label"] == "high_cardinality_structured_support"
-    assert report["recommended_head"] == "hierarchical_support"
+    assert report["recommended_head"] == "support_prior"
 
 
 def test_infers_continuous_for_nearly_unique_irregular_values():
@@ -61,7 +61,7 @@ def test_infers_continuous_for_nearly_unique_irregular_values():
     report = infer_numerical_column_type(pd.Series(values))
 
     assert report["label"] == "continuous"
-    assert report["recommended_head"] == "continuous_baseline"
+    assert report["recommended_head"] == "continuous"
 
 
 def test_multi_column_report_is_schema_driven():
@@ -80,4 +80,4 @@ def test_multi_column_report_is_schema_driven():
     )
 
     assert set(report) == {"small", "continuous"}
-    assert report["small"]["recommended_head"] == "discrete_support"
+    assert report["small"]["recommended_head"] == "support_prior"

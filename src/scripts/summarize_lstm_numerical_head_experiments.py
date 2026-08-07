@@ -420,6 +420,26 @@ def build_decision(
             "M4_destination_support_prior",
             "M3_destination_support",
         ),
+        "weak_residual_R1_minus_pure_prior_R0": model_delta(
+            means,
+            "M2P_R1_weak_residual",
+            "M2P_R0_global_prior",
+        ),
+        "moderate_residual_R2_minus_pure_prior_R0": model_delta(
+            means,
+            "M2P_R2_moderate_residual",
+            "M2P_R0_global_prior",
+        ),
+        "full_residual_R3_minus_pure_prior_R0": model_delta(
+            means,
+            "M2P_R3_full_residual",
+            "M2P_R0_global_prior",
+        ),
+        "full_prior_residual_R3_minus_ordinary_M2": model_delta(
+            means,
+            "M2P_R3_full_residual",
+            "M2_global_support",
+        ),
     }
     candidate_scores: dict[str, float] = {}
     if not means.empty:
@@ -473,9 +493,14 @@ def build_decision(
         if not frame.empty
         else set()
     )
+    complete_candidates = {
+        model: score
+        for model, score in candidate_scores.items()
+        if model in complete_models
+    }
     comparable_winner = (
-        winner
-        if winner in complete_models
+        min(complete_candidates, key=complete_candidates.get)
+        if complete_candidates
         and "M0_original_lstm_v53" in complete_models
         else None
     )
@@ -495,7 +520,7 @@ def build_decision(
     replace_default = bool(
         comparable_winner
         and all(
-            check["passed"]
+            check["status"] == "passed"
             for check in acceptance.values()
             if check["required"]
         )
@@ -648,6 +673,9 @@ def acceptance_checks(
             )
         else:
             value = values.get(metric) if metric in values else None
+        evaluable = (
+            value is not None and np.isfinite(float(value))
+        )
         passed = (
             (
                 math.isclose(
@@ -662,8 +690,8 @@ def acceptance_checks(
                     else float(value) > float(threshold)
                 )
             )
-            if value is not None and np.isfinite(float(value))
-            else False
+            if evaluable
+            else None
         )
         output[name] = {
             "metric": metric,
@@ -675,7 +703,14 @@ def acceptance_checks(
             "operation": operation,
             "threshold": float(threshold),
             "required": bool(required),
-            "passed": bool(passed),
+            "status": (
+                "passed"
+                if passed is True
+                else "failed"
+                if passed is False
+                else "not_evaluable"
+            ),
+            "passed": passed,
         }
     return output
 
@@ -730,10 +765,17 @@ def comparative_acceptance_checks(
             "operation": "all_true",
             "threshold": 1.0,
             "required": True,
-            "passed": bool(
-                len(full_improvements) == len(common)
-                and len(common) >= 3
-                and all(full_improvements)
+            "status": (
+                "not_evaluable"
+                if len(common) < 3 or not full_improvements
+                else "passed"
+                if all(full_improvements)
+                else "failed"
+            ),
+            "passed": (
+                None
+                if len(common) < 3 or not full_improvements
+                else bool(all(full_improvements))
             ),
         },
         "trend_does_not_materially_regress": {
@@ -744,9 +786,17 @@ def comparative_acceptance_checks(
             "operation": "lte",
             "threshold": 0.02,
             "required": True,
-            "passed": bool(
-                np.isfinite(trend_delta)
-                and trend_delta <= 0.02
+            "status": (
+                "not_evaluable"
+                if not np.isfinite(trend_delta)
+                else "passed"
+                if trend_delta <= 0.02
+                else "failed"
+            ),
+            "passed": (
+                None
+                if not np.isfinite(trend_delta)
+                else bool(trend_delta <= 0.02)
             ),
         },
         "categorical_tv_does_not_materially_regress": {
@@ -755,6 +805,11 @@ def comparative_acceptance_checks(
             "operation": "lte",
             "threshold": 0.05,
             "required": True,
+            "status": (
+                "passed"
+                if categorical_regression <= 0.05
+                else "failed"
+            ),
             "passed": bool(categorical_regression <= 0.05),
         },
     }

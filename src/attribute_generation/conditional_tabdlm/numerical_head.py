@@ -17,15 +17,26 @@ from .tokenization import stable_hash_bucket
 
 
 NUMERICAL_HEAD_MODES = (
+    "continuous",
     "continuous_baseline",
+    "support",
     "discrete_support",
     "hierarchical_support",
+    "support_prior",
     "auto",
 )
 
 
+def numerical_head_config(raw: dict[str, Any]) -> dict[str, Any]:
+    """Return the numerical-head config with plural keys taking precedence."""
+
+    singular = dict(raw.get("numerical_head") or {})
+    plural = dict(raw.get("numerical_heads") or {})
+    return {**singular, **plural}
+
+
 def numerical_head_feature_enabled(raw: dict[str, Any]) -> bool:
-    cfg = raw.get("numerical_heads") or {}
+    cfg = numerical_head_config(raw)
     return bool(
         "mode" in cfg
         or "columns" in cfg
@@ -140,7 +151,7 @@ def fit_numerical_head_metadata(
                 )
             }
         )
-    head_cfg = dict(config.raw.get("numerical_heads") or {})
+    head_cfg = numerical_head_config(config.raw)
     seed = int((config.raw.get("training") or {}).get("seed", 42))
     inferred = infer_numerical_types(
         original,
@@ -161,14 +172,32 @@ def fit_numerical_head_metadata(
                 f"Unsupported numerical head mode for {column!r}: "
                 f"{requested!r}"
             )
-        resolved = (
+        selected = (
             str(inferred[column]["recommended_head"])
             if requested == "auto"
-            else requested
+            else public_head_name(requested)
         )
+        resolved = resolve_implementation_mode(
+            requested=requested,
+            selected=selected,
+            support_size=int(inferred[column]["support_size"]),
+            head_cfg=head_cfg,
+            column_cfg=column_cfg,
+        )
+        if (
+            requested in {"support", "support_prior"}
+            and resolved == "continuous_baseline"
+        ):
+            raise ValueError(
+                f"Explicit {requested!r} mode for {column!r} exceeds "
+                "hierarchical_support_max_values. Increase the configured "
+                "limit deliberately or use mode='auto'/'continuous'; the "
+                "explicit head will not be silently reinterpreted."
+            )
         report: dict[str, Any] = {
             "column": column,
             "requested_mode": requested,
+            "selected_head": selected,
             "resolved_mode": resolved,
             "inferred_type": inferred[column],
             "training_only": True,
@@ -207,6 +236,9 @@ def fit_numerical_head_metadata(
                             "num_buckets",
                             262144,
                         )
+                    ),
+                    enable_global_prior=(
+                        selected == "support_prior"
                     ),
                 )
             )
@@ -300,6 +332,7 @@ def support_metadata(
     destination_hashes: np.ndarray,
     timestamps: np.ndarray,
     num_hash_buckets: int,
+    enable_global_prior: bool = False,
 ) -> dict[str, Any]:
     support_limit = int(
         column_cfg.get(
@@ -331,14 +364,24 @@ def support_metadata(
         counts,
         num_bins=num_bins,
     )
+    default_imbalance = (
+        "none" if enable_global_prior else "inverse_sqrt"
+    )
     imbalance = str(
         column_cfg.get(
             "class_frequency_weighting",
-            head_cfg.get("class_frequency_weighting", "inverse_sqrt"),
+            head_cfg.get(
+                "class_frequency_weighting",
+                default_imbalance,
+            ),
         )
     )
     weights = support_class_weights(counts, imbalance)
     prior_cfg = dict(head_cfg.get("prior") or {})
+    global_prior_cfg = {
+        **dict(head_cfg.get("global_prior") or {}),
+        **dict(column_cfg.get("global_prior") or {}),
+    }
     prior = (
         fit_support_priors(
             standardized_support,
@@ -383,6 +426,112 @@ def support_metadata(
         "hierarchical_bin_offsets": bin_offsets.tolist(),
         "hierarchical_num_bins": int(len(bin_offsets) - 1),
         "prior": prior,
+        "global_prior": fit_global_support_prior(
+            counts,
+            {
+                **global_prior_cfg,
+                "enabled": bool(enable_global_prior),
+            },
+        ),
+    }
+
+
+def public_head_name(mode: str) -> str:
+    mode = str(mode).strip().lower()
+    if mode in {"continuous", "continuous_baseline"}:
+        return "continuous"
+    if mode in {
+        "support",
+        "discrete_support",
+        "hierarchical_support",
+    }:
+        return "support"
+    if mode == "support_prior":
+        return "support_prior"
+    if mode == "auto":
+        return "auto"
+    raise ValueError(f"Unsupported numerical head mode: {mode!r}")
+
+
+def resolve_implementation_mode(
+    *,
+    requested: str,
+    selected: str,
+    support_size: int,
+    head_cfg: dict[str, Any],
+    column_cfg: dict[str, Any],
+) -> str:
+    """Resolve public routing choices to the existing decoder families."""
+
+    requested = str(requested).lower()
+    if requested in {"continuous", "continuous_baseline"}:
+        return "continuous_baseline"
+    if requested in {"discrete_support", "hierarchical_support"}:
+        return requested
+    if selected == "continuous":
+        return "continuous_baseline"
+    direct_limit = int(
+        column_cfg.get(
+            "direct_support_max_values",
+            head_cfg.get("direct_support_max_values", 8192),
+        )
+    )
+    hierarchical_limit = int(
+        (
+            column_cfg.get("type_inference") or {}
+        ).get(
+            "hierarchical_support_max_values",
+            (head_cfg.get("type_inference") or {}).get(
+                "hierarchical_support_max_values",
+                200_000,
+            ),
+        )
+    )
+    if int(support_size) <= direct_limit:
+        return "discrete_support"
+    if int(support_size) <= hierarchical_limit:
+        return "hierarchical_support"
+    return "continuous_baseline"
+
+
+def fit_global_support_prior(
+    counts: np.ndarray,
+    config: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Fit a smoothed empirical support prior from training counts only."""
+
+    raw = dict(config or {})
+    counts = np.asarray(counts, dtype=np.float64)
+    if np.any(counts < 0) or not len(counts):
+        raise ValueError("Global support-prior counts must be nonnegative")
+    smoothing = float(raw.get("smoothing", 1.0))
+    if smoothing < 0:
+        raise ValueError("Global support-prior smoothing must be nonnegative")
+    smoothed = counts + smoothing
+    denominator = float(smoothed.sum())
+    if denominator <= 0:
+        raise ValueError("Global support prior has zero probability mass")
+    probability = smoothed / denominator
+    return {
+        "enabled": bool(raw.get("enabled", False)),
+        "training_only": True,
+        "counts": counts.astype(np.float64).tolist(),
+        "probabilities": probability.astype(np.float64).tolist(),
+        "smoothing": smoothing,
+        "alpha": float(raw.get("alpha", 1.0)),
+        "epsilon": float(raw.get("epsilon", 1e-8)),
+        "residual_weight": float(raw.get("residual_weight", 1.0)),
+        "residual_temperature": float(
+            raw.get("residual_temperature", 1.0)
+        ),
+        "residual_norm_clip": (
+            float(raw["residual_norm_clip"])
+            if raw.get("residual_norm_clip") is not None
+            else None
+        ),
+        "residual_init_scale": float(
+            raw.get("residual_init_scale", 1e-3)
+        ),
     }
 
 
@@ -725,6 +874,112 @@ class SmoothedSupportPrior(nn.Module):
         )
 
 
+class GlobalSupportPrior(nn.Module):
+    """Training-derived marginal prior with a controlled neural residual."""
+
+    def __init__(self, metadata: dict[str, Any] | None):
+        super().__init__()
+        raw = dict(metadata or {})
+        self.enabled = bool(raw.get("enabled", False))
+        self.alpha = float(raw.get("alpha", 1.0))
+        self.residual_weight = float(raw.get("residual_weight", 1.0))
+        self.residual_temperature = max(
+            float(raw.get("residual_temperature", 1.0)),
+            1e-6,
+        )
+        self.residual_norm_clip = raw.get("residual_norm_clip")
+        if self.residual_norm_clip is not None:
+            self.residual_norm_clip = float(self.residual_norm_clip)
+        self.residual_init_scale = float(
+            raw.get("residual_init_scale", 1e-3)
+        )
+        epsilon = float(raw.get("epsilon", 1e-8))
+        probabilities = tensor(
+            raw.get("probabilities", [1.0]),
+            torch.float32,
+        )
+        probabilities = probabilities / probabilities.sum().clamp_min(
+            epsilon
+        )
+        self.register_buffer(
+            "log_probability",
+            torch.log(probabilities.clamp_min(epsilon)),
+            persistent=False,
+        )
+        runtime_bias = tensor(
+            raw.get(
+                "runtime_logit_bias",
+                [0.0] * int(probabilities.numel()),
+            ),
+            torch.float32,
+        )
+        if runtime_bias.shape != probabilities.shape:
+            raise ValueError(
+                "Configured support logit bias has shape "
+                f"{tuple(runtime_bias.shape)}, expected "
+                f"{tuple(probabilities.shape)}"
+            )
+        self.register_buffer(
+            "runtime_logit_bias",
+            runtime_bias,
+            persistent=False,
+        )
+        self.has_runtime_logit_bias = bool(
+            torch.any(runtime_bias != 0).item()
+        )
+
+    def initialize_residual(self, layer: nn.Linear) -> None:
+        if not self.enabled:
+            return
+        nn.init.normal_(
+            layer.weight,
+            mean=0.0,
+            std=max(self.residual_init_scale, 0.0),
+        )
+        nn.init.zeros_(layer.bias)
+
+    def residual_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        residual = logits.float() / self.residual_temperature
+        if self.residual_norm_clip is not None:
+            norm = residual.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+            scale = torch.clamp(
+                self.residual_norm_clip / norm,
+                max=1.0,
+            )
+            residual = residual * scale
+        return residual * self.residual_weight
+
+    def combine(self, residual_logits: torch.Tensor) -> torch.Tensor:
+        residual = self.residual_logits(residual_logits)
+        if not self.enabled:
+            return residual_logits + self.runtime_logit_bias.unsqueeze(0)
+        return (
+            residual
+            + self.alpha * self.log_probability.unsqueeze(0)
+            + self.runtime_logit_bias.unsqueeze(0)
+        )
+
+    def set_runtime_logit_bias(
+        self,
+        values: torch.Tensor | np.ndarray | list[float],
+    ) -> None:
+        bias = torch.as_tensor(
+            values,
+            dtype=self.runtime_logit_bias.dtype,
+            device=self.runtime_logit_bias.device,
+        )
+        if bias.shape != self.runtime_logit_bias.shape:
+            raise ValueError(
+                "Support logit-bias shape mismatch: "
+                f"{tuple(bias.shape)} != "
+                f"{tuple(self.runtime_logit_bias.shape)}"
+            )
+        self.runtime_logit_bias.copy_(bias)
+        self.has_runtime_logit_bias = bool(
+            torch.any(self.runtime_logit_bias != 0).item()
+        )
+
+
 class DiscreteSupportNumericalHead(nn.Module):
     def __init__(
         self,
@@ -736,6 +991,20 @@ class DiscreteSupportNumericalHead(nn.Module):
             int(hidden_dim),
             int(metadata["support_size"]),
         )
+        counts = tensor(metadata["support_counts"], torch.float32)
+        global_prior_metadata = dict(
+            metadata.get("global_prior") or {}
+        )
+        global_prior_metadata.setdefault(
+            "probabilities",
+            (
+                counts / counts.sum().clamp_min(1.0)
+            ).tolist(),
+        )
+        self.global_prior = GlobalSupportPrior(
+            global_prior_metadata
+        )
+        self.global_prior.initialize_residual(self.linear)
         self.label_smoothing = float(
             metadata.get("label_smoothing", 0.0)
         )
@@ -763,7 +1032,6 @@ class DiscreteSupportNumericalHead(nn.Module):
             "class_weights",
             tensor(metadata["class_weights"], torch.float32),
         )
-        counts = tensor(metadata["support_counts"], torch.float32)
         self.register_buffer(
             "global_probability",
             counts / counts.sum().clamp_min(1.0),
@@ -777,18 +1045,27 @@ class DiscreteSupportNumericalHead(nn.Module):
         timestamps: torch.Tensor,
     ) -> dict[str, Any]:
         neural_logits = self.linear(hidden)
+        residual_logits = self.global_prior.residual_logits(
+            neural_logits
+        )
         prior_logits = None
-        logits = neural_logits
+        logits = self.global_prior.combine(neural_logits)
         if self.prior.enabled:
             prior_logits = self.prior(destination_ids, timestamps)
             logits = (
-                neural_logits
+                logits
                 + self.prior.lambda_prior * prior_logits
             )
         return {
             "mode": "discrete_support",
             "logits": logits,
             "neural_logits": neural_logits,
+            "residual_logits": residual_logits,
+            "global_prior_logits": (
+                self.global_prior.log_probability
+                if self.global_prior.enabled
+                else None
+            ),
             "prior_logits": prior_logits,
             "support_standardized": self.support_standardized,
             "support_original": self.support_original,
@@ -873,6 +1150,27 @@ class HierarchicalSupportNumericalHead(nn.Module):
             counts / counts.sum().clamp_min(1.0),
         )
         self.prior = SmoothedSupportPrior(metadata.get("prior") or {})
+        global_prior_metadata = dict(
+            metadata.get("global_prior") or {}
+        )
+        global_prior_metadata.setdefault(
+            "probabilities",
+            (
+                counts / counts.sum().clamp_min(1.0)
+            ).tolist(),
+        )
+        self.global_prior = GlobalSupportPrior(
+            global_prior_metadata
+        )
+        if self.global_prior.enabled:
+            nn.init.normal_(
+                self.coarse.weight,
+                mean=0.0,
+                std=max(self.global_prior.residual_init_scale, 0.0),
+            )
+            nn.init.zeros_(self.coarse.bias)
+            for layer in self.fine:
+                self.global_prior.initialize_residual(layer)
 
     def forward(
         self,
@@ -889,8 +1187,46 @@ class HierarchicalSupportNumericalHead(nn.Module):
             if target_values is not None
             else None
         )
-        coarse_logits = self.coarse(hidden)
+        coarse_residual = self.coarse(hidden)
+        coarse_logits = coarse_residual
         prior_logits = None
+        global_prior_logits = None
+        if (
+            self.global_prior.enabled
+            or self.global_prior.has_runtime_logit_bias
+        ):
+            global_prior_logits = (
+                (
+                    self.global_prior.alpha
+                    * self.global_prior.log_probability
+                    if self.global_prior.enabled
+                    else torch.zeros_like(
+                        self.global_prior.runtime_logit_bias
+                    )
+                )
+                + self.global_prior.runtime_logit_bias
+            )
+            coarse_global_prior = torch.stack(
+                [
+                    torch.logsumexp(
+                        global_prior_logits[start:end],
+                        dim=0,
+                    )
+                    for start, end in zip(
+                        self.offsets[:-1].tolist(),
+                        self.offsets[1:].tolist(),
+                    )
+                ],
+                dim=0,
+            )
+            coarse_logits = (
+                (
+                    self.global_prior.residual_logits(coarse_residual)
+                    if self.global_prior.enabled
+                    else coarse_residual
+                )
+                + coarse_global_prior.unsqueeze(0)
+            )
         if self.prior.enabled:
             prior_logits = self.prior(destination_ids, timestamps)
             coarse_prior = torch.stack(
@@ -913,6 +1249,7 @@ class HierarchicalSupportNumericalHead(nn.Module):
         output: dict[str, Any] = {
             "mode": "hierarchical_support",
             "coarse_logits": coarse_logits,
+            "coarse_residual_logits": coarse_residual,
             "hidden": hidden,
             "target_ids": target_ids,
             "support_standardized": self.support_standardized,
@@ -922,6 +1259,7 @@ class HierarchicalSupportNumericalHead(nn.Module):
             "label_smoothing": self.label_smoothing,
             "ordinal_weight": self.ordinal_weight,
             "prior_logits": prior_logits,
+            "global_prior_logits": global_prior_logits,
         }
         if target_ids is not None:
             target_bins = self.bin_ids[target_ids]
@@ -940,6 +1278,13 @@ class HierarchicalSupportNumericalHead(nn.Module):
                 if not selected.any():
                     continue
                 local = layer(hidden[selected])
+                if self.global_prior.enabled:
+                    start = int(self.offsets[bin_id].item())
+                    end = int(self.offsets[bin_id + 1].item())
+                    local = (
+                        self.global_prior.residual_logits(local)
+                        + global_prior_logits[start:end].unsqueeze(0)
+                    )
                 if prior_logits is not None:
                     start = int(self.offsets[bin_id].item())
                     end = int(self.offsets[bin_id + 1].item())
@@ -995,6 +1340,31 @@ class HierarchicalSupportNumericalHead(nn.Module):
             if not selected.any():
                 continue
             local_logits = layer(hidden[selected])
+            if (
+                self.global_prior.enabled
+                or self.global_prior.has_runtime_logit_bias
+            ):
+                start = int(self.offsets[bin_id].item())
+                end = int(self.offsets[bin_id + 1].item())
+                global_support_logits = (
+                    self.global_prior.alpha
+                    * self.global_prior.log_probability[start:end]
+                    if self.global_prior.enabled
+                    else torch.zeros_like(
+                        self.global_prior.runtime_logit_bias[start:end]
+                    )
+                )
+                local_logits = (
+                    (
+                        self.global_prior.residual_logits(local_logits)
+                        if self.global_prior.enabled
+                        else local_logits
+                    )
+                    + (
+                        global_support_logits
+                        + self.global_prior.runtime_logit_bias[start:end]
+                    ).unsqueeze(0)
+                )
             if prior_logits is not None:
                 start = int(self.offsets[bin_id].item())
                 end = int(self.offsets[bin_id + 1].item())

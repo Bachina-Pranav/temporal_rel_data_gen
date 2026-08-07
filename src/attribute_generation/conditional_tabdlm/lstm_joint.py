@@ -36,6 +36,7 @@ from .numerical_head import (
     DiscreteSupportNumericalHead,
     HierarchicalSupportNumericalHead,
     fit_numerical_head_metadata,
+    numerical_head_config,
     numerical_head_feature_enabled,
     resolve_event_role_indices,
     support_numerical_loss,
@@ -836,7 +837,7 @@ def build_lstm_model(
             (
                 config.raw.get("_numerical_head_metadata") or {}
             ).get("conditioning")
-            or (config.raw.get("numerical_heads") or {}).get(
+            or numerical_head_config(config.raw).get(
                 "conditioning"
             )
         ),
@@ -896,6 +897,26 @@ def prepare_numerical_head_config(
     if training_table_path:
         metadata["fit_source_path"] = str(training_table_path)
     config.raw["_numerical_head_metadata"] = metadata
+    config.raw["numerical_columns"] = {
+        column: {
+            "inferred_type": (
+                report.get("inferred_type") or {}
+            ).get("label"),
+            "selected_head": report.get("selected_head"),
+            "implementation_mode": report.get("resolved_mode"),
+            "support_size": (
+                report.get("inferred_type") or {}
+            ).get("support_size"),
+            "unique_ratio": (
+                report.get("inferred_type") or {}
+            ).get("unique_value_ratio"),
+            "repeated_mass": (
+                report.get("inferred_type") or {}
+            ).get("repeated_observation_mass"),
+            "training_only": True,
+        }
+        for column, report in (metadata.get("columns") or {}).items()
+    }
     save_json(
         metadata,
         metadata_dir / "numerical_head_metadata.json",
@@ -2020,7 +2041,7 @@ def validation_numerical_metrics(
     metrics: dict[str, float] = {}
     composite_values: list[float] = []
     selection_cfg = (
-        (config.raw.get("numerical_heads") or {}).get(
+        numerical_head_config(config.raw).get(
             "validation_selection"
         )
         if config is not None
@@ -2200,7 +2221,7 @@ def validation_selection_metric_name(
     config: ConditionalTABDLMConfig,
 ) -> str:
     selection = (
-        (config.raw.get("numerical_heads") or {}).get(
+        numerical_head_config(config.raw).get(
             "validation_selection"
         )
         or {}
@@ -2634,7 +2655,19 @@ def load_lstm_checkpoint(
     vocabs = {column: CategoryVocab.from_dict(data) for column, data in checkpoint["categorical_vocabs"].items()}
     tokenizer = SimpleTextTokenizer.from_dict(checkpoint["tokenizer_metadata"])
     model = build_lstm_model(config, vocabs, tokenizer).to(device)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    try:
+        model.load_state_dict(checkpoint["model_state_dict"])
+    except RuntimeError as exc:
+        selected = {
+            column: mode
+            for column, mode in model.numerical_head_modes.items()
+        }
+        raise RuntimeError(
+            "Checkpoint tensors are incompatible with the numerical-head "
+            f"architecture resolved from the saved config: {selected}. "
+            "Use the checkpoint's original resolved config; numerical heads "
+            "are never silently reinterpreted."
+        ) from exc
     model.eval()
     graph_encoder = None
     if include_graph and graph_conditioning_enabled(raw_config):

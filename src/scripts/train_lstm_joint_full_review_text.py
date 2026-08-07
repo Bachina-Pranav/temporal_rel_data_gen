@@ -21,6 +21,7 @@ from tempdir_bootstrap import configure_tempdir  # noqa: E402
 configure_tempdir(Path(__file__).resolve().parents[2])
 
 from attribute_generation.conditional_tabdlm.lstm_joint import train_lstm_from_config  # noqa: E402
+from attribute_generation.conditional_tabdlm.numerical_head import numerical_head_config  # noqa: E402
 from attribute_generation.conditional_tabdlm.schema import (  # noqa: E402
     ConditionalTABDLMConfig,
     ConditionalTABDLMSchema,
@@ -237,7 +238,7 @@ def best_validation_metrics(
     if not rows:
         return {}
     selection = (
-        (config.raw.get("numerical_heads") or {}).get(
+        numerical_head_config(config.raw).get(
             "validation_selection"
         )
         or {}

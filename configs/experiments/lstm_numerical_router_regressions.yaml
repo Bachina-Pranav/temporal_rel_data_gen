@@ -1,0 +1,27 @@
+output_root: outputs/lstm_numerical_router_regressions
+
+datasets:
+  rel_hm:
+    config: configs/attribute_generation/lstm_hm_10k_customers.yaml
+    evaluation_config: configs/evaluation/single_event_table_paper_metrics_hm_10k_customers.yaml
+    legacy_head_label: continuous
+    modalities: [numerical, categorical, temporal, relational]
+    legacy_metrics_candidates:
+      - outputs/hm-10k-customers/lstm_v53_explicit_split_three_seed/runs/seed_42/evaluation/paper_grade/metrics.json
+
+  movielens_100k:
+    config: configs/attribute_generation/lstm_movielens_100k.yaml
+    evaluation_config: configs/evaluation/single_event_table_paper_metrics_movielens_100k.yaml
+    legacy_head_label: categorical_ordinal
+    modalities: [categorical, temporal, relational]
+    legacy_metrics_candidates:
+      - outputs/movielens-100k/lstm_v53/evaluation/paper_grade/metrics.json
+
+  amazon_toy:
+    config: configs/attribute_generation/conditional_tabdlm_amazon_toy_exp5_lstm_joint_full_review_text.yaml
+    evaluation_config: configs/evaluation/single_event_table_paper_metrics_amazon_toy.yaml
+    legacy_head_label: categorical_ordinal
+    modalities: [categorical, boolean, text, temporal, relational]
+    legacy_metrics_candidates:
+      - outputs/amazon-toy/conditional_tabdlm_exp5_3_lstm_length_preserving_privacy_sampler/evaluation/paper_grade/metrics.json
+      - outputs/amazon-toy/conditional_tabdlm_exp5_lstm_joint_full_review_text/evaluation/paper_grade/metrics.json

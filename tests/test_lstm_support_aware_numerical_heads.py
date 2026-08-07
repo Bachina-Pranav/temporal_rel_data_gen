@@ -26,7 +26,9 @@ from attribute_generation.conditional_tabdlm.numerical import (  # noqa: E402
     fit_numerical_transformers,
 )
 from attribute_generation.conditional_tabdlm.numerical_head import (  # noqa: E402
+    GlobalSupportPrior,
     SmoothedSupportPrior,
+    fit_global_support_prior,
     fit_numerical_head_metadata,
 )
 from attribute_generation.conditional_tabdlm.schema import (  # noqa: E402
@@ -284,6 +286,15 @@ def test_pretokenized_run_fits_exact_support_from_training_only_table(
     assert set(
         metadata["columns"]["price"]["support_values_original"]
     ) == {0.01, 0.02, 0.03}
+    assert config.raw["numerical_columns"]["price"] == {
+        "inferred_type": "repeated_or_quantized",
+        "selected_head": "support_prior",
+        "implementation_mode": "discrete_support",
+        "support_size": 3,
+        "unique_ratio": 0.5,
+        "repeated_mass": 1.0,
+        "training_only": True,
+    }
 
 
 def test_integer_support_decodes_as_numeric_integer_tensor():
@@ -356,6 +367,151 @@ def test_event_roles_not_foreign_key_positions_drive_destination_fusion():
     assert roles["destination_fk_index"] == 0
     assert roles["source_fk_index"] == 1
     assert not torch.allclose(first, second)
+
+
+def test_support_prior_uses_smoothed_training_counts_and_near_zero_residual():
+    frame, config, numerical_metadata = fixture("support_prior")
+    config.raw["numerical_heads"]["global_prior"] = {
+        "smoothing": 2.0,
+        "alpha": 1.0,
+        "residual_weight": 0.0,
+        "residual_init_scale": 0.001,
+    }
+    model, batch = build_fixture_model(
+        frame,
+        config,
+        numerical_metadata,
+    )
+    metadata = config.raw["_numerical_head_metadata"]["columns"]["price"]
+    head = model.support_numerical_heads["price"]
+    probability = torch.as_tensor(
+        metadata["global_prior"]["probabilities"]
+    )
+
+    assert metadata["global_prior"]["training_only"] is True
+    assert torch.allclose(probability.sum(), torch.tensor(1.0))
+    assert metadata["selected_head"] == "support_prior"
+    assert float(head.linear.weight.abs().max()) < 0.01
+
+    condition = model.encode_condition(
+        batch["foreign_key_ids"],
+        batch["datetime_values"],
+    )
+    row = model.row_latent(
+        condition,
+        noise=torch.zeros(len(frame), model.latent_noise_dim),
+    )
+    output = model.numerical_params(
+        row,
+        batch["foreign_key_ids"],
+        batch["datetime_values"],
+    )["price"]
+    predicted = torch.softmax(output["logits"], dim=-1)
+    assert torch.allclose(
+        predicted,
+        probability.unsqueeze(0).expand_as(predicted),
+        atol=1e-6,
+    )
+
+
+def test_global_prior_smoothing_handles_zero_counts():
+    metadata = fit_global_support_prior(
+        torch.tensor([4.0, 0.0, 2.0]).numpy(),
+        {"enabled": True, "smoothing": 1.0},
+    )
+    probability = torch.tensor(metadata["probabilities"])
+
+    assert torch.all(probability > 0)
+    assert torch.allclose(probability.sum(), torch.tensor(1.0))
+
+
+def test_global_prior_runtime_bias_is_deterministic_and_normalized():
+    prior = GlobalSupportPrior(
+        {
+            "enabled": True,
+            "probabilities": [0.2, 0.3, 0.5],
+            "runtime_logit_bias": [0.1, -0.2, 0.3],
+            "residual_weight": 0.0,
+        }
+    )
+    logits = prior.combine(torch.randn(4, 3))
+    first = torch.softmax(logits, dim=-1)
+    second = torch.softmax(prior.combine(torch.randn(4, 3)), dim=-1)
+
+    assert torch.allclose(first, second)
+    assert torch.allclose(first.sum(dim=1), torch.ones(4))
+
+
+def test_hierarchical_support_applies_runtime_bias_without_training_prior():
+    frame, config, numerical_metadata = fixture(
+        "hierarchical_support"
+    )
+    model, batch = build_fixture_model(
+        frame,
+        config,
+        numerical_metadata,
+    )
+    head = model.support_numerical_heads["price"]
+    condition = model.encode_condition(
+        batch["foreign_key_ids"],
+        batch["datetime_values"],
+    )
+    row = model.row_latent(
+        condition,
+        noise=torch.zeros(len(frame), model.latent_noise_dim),
+    )
+    before = head(
+        row,
+        batch["foreign_key_ids"][:, 1],
+        batch["datetime_values"][:, 0],
+    )["coarse_logits"]
+    head.global_prior.set_runtime_logit_bias([3.0, 0.0, -3.0])
+    after = head(
+        row,
+        batch["foreign_key_ids"][:, 1],
+        batch["datetime_values"][:, 0],
+    )["coarse_logits"]
+
+    assert head.global_prior.enabled is False
+    assert head.global_prior.has_runtime_logit_bias is True
+    assert not torch.allclose(before, after)
+
+
+def test_auto_router_selects_support_prior_and_persists_profile():
+    frame, config, numerical_metadata = fixture("auto")
+    metadata = fit_numerical_head_metadata(
+        config,
+        train_frame=frame,
+        numerical_metadata=numerical_metadata,
+    )
+    report = metadata["columns"]["price"]
+
+    assert report["selected_head"] == "support_prior"
+    assert report["resolved_mode"] == "discrete_support"
+    assert report["global_prior"]["enabled"] is True
+
+
+def test_singular_legacy_continuous_override_preserves_linear_layout():
+    frame, config, numerical_metadata = fixture(
+        "continuous_baseline",
+        enable_new_feature=False,
+    )
+    config.raw["numerical_head"] = {"mode": "continuous"}
+    metadata = fit_numerical_head_metadata(
+        config,
+        train_frame=frame,
+        numerical_metadata=numerical_metadata,
+    )
+    config.raw["_numerical_head_metadata"] = metadata
+    model = build_lstm_model(
+        config,
+        {},
+        SimpleTextTokenizer(),
+    )
+
+    assert metadata["columns"]["price"]["selected_head"] == "continuous"
+    assert list(model.numerical_heads) == ["price"]
+    assert list(model.support_numerical_heads) == []
 
 
 def build_fixture_model(

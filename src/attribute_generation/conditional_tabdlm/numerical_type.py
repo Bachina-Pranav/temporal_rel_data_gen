@@ -160,20 +160,20 @@ def infer_numerical_column_type(
     )
     if low_cardinality:
         label = "low_cardinality_discrete_numerical"
-        recommended_head = "discrete_support"
+        recommended_head = "support_prior"
     elif (
         structured
         and len(support)
         <= int(thresholds.direct_support_max_values)
     ):
         label = "repeated_or_quantized"
-        recommended_head = "discrete_support"
+        recommended_head = "support_prior"
     elif structured:
         label = "high_cardinality_structured_support"
-        recommended_head = "hierarchical_support"
+        recommended_head = "support_prior"
     else:
         label = "continuous"
-        recommended_head = "continuous_baseline"
+        recommended_head = "continuous"
     return {
         "label": label,
         "recommended_head": recommended_head,
