@@ -372,33 +372,36 @@ def infer_support_kind(
     support: np.ndarray,
     counts: np.ndarray,
 ) -> dict[str, Any]:
-    unique_ratio = float(len(support) / max(int(num_rows), 1))
-    repeated_rate = float(
-        counts[counts > 1].sum() / max(counts.sum(), 1)
+    from .numerical_type import infer_numerical_column_type
+
+    support = np.asarray(support, dtype=float)
+    counts = np.asarray(counts, dtype=np.int64)
+    observed_rows = int(counts.sum())
+    if observed_rows <= 200_000:
+        reconstructed = np.repeat(support, counts)
+    else:
+        rng = np.random.default_rng(42)
+        reconstructed = rng.choice(
+            support,
+            size=200_000,
+            replace=True,
+            p=counts.astype(float) / observed_rows,
+        )
+    if int(num_rows) != observed_rows:
+        num_rows = observed_rows
+    report = infer_numerical_column_type(reconstructed, seed=42)
+    report.update(
+        {
+            "quantized": report["label"] != "continuous",
+            "unique_ratio": float(
+                len(support) / max(int(num_rows), 1)
+            ),
+            "repeated_observation_rate": float(
+                counts[counts > 1].sum() / max(counts.sum(), 1)
+            ),
+        }
     )
-    spacing = positive_spacings(support)
-    spacing_cv = (
-        float(np.std(spacing) / max(np.mean(spacing), 1e-12))
-        if len(spacing)
-        else 0.0
-    )
-    quantized = bool(
-        unique_ratio <= 0.20
-        and repeated_rate >= 0.50
-        and len(support) <= 100_000
-    )
-    return {
-        "label": "repeated_or_quantized" if quantized else "continuous",
-        "quantized": quantized,
-        "unique_ratio": unique_ratio,
-        "repeated_observation_rate": repeated_rate,
-        "spacing_coefficient_of_variation": spacing_cv,
-        "criteria": {
-            "maximum_unique_ratio": 0.20,
-            "minimum_repeated_observation_rate": 0.50,
-            "maximum_support_size": 100_000,
-        },
-    }
+    return report
 
 
 def split_support_summary(

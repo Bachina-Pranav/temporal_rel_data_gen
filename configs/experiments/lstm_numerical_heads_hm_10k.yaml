@@ -1,0 +1,77 @@
+experiment_name: lstm_numerical_heads_hm_10k
+base_config: configs/attribute_generation/lstm_hm_10k_customers.yaml
+evaluation_config: configs/evaluation/single_event_table_paper_metrics_hm_10k_customers.yaml
+baseline_experiment_root: outputs/hm-10k-customers/lstm_v53_three_seed
+pretokenized_dir: data/processed/interaction_benchmarks/hm_10k_customers/pretokenized_lstm
+neighbor_cache_dir: data/processed/interaction_benchmarks/hm_10k_customers/neighbor_cache
+output_root: outputs/hm-10k-customers/lstm_numerical_heads
+seeds: [17, 42, 73]
+first_seed: 42
+
+shared_numerical_head:
+  direct_support_max_values: 8192
+  hierarchical_num_bins: 64
+  class_frequency_weighting: inverse_sqrt
+  label_smoothing: 0.01
+  ordinal_regularization_weight: 0.0
+  global_calibration_weight: 0.0
+  type_inference:
+    low_cardinality_max_values: 64
+    direct_support_max_values: 8192
+    hierarchical_support_max_values: 200000
+    repeated_max_unique_ratio: 0.25
+    repeated_min_observation_mass: 0.50
+    holdout_min_support_overlap: 0.75
+    precision_min_dominant_mass: 0.70
+    spacing_max_coefficient_of_variation: 2.0
+    top_values_min_observation_mass: 0.10
+    minimum_structured_signals: 3
+  validation_selection:
+    metric: numerical_composite
+    trend_weight: 0.1
+
+variants:
+  M1_destination_continuous:
+    description: Explicit destination-conditioned fusion with the original Gaussian output.
+    numerical_heads:
+      mode: continuous_baseline
+      conditioning:
+        explicit_destination: true
+      prior:
+        enabled: false
+
+  M2_global_support:
+    description: Training-derived support output with the original shared row conditioning.
+    numerical_heads:
+      mode: auto
+      conditioning:
+        explicit_destination: false
+      prior:
+        enabled: false
+
+  M3_destination_support:
+    description: Support output plus explicit gated destination conditioning.
+    numerical_heads:
+      mode: auto
+      conditioning:
+        explicit_destination: true
+      prior:
+        enabled: false
+
+  M4_destination_support_prior:
+    description: M3 plus smoothed destination/frequency/time/global support priors.
+    numerical_heads:
+      mode: auto
+      conditioning:
+        explicit_destination: true
+      prior:
+        enabled: true
+        lambda_prior: 0.5
+        num_frequency_buckets: 4
+        num_time_buckets: 8
+        min_destination_rows: 20
+        max_exact_support_values: 64
+        time_smoothing: 100.0
+        frequency_smoothing: 100.0
+        destination_smoothing: 20.0
+        epsilon: 1.0e-8

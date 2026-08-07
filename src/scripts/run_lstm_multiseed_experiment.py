@@ -211,6 +211,9 @@ def run_seed(
         shared / "spines" / "test_spine.csv",
         pretokenized_dir,
         neighbor_cache_dir,
+        numerical_head_training_table=(
+            shared / "spines" / "train_real.csv"
+        ),
         smoke=smoke,
     )
     config_path = output_dir / "config_resolved.yaml"
@@ -332,32 +335,59 @@ def run_seed(
         args,
     )
     run_stage(
-        [
-            python(),
-            "src/scripts/evaluate_lstm_attribute_diagnostics.py",
-            "--config",
-            str(config_path),
-            "--train-real",
-            str(shared / "spines" / "train_real.csv"),
-            "--evaluation-real",
-            str(real_for_eval),
-            "--synthetic",
-            str(synthetic),
-            "--graph-history-prefix",
-            str(shared / "spines" / "history_prefix_spine.csv"),
-            "--output",
-            str(
+        attribute_diagnostics_command(
+            config_path=config_path,
+            evaluation_config_path=eval_path,
+            train_real_path=shared / "spines" / "train_real.csv",
+            evaluation_real_path=real_for_eval,
+            synthetic_path=synthetic,
+            graph_history_prefix_path=(
+                shared / "spines" / "history_prefix_spine.csv"
+            ),
+            output_path=(
                 output_dir
                 / "evaluation"
                 / "attribute_diagnostics.json"
             ),
-            "--seed",
-            str(seed),
-        ],
+            seed=seed,
+        ),
         output_dir / "logs" / "attribute_diagnostics.log",
         args,
     )
     return collect_seed_result(seed, output_dir)
+
+
+def attribute_diagnostics_command(
+    *,
+    config_path: Path,
+    evaluation_config_path: Path,
+    train_real_path: Path,
+    evaluation_real_path: Path,
+    synthetic_path: Path,
+    graph_history_prefix_path: Path,
+    output_path: Path,
+    seed: int,
+) -> list[str]:
+    return [
+        python(),
+        "src/scripts/evaluate_lstm_attribute_diagnostics.py",
+        "--config",
+        str(config_path),
+        "--train-real",
+        str(train_real_path),
+        "--evaluation-real",
+        str(evaluation_real_path),
+        "--synthetic",
+        str(synthetic_path),
+        "--graph-history-prefix",
+        str(graph_history_prefix_path),
+        "--evaluation-config",
+        str(evaluation_config_path),
+        "--output",
+        str(output_path),
+        "--seed",
+        str(seed),
+    ]
 
 
 def prepare_evaluation_real(
@@ -389,6 +419,7 @@ def resolve_seed_config(
     pretokenized_dir: Path,
     neighbor_cache_dir: Path,
     *,
+    numerical_head_training_table: Path | None = None,
     smoke: bool,
 ) -> dict[str, Any]:
     resolved = copy.deepcopy(base)
@@ -397,6 +428,10 @@ def resolve_seed_config(
     paths["synthetic_spine_path"] = str(test_spine)
     paths["pretokenized_dir"] = str(pretokenized_dir)
     paths["neighbor_cache_dir"] = str(neighbor_cache_dir)
+    if numerical_head_training_table is not None:
+        paths["numerical_head_training_table_path"] = str(
+            numerical_head_training_table
+        )
     training = resolved.setdefault("training", {})
     training["seed"] = int(seed)
     sampling = resolved.setdefault("sampling", {})
@@ -409,7 +444,10 @@ def resolve_seed_config(
         training["validation_max_batches"] = 2
         training["early_stopping_patience"] = 2
     resolved.setdefault("experiment_metadata", {})["seed"] = int(seed)
-    resolved["experiment_metadata"]["baseline_architecture_changed"] = False
+    resolved["experiment_metadata"].setdefault(
+        "baseline_architecture_changed",
+        False,
+    )
     return resolved
 
 

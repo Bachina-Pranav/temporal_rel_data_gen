@@ -22,8 +22,23 @@ def build_temporal_history_index(
     assert_valid_graph_conditioning(config.raw)
     id_cfg = config.raw.get("id_encoding", {})
     schema = config.schema
-    customer_col = schema.foreign_key_columns[0]
-    product_col = schema.foreign_key_columns[1] if len(schema.foreign_key_columns) > 1 else schema.foreign_key_columns[0]
+    event_spine = config.raw.get("event_spine") or {}
+    customer_col = str(
+        event_spine.get(
+            "source_fk",
+            schema.foreign_key_columns[0],
+        )
+    )
+    product_col = str(
+        event_spine.get(
+            "destination_fk",
+            (
+                schema.foreign_key_columns[1]
+                if len(schema.foreign_key_columns) > 1
+                else schema.foreign_key_columns[0]
+            ),
+        )
+    )
     return TemporalHistoryIndex.from_config(
         frame,
         config.raw,

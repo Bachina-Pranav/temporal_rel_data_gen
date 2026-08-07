@@ -493,20 +493,35 @@ def sample_lstm_fast_batch(
         row = model.row_latent(condition)
     decoded_numerical: dict[str, list[float]] = {}
     with profiler.timer("numerical_sampling_seconds"):
-        for column, params in model.numerical_params(row).items():
-            sampled = sample_gaussian_params(
-                params,
-                temperature=numerical_temperature,
-            )
-            decoded_numerical[column] = (
-                inverse_transform_numerical(
-                    sampled,
-                    numerical_metadata.get(column, {}),
+        numerical_output = model.numerical_params(
+            row,
+            foreign_key_ids,
+            datetime_values,
+            graph_context,
+        )
+        support_values = model.sample_support_numerical(
+            numerical_output,
+            temperature=numerical_temperature,
+        )
+        for column, params in numerical_output.items():
+            if column in support_values:
+                decoded_numerical[column] = (
+                    support_values[column].detach().cpu().tolist()
                 )
-                .detach()
-                .cpu()
-                .tolist()
-            )
+            else:
+                sampled = sample_gaussian_params(
+                    params,
+                    temperature=numerical_temperature,
+                )
+                decoded_numerical[column] = (
+                    inverse_transform_numerical(
+                        sampled,
+                        numerical_metadata.get(column, {}),
+                    )
+                    .detach()
+                    .cpu()
+                    .tolist()
+                )
     sampled_cat_columns: list[torch.Tensor] = []
     decoded_cats: dict[str, list[Any]] = {}
     with profiler.timer("categorical_sampling_seconds"):
@@ -627,6 +642,7 @@ def sample_lstm_naive_batch(
         tokenizer,
         graph_context=graph_context,
         temperature=temperature,
+        numerical_temperature=numerical_temperature,
         top_p=top_p,
         min_tokens=min_tokens,
         repetition_penalty=repetition_penalty,
@@ -642,7 +658,12 @@ def sample_lstm_naive_batch(
         text_lengths=generated["text_lengths"],
         numerical={
             column: (
-                inverse_transform_numerical(
+                generated["numerical_values"][column]
+                .detach()
+                .cpu()
+                .tolist()
+                if column in generated.get("numerical_values", {})
+                else inverse_transform_numerical(
                     sample_gaussian_params(
                         generated["numerical_params"][column],
                         temperature=numerical_temperature,

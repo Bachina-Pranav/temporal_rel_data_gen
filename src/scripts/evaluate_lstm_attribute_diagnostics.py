@@ -11,12 +11,14 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+import yaml
 
 
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from attribute_generation.conditional_tabdlm.experiment_audit import strict_prior_counts  # noqa: E402
+from attribute_generation.conditional_tabdlm.posthoc_diagnostics import repeated_c2st  # noqa: E402
 from attribute_generation.conditional_tabdlm.schema import load_config  # noqa: E402
 from evaluation.paper_metrics.shape_trend import pair_trend_error  # noqa: E402
 from evaluation.paper_metrics.utils import (  # noqa: E402
@@ -33,8 +35,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--evaluation-real", required=True)
     parser.add_argument("--synthetic", required=True)
     parser.add_argument("--graph-history-prefix", required=True)
+    parser.add_argument("--evaluation-config", default=None)
     parser.add_argument("--output", required=True)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--c2st-classifier-seeds",
+        nargs="+",
+        type=int,
+        default=[11, 23, 37],
+    )
+    parser.add_argument("--max-c2st-rows", type=int, default=20000)
     return parser.parse_args()
 
 
@@ -45,6 +55,11 @@ def main() -> None:
     real = pd.read_csv(args.evaluation_real, low_memory=False)
     synthetic = pd.read_csv(args.synthetic, low_memory=False)
     prefix = pd.read_csv(args.graph_history_prefix, low_memory=False)
+    evaluation_config = (
+        load_mapping(args.evaluation_config)
+        if args.evaluation_config
+        else None
+    )
     if len(real) != len(synthetic):
         raise ValueError(
             f"Attribute diagnostics require aligned rows: real={len(real)}, synthetic={len(synthetic)}"
@@ -56,6 +71,9 @@ def main() -> None:
         prefix,
         config,
         seed=int(args.seed),
+        evaluation_config=evaluation_config,
+        c2st_classifier_seeds=args.c2st_classifier_seeds,
+        max_c2st_rows=int(args.max_c2st_rows),
     )
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -74,6 +92,13 @@ def evaluate_attribute_diagnostics(
     config: Any,
     *,
     seed: int,
+    evaluation_config: dict[str, Any] | None = None,
+    c2st_classifier_seeds: list[int] | tuple[int, ...] = (
+        11,
+        23,
+        37,
+    ),
+    max_c2st_rows: int | None = 20000,
 ) -> dict[str, Any]:
     schema = config.schema
     numerical = {
@@ -123,6 +148,15 @@ def evaluate_attribute_diagnostics(
         schema,
         seed=seed,
     )
+    group_c2st = attribute_group_c2st(
+        real,
+        synthetic,
+        schema,
+        evaluation_config,
+        classifier_seeds=c2st_classifier_seeds,
+        max_rows=max_c2st_rows,
+        generator_seed=seed,
+    )
     return {
         "dataset_name": config.raw.get("dataset_name"),
         "num_train_rows": int(len(train)),
@@ -133,6 +167,7 @@ def evaluate_attribute_diagnostics(
         "dependency_fidelity": dependencies,
         "history_coverage": history,
         "privacy_memorization": privacy,
+        "attribute_group_c2st": group_c2st,
     }
 
 
@@ -155,6 +190,19 @@ def numerical_metrics(
         (syn_num < train_num.min())
         | (syn_num > train_num.max())
     ) & ~invalid
+    train_support = np.sort(train_num.dropna().unique())
+    real_support_overlap = support_overlap_rate(
+        real_valid.to_numpy(float),
+        train_support,
+    )
+    synthetic_support_overlap = support_overlap_rate(
+        syn_valid.to_numpy(float),
+        train_support,
+    )
+    nearest = nearest_support_distances(
+        syn_valid.to_numpy(float),
+        train_support,
+    )
     return {
         "mean_real": float(real_valid.mean()),
         "mean_synthetic": float(syn_valid.mean()),
@@ -174,10 +222,123 @@ def numerical_metrics(
         "wasserstein_distance": wasserstein_1d(real_valid, syn_valid),
         "invalid_rate": float(invalid.mean()),
         "out_of_train_range_rate": float(out_of_range.mean()),
+        "training_support_size": int(len(train_support)),
+        "real_training_support_overlap_rate": real_support_overlap,
+        "synthetic_training_support_overlap_rate": (
+            synthetic_support_overlap
+        ),
+        "nearest_training_support_distance_mean": (
+            float(np.mean(nearest)) if len(nearest) else None
+        ),
+        "nearest_training_support_distance_p95": (
+            float(np.quantile(nearest, 0.95))
+            if len(nearest)
+            else None
+        ),
+        "unique_value_ratio_real": float(
+            real_valid.nunique() / max(len(real_valid), 1)
+        ),
+        "unique_value_ratio_synthetic": float(
+            syn_valid.nunique() / max(len(syn_valid), 1)
+        ),
+        "support_entropy_real": empirical_entropy(real_valid),
+        "support_entropy_synthetic": empirical_entropy(syn_valid),
         "missingness_rate_error": float(
             abs(real_num.isna().mean() - syn_num.isna().mean())
         ),
     }
+
+
+def attribute_group_c2st(
+    real: pd.DataFrame,
+    synthetic: pd.DataFrame,
+    schema: Any,
+    evaluation_config: dict[str, Any] | None,
+    *,
+    classifier_seeds: list[int] | tuple[int, ...],
+    max_rows: int | None,
+    generator_seed: int,
+) -> dict[str, Any]:
+    if evaluation_config is None:
+        return {
+            "status": "skipped",
+            "reason": "No evaluation configuration was supplied.",
+        }
+    groups = {
+        "numerical_only": list(schema.numerical_targets),
+        "categorical_only": list(schema.categorical_targets),
+    }
+    output: dict[str, Any] = {
+        "status": "completed",
+        "classifier_seeds": [int(value) for value in classifier_seeds],
+        "max_rows_per_side": (
+            int(max_rows) if max_rows is not None else None
+        ),
+    }
+    for label, columns in groups.items():
+        if not columns:
+            output[label] = {
+                "status": "not_applicable",
+                "columns": [],
+            }
+            continue
+        aggregate, _ = repeated_c2st(
+            real,
+            synthetic,
+            evaluation_config,
+            classifier_seeds=classifier_seeds,
+            columns=columns,
+            max_rows=max_rows,
+            generator_seed=generator_seed,
+            label=label,
+        )
+        output[label] = {
+            "status": "completed",
+            "columns": columns,
+            **aggregate,
+        }
+    return output
+
+
+def support_overlap_rate(
+    values: np.ndarray,
+    support: np.ndarray,
+) -> float | None:
+    values = np.asarray(values, dtype=float)
+    support = np.asarray(support, dtype=float)
+    if not len(values) or not len(support):
+        return None
+    return float(np.mean(np.isin(values, support)))
+
+
+def nearest_support_distances(
+    values: np.ndarray,
+    support: np.ndarray,
+) -> np.ndarray:
+    values = np.asarray(values, dtype=float)
+    support = np.sort(np.asarray(support, dtype=float))
+    if not len(values) or not len(support):
+        return np.asarray([], dtype=float)
+    right = np.searchsorted(support, values, side="left")
+    left = np.clip(right - 1, 0, len(support) - 1)
+    right = np.clip(right, 0, len(support) - 1)
+    return np.minimum(
+        np.abs(values - support[left]),
+        np.abs(values - support[right]),
+    )
+
+
+def empirical_entropy(values: pd.Series) -> float | None:
+    counts = values.value_counts(dropna=True).to_numpy(float)
+    if not len(counts):
+        return None
+    probability = counts / counts.sum()
+    return float(
+        -np.sum(
+            probability
+            * np.log(np.maximum(probability, 1e-12))
+        )
+    )
 
 
 def categorical_metrics(
@@ -495,6 +656,14 @@ def json_default(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
     raise TypeError(f"Cannot serialize {type(value).__name__}")
+
+
+def load_mapping(path: str | Path) -> dict[str, Any]:
+    with Path(path).open(encoding="utf-8") as handle:
+        value = yaml.safe_load(handle)
+    if not isinstance(value, dict):
+        raise ValueError(f"Expected a mapping in {path}")
+    return value
 
 
 if __name__ == "__main__":

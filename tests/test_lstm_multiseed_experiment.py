@@ -10,8 +10,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from scripts.run_lstm_multiseed_experiment import (  # noqa: E402
+    attribute_diagnostics_command,
     flatten_numeric_scalars,
     prepare_evaluation_real,
+    resolve_seed_config,
 )
 
 
@@ -72,3 +74,39 @@ def test_attribute_diagnostics_scalars_are_flattened_for_aggregation():
         "attribute.price.quantiles.0.5": 0.03,
         "attribute.valid": 1.0,
     }
+
+
+def test_attribute_diagnostics_command_receives_evaluation_config():
+    command = attribute_diagnostics_command(
+        config_path=Path("model.yaml"),
+        evaluation_config_path=Path("evaluation.yaml"),
+        train_real_path=Path("train.csv"),
+        evaluation_real_path=Path("test.csv"),
+        synthetic_path=Path("synthetic.csv"),
+        graph_history_prefix_path=Path("history.csv"),
+        output_path=Path("diagnostics.json"),
+        seed=42,
+    )
+
+    assert command[
+        command.index("--evaluation-config") + 1
+    ] == "evaluation.yaml"
+    assert "--evaluation-config" in command
+
+
+def test_seed_config_uses_materialized_training_table_for_numerical_head():
+    resolved = resolve_seed_config(
+        {"paths": {}, "training": {}, "sampling": {}},
+        42,
+        Path("run"),
+        Path("test_spine.csv"),
+        Path("pretokenized"),
+        Path("neighbor_cache"),
+        numerical_head_training_table=Path("train_real.csv"),
+        smoke=False,
+    )
+
+    assert (
+        resolved["paths"]["numerical_head_training_table_path"]
+        == "train_real.csv"
+    )

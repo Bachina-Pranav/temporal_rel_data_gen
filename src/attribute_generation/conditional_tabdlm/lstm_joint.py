@@ -16,6 +16,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from evaluation.paper_metrics.utils import ks_distance, wasserstein_1d
 
 from .constrained import decode_category_id, mask_invalid_category_logits, normalize_rating_value, validate_output_categoricals, valid_category_values
 from .dataset import (
@@ -31,6 +32,14 @@ from .graph_encoder import TemporalStructureOnlyGraphEncoder
 from .graph_schema import assert_valid_graph_conditioning, graph_conditioning_enabled, graph_metadata
 from .model import DateTimeEncoder
 from .numerical import gaussian_nll_from_params, inverse_transform_numerical, sample_gaussian_params
+from .numerical_head import (
+    DiscreteSupportNumericalHead,
+    HierarchicalSupportNumericalHead,
+    fit_numerical_head_metadata,
+    numerical_head_feature_enabled,
+    resolve_event_role_indices,
+    support_numerical_loss,
+)
 from .neighbor_cache import CachedTemporalHistoryIndex
 from .pretokenized import PretokenizedLSTMDataset, load_pretokenized_bundle
 from .schema import ConditionalTABDLMConfig, ConditionalTABDLMSchema
@@ -81,6 +90,8 @@ class JointLSTMRelationalAttributeGenerator(nn.Module):
         summary_condition_dropout: float = 0.1,
         decoder_input_token_dropout: dict[str, float] | None = None,
         decoder_input_token_dropout_replacement: str = "UNK",
+        numerical_head_metadata: dict[str, Any] | None = None,
+        numerical_conditioning: dict[str, Any] | None = None,
     ):
         super().__init__()
         self.schema = schema
@@ -111,6 +122,12 @@ class JointLSTMRelationalAttributeGenerator(nn.Module):
         self.decoder_input_token_dropout = dict(decoder_input_token_dropout or {})
         self.decoder_input_token_dropout_replacement = str(decoder_input_token_dropout_replacement)
         self.last_token_dropout_rates: dict[str, float] = {}
+        self.numerical_head_metadata = dict(
+            numerical_head_metadata or {}
+        )
+        self.numerical_conditioning = dict(
+            numerical_conditioning or {}
+        )
 
         self.foreign_key_embeddings = nn.ModuleList(
             [nn.Embedding(self.num_hash_buckets, self.id_embedding_dim) for _ in schema.foreign_key_columns]
@@ -140,12 +157,106 @@ class JointLSTMRelationalAttributeGenerator(nn.Module):
                 for column in schema.model_categorical_targets
             }
         )
+        column_metadata = (
+            self.numerical_head_metadata.get("columns") or {}
+        )
+        self.numerical_head_modes = {
+            column: str(
+                (column_metadata.get(column) or {}).get(
+                    "resolved_mode",
+                    "continuous_baseline",
+                )
+            )
+            for column in schema.numerical_targets
+        }
         self.numerical_heads = nn.ModuleDict(
             {
                 column: nn.Linear(self.row_hidden_dim, 2)
                 for column in schema.numerical_targets
+                if self.numerical_head_modes[column]
+                == "continuous_baseline"
             }
         )
+        self.support_numerical_heads = nn.ModuleDict()
+        for column in schema.numerical_targets:
+            mode = self.numerical_head_modes[column]
+            metadata = column_metadata.get(column) or {}
+            if mode == "discrete_support":
+                self.support_numerical_heads[column] = (
+                    DiscreteSupportNumericalHead(
+                        self.row_hidden_dim,
+                        metadata,
+                    )
+                )
+            elif mode == "hierarchical_support":
+                self.support_numerical_heads[column] = (
+                    HierarchicalSupportNumericalHead(
+                        self.row_hidden_dim,
+                        metadata,
+                    )
+                )
+            elif mode != "continuous_baseline":
+                raise ValueError(
+                    f"Unresolved numerical head mode for {column!r}: "
+                    f"{mode!r}"
+                )
+        self.explicit_numerical_conditioning = bool(
+            self.numerical_conditioning.get(
+                "explicit_destination",
+                False,
+            )
+        )
+        self.numerical_event_roles = dict(
+            self.numerical_head_metadata.get("event_roles") or {}
+        )
+        if self.explicit_numerical_conditioning:
+            required_roles = {
+                "source_fk_index",
+                "destination_fk_index",
+                "timestamp_index",
+            }
+            missing_roles = sorted(
+                required_roles.difference(self.numerical_event_roles)
+            )
+            if missing_roles:
+                raise ValueError(
+                    "Explicit numerical conditioning is missing event "
+                    f"role indices: {missing_roles}"
+                )
+            contextual_graph_dim = (
+                self.graph_context_dim
+                if self.use_graph_context
+                else 0
+            )
+            source_temporal_dim = (
+                self.id_embedding_dim
+                + len(schema.datetime_columns)
+                * self.datetime_embedding_dim
+                + contextual_graph_dim
+            )
+            destination_dim = (
+                self.id_embedding_dim + contextual_graph_dim
+            )
+            self.numerical_source_temporal_projection = nn.Sequential(
+                nn.Linear(source_temporal_dim, self.row_hidden_dim),
+                nn.GELU(),
+                nn.LayerNorm(self.row_hidden_dim),
+            )
+            self.numerical_destination_projection = nn.Sequential(
+                nn.Linear(destination_dim, self.row_hidden_dim),
+                nn.GELU(),
+                nn.LayerNorm(self.row_hidden_dim),
+            )
+            self.numerical_shared_norm = nn.LayerNorm(
+                self.row_hidden_dim
+            )
+            self.numerical_destination_gate = nn.Linear(
+                self.row_hidden_dim * 2,
+                self.row_hidden_dim,
+            )
+            self.numerical_output_norm = nn.LayerNorm(
+                self.row_hidden_dim
+            )
         self.categorical_context_embeddings = nn.ModuleDict(
             {
                 column: nn.Embedding(categorical_vocabs[column].size, self.categorical_context_dim)
@@ -205,22 +316,48 @@ class JointLSTMRelationalAttributeGenerator(nn.Module):
         datetime_values: torch.Tensor,
         graph_context: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        pieces: list[torch.Tensor] = []
-        for idx, embedding in enumerate(self.foreign_key_embeddings):
-            pieces.append(embedding(foreign_key_ids[:, idx]))
-        datetime_features = self.datetime_encoder(datetime_values)
-        for idx in range(datetime_features.shape[1]):
-            pieces.append(datetime_features[:, idx, :])
+        components = self.encode_condition_components(
+            foreign_key_ids,
+            datetime_values,
+            graph_context=graph_context,
+        )
+        pieces = [
+            *components["foreign_keys"],
+            *components["datetimes"],
+        ]
         if self.use_graph_context:
-            if graph_context is None:
-                graph_context = torch.zeros(
-                    foreign_key_ids.shape[0],
-                    self.graph_context_dim,
-                    dtype=torch.float32,
-                    device=foreign_key_ids.device,
-                )
-            pieces.append(graph_context.float())
+            pieces.append(components["graph"])
         return self.condition_mlp(torch.cat(pieces, dim=1))
+
+    def encode_condition_components(
+        self,
+        foreign_key_ids: torch.Tensor,
+        datetime_values: torch.Tensor,
+        graph_context: torch.Tensor | None = None,
+    ) -> dict[str, Any]:
+        foreign_keys = [
+            embedding(foreign_key_ids[:, idx])
+            for idx, embedding in enumerate(
+                self.foreign_key_embeddings
+            )
+        ]
+        datetime_encoded = self.datetime_encoder(datetime_values)
+        datetimes = [
+            datetime_encoded[:, idx, :]
+            for idx in range(datetime_encoded.shape[1])
+        ]
+        if graph_context is None:
+            graph_context = torch.zeros(
+                foreign_key_ids.shape[0],
+                self.graph_context_dim,
+                dtype=torch.float32,
+                device=foreign_key_ids.device,
+            )
+        return {
+            "foreign_keys": foreign_keys,
+            "datetimes": datetimes,
+            "graph": graph_context.float(),
+        }
 
     def row_latent(self, condition: torch.Tensor, noise: torch.Tensor | None = None) -> torch.Tensor:
         if noise is None:
@@ -230,8 +367,130 @@ class JointLSTMRelationalAttributeGenerator(nn.Module):
     def categorical_logits(self, row_latent: torch.Tensor) -> dict[str, torch.Tensor]:
         return {column: head(row_latent) for column, head in self.categorical_heads.items()}
 
-    def numerical_params(self, row_latent: torch.Tensor) -> dict[str, torch.Tensor]:
-        return {column: head(row_latent) for column, head in self.numerical_heads.items()}
+    def numerical_hidden(
+        self,
+        row_latent: torch.Tensor,
+        foreign_key_ids: torch.Tensor | None = None,
+        datetime_values: torch.Tensor | None = None,
+        graph_context: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if not self.explicit_numerical_conditioning:
+            return row_latent
+        if foreign_key_ids is None or datetime_values is None:
+            raise ValueError(
+                "Explicit numerical conditioning requires foreign keys "
+                "and datetime values"
+            )
+        components = self.encode_condition_components(
+            foreign_key_ids,
+            datetime_values,
+            graph_context=graph_context,
+        )
+        source_index = int(
+            self.numerical_event_roles["source_fk_index"]
+        )
+        destination_index = int(
+            self.numerical_event_roles["destination_fk_index"]
+        )
+        source_pieces = [
+            components["foreign_keys"][source_index],
+            *components["datetimes"],
+        ]
+        destination_pieces = [
+            components["foreign_keys"][destination_index],
+        ]
+        if self.use_graph_context:
+            source_pieces.append(components["graph"])
+            destination_pieces.append(components["graph"])
+        source_temporal = (
+            self.numerical_source_temporal_projection(
+                torch.cat(source_pieces, dim=1)
+            )
+        )
+        destination = self.numerical_destination_projection(
+            torch.cat(destination_pieces, dim=1)
+        )
+        shared = self.numerical_shared_norm(
+            row_latent + source_temporal
+        )
+        gate = torch.sigmoid(
+            self.numerical_destination_gate(
+                torch.cat([shared, destination], dim=1)
+            )
+        )
+        return self.numerical_output_norm(
+            shared + gate * destination
+        )
+
+    def numerical_params(
+        self,
+        row_latent: torch.Tensor,
+        foreign_key_ids: torch.Tensor | None = None,
+        datetime_values: torch.Tensor | None = None,
+        graph_context: torch.Tensor | None = None,
+        target_values: torch.Tensor | None = None,
+    ) -> dict[str, Any]:
+        hidden = self.numerical_hidden(
+            row_latent,
+            foreign_key_ids,
+            datetime_values,
+            graph_context,
+        )
+        output: dict[str, Any] = {}
+        for index, column in enumerate(self.schema.numerical_targets):
+            mode = self.numerical_head_modes[column]
+            if mode == "continuous_baseline":
+                output[column] = self.numerical_heads[column](hidden)
+                continue
+            if foreign_key_ids is None or datetime_values is None:
+                raise ValueError(
+                    "Support-aware numerical heads require event-spine "
+                    "conditions"
+                )
+            roles = self.numerical_head_metadata["event_roles"]
+            destination_ids = foreign_key_ids[
+                :,
+                int(roles["destination_fk_index"]),
+            ]
+            timestamps = datetime_values[
+                :,
+                int(roles["timestamp_index"]),
+            ]
+            target = (
+                target_values[:, index]
+                if target_values is not None
+                and target_values.shape[1] > index
+                else None
+            )
+            head = self.support_numerical_heads[column]
+            if mode == "hierarchical_support":
+                output[column] = head(
+                    hidden,
+                    destination_ids,
+                    timestamps,
+                    target_values=target,
+                )
+            else:
+                output[column] = head(
+                    hidden,
+                    destination_ids,
+                    timestamps,
+                )
+        return output
+
+    def sample_support_numerical(
+        self,
+        output: dict[str, Any],
+        *,
+        temperature: float,
+    ) -> dict[str, torch.Tensor]:
+        values: dict[str, torch.Tensor] = {}
+        for column, head in self.support_numerical_heads.items():
+            values[column] = head.sample(
+                output[column],
+                temperature=temperature,
+            )
+        return values
 
     def categorical_context(self, row_latent: torch.Tensor, categorical_ids: torch.Tensor) -> torch.Tensor:
         pieces = [row_latent]
@@ -319,11 +578,18 @@ class JointLSTMRelationalAttributeGenerator(nn.Module):
         text_ids: dict[str, torch.Tensor],
         graph_context: torch.Tensor | None = None,
         noise: torch.Tensor | None = None,
+        numerical_values: torch.Tensor | None = None,
     ) -> dict[str, Any]:
         condition = self.encode_condition(foreign_key_ids, datetime_values, graph_context=graph_context)
         row = self.row_latent(condition, noise=noise)
         cat_logits = self.categorical_logits(row)
-        numerical = self.numerical_params(row)
+        numerical = self.numerical_params(
+            row,
+            foreign_key_ids,
+            datetime_values,
+            graph_context,
+            target_values=numerical_values,
+        )
         context = self.categorical_context(row, categorical_ids)
         text_logits: dict[str, torch.Tensor] = {}
         summary_repr = None
@@ -346,6 +612,7 @@ class JointLSTMRelationalAttributeGenerator(nn.Module):
         tokenizer: SimpleTextTokenizer,
         graph_context: torch.Tensor | None = None,
         temperature: float = 0.9,
+        numerical_temperature: float | None = None,
         top_p: float = 0.95,
         min_tokens: dict[str, int] | None = None,
         repetition_penalty: dict[str, float] | None = None,
@@ -355,7 +622,20 @@ class JointLSTMRelationalAttributeGenerator(nn.Module):
         condition = self.encode_condition(foreign_key_ids, datetime_values, graph_context=graph_context)
         row = self.row_latent(condition)
         cat_logits = self.categorical_logits(row)
-        numerical_params = self.numerical_params(row)
+        numerical_params = self.numerical_params(
+            row,
+            foreign_key_ids,
+            datetime_values,
+            graph_context,
+        )
+        support_numerical_values = self.sample_support_numerical(
+            numerical_params,
+            temperature=(
+                float(numerical_temperature)
+                if numerical_temperature is not None
+                else float(temperature)
+            ),
+        )
         sampled_cat_columns: list[torch.Tensor] = []
         decoded_cats: dict[str, list[Any]] = {}
         for column in self.schema.model_categorical_targets:
@@ -393,6 +673,7 @@ class JointLSTMRelationalAttributeGenerator(nn.Module):
             "categorical_ids": categorical_ids,
             "categorical": decoded_cats,
             "numerical_params": numerical_params,
+            "numerical_values": support_numerical_values,
             "text_ids": text_ids,
             "text": decoded_text,
             "text_lengths": lengths,
@@ -480,6 +761,10 @@ class JointLSTMRelationalAttributeGenerator(nn.Module):
             "use_graph_context": self.use_graph_context,
             "text_vocab_size": self.text_vocab_size,
             "numerical_targets": list(self.schema.numerical_targets),
+            "numerical_head_modes": dict(self.numerical_head_modes),
+            "explicit_numerical_conditioning": bool(
+                self.explicit_numerical_conditioning
+            ),
             "review_text_conditioned_on_summary": self.review_text_conditioned_on_summary,
             "summary_condition_type": self.summary_condition_type,
             "summary_condition_dim": self.summary_condition_dim,
@@ -544,7 +829,87 @@ def build_lstm_model(
         summary_condition_dropout=float(review_decoder_cfg.get("summary_condition_dropout", 0.1)),
         decoder_input_token_dropout=token_dropout,
         decoder_input_token_dropout_replacement=str(token_dropout_cfg.get("replacement", "UNK")),
+        numerical_head_metadata=config.raw.get(
+            "_numerical_head_metadata"
+        ),
+        numerical_conditioning=(
+            (
+                config.raw.get("_numerical_head_metadata") or {}
+            ).get("conditioning")
+            or (config.raw.get("numerical_heads") or {}).get(
+                "conditioning"
+            )
+        ),
     )
+
+
+def prepare_numerical_head_config(
+    config: ConditionalTABDLMConfig,
+    *,
+    numerical_metadata: dict[str, Any],
+    train_frame: pd.DataFrame | None,
+    train_dataset: Any | None,
+    metadata_dir: Path,
+) -> dict[str, Any]:
+    """Resolve opt-in head state before model construction."""
+
+    if not numerical_head_feature_enabled(config.raw):
+        return {}
+    fit_source = "in_memory_training_frame"
+    fit_frame = train_frame
+    fit_dataset = train_dataset
+    training_table_path = (
+        config.raw.get("paths") or {}
+    ).get("numerical_head_training_table_path")
+    if fit_frame is None and training_table_path:
+        training_table_path = Path(training_table_path)
+        if not training_table_path.exists():
+            raise FileNotFoundError(
+                "Missing training-only table for numerical-head "
+                f"metadata: {training_table_path}"
+            )
+        required_columns = list(
+            dict.fromkeys(
+                [
+                    *config.schema.foreign_key_columns,
+                    *config.schema.datetime_columns,
+                    *config.schema.numerical_targets,
+                ]
+            )
+        )
+        fit_frame = pd.read_csv(
+            training_table_path,
+            usecols=required_columns,
+            low_memory=False,
+        )
+        fit_dataset = None
+        fit_source = "training_only_table"
+    elif fit_frame is None:
+        fit_source = "pretokenized_training_arrays"
+    metadata = fit_numerical_head_metadata(
+        config,
+        train_frame=fit_frame,
+        train_dataset=fit_dataset,
+        numerical_metadata=numerical_metadata,
+    )
+    metadata["fit_source"] = fit_source
+    if training_table_path:
+        metadata["fit_source_path"] = str(training_table_path)
+    config.raw["_numerical_head_metadata"] = metadata
+    save_json(
+        metadata,
+        metadata_dir / "numerical_head_metadata.json",
+    )
+    save_json(
+        {
+            column: report.get("inferred_type")
+            for column, report in (
+                metadata.get("columns") or {}
+            ).items()
+        },
+        metadata_dir / "numerical_type_inference.json",
+    )
+    return metadata
 
 
 def train_lstm_from_config(config: ConditionalTABDLMConfig, device: str | None = None) -> Path:
@@ -613,6 +978,14 @@ def _train_lstm_from_config_once(
     categorical_vocabs = load_category_vocabs(config)
     tokenizer = load_text_tokenizer(config)
     numerical_metadata = load_numerical_metadata(config)
+    prepare_numerical_head_config(
+        config,
+        numerical_metadata=numerical_metadata,
+        train_frame=train_frame,
+        train_dataset=None,
+        metadata_dir=metadata_dir,
+    )
+    save_yaml(config.to_dict(), output_dir / "config_resolved.yaml")
     num_hash_buckets = int(config.raw.get("id_encoding", {}).get("num_buckets", 262144))
     train_dataset = ConditionalTABDLMDataset(train_frame, config.schema, categorical_vocabs, tokenizer, num_hash_buckets, numerical_metadata=numerical_metadata)
     valid_dataset = ConditionalTABDLMDataset(valid_frame, config.schema, categorical_vocabs, tokenizer, num_hash_buckets, numerical_metadata=numerical_metadata)
@@ -684,9 +1057,12 @@ def _train_lstm_from_config_once(
         if checkpoint.get("scaler_state_dict") is not None:
             scaler.load_state_dict(checkpoint["scaler_state_dict"])
         start_epoch = int(checkpoint.get("epoch", 0)) + 1
-        valid_total = (checkpoint.get("valid_metrics") or {}).get("total_loss")
-        if valid_total is not None:
-            best_valid = float(valid_total)
+        checkpoint_metrics = checkpoint.get("valid_metrics") or {}
+        if checkpoint_metrics:
+            best_valid = validation_selection_value(
+                checkpoint_metrics,
+                config,
+            )
         print(f"Resuming LSTM training from {resume_from} at epoch={start_epoch}")
     elif log_path.exists():
         log_path.unlink()
@@ -695,9 +1071,15 @@ def _train_lstm_from_config_once(
     if resume_from and best_path.exists():
         try:
             best_checkpoint = torch.load(best_path, map_location="cpu")
-            best_total = (best_checkpoint.get("valid_metrics") or {}).get("total_loss")
-            if best_total is not None:
-                best_valid = min(best_valid, float(best_total))
+            best_metrics = best_checkpoint.get("valid_metrics") or {}
+            if best_metrics:
+                best_valid = min(
+                    best_valid,
+                    validation_selection_value(
+                        best_metrics,
+                        config,
+                    ),
+                )
         except Exception:
             pass
     for epoch in range(start_epoch, epochs + 1):
@@ -734,13 +1116,20 @@ def _train_lstm_from_config_once(
             config=config,
             clip_norm=clip_norm,
         )
-        current = float(valid_metrics["total_loss"])
+        current = validation_selection_value(
+            valid_metrics,
+            config,
+        )
+        selection_metric = validation_selection_metric_name(config)
         improved = current < (best_valid - min_delta)
         row = {
             "epoch": int(epoch),
             **{f"train_{key}": value for key, value in train_metrics.items()},
             **{f"valid_{key}": value for key, value in valid_metrics.items()},
             "best_valid_total_loss": min(best_valid, current),
+            "validation_selection_metric": selection_metric,
+            "validation_selection_value": float(current),
+            "best_validation_score": min(best_valid, current),
             "epochs_without_improvement": 0 if improved else without_improvement + 1,
         }
         append_jsonl(log_path, row)
@@ -764,6 +1153,10 @@ def _train_lstm_from_config_once(
             "min_batch_size": int(training.get("min_batch_size", batch_size)),
             "epochs_completed": int(epoch),
             "best_valid_total_loss": float(best_valid),
+            "validation_selection_metric": (
+                validation_selection_metric_name(config)
+            ),
+            "best_validation_score": float(best_valid),
             "device": str(device),
             "mixed_precision_used": bool(use_amp),
         },
@@ -812,6 +1205,23 @@ def _train_lstm_fixed_step_from_config_once(
         train_dataset = ConditionalTABDLMDataset(train_frame, config.schema, categorical_vocabs, tokenizer, num_hash_buckets, numerical_metadata=numerical_metadata)
         valid_dataset = ConditionalTABDLMDataset(valid_frame, config.schema, categorical_vocabs, tokenizer, num_hash_buckets, numerical_metadata=numerical_metadata)
         train_rows_available = int(len(train_dataset))
+
+    numerical_metadata = (
+        config.raw.get("_numerical_metadata")
+        or (
+            bundle.numerical_metadata
+            if pretokenized_dir
+            else load_numerical_metadata(config)
+        )
+    )
+    prepare_numerical_head_config(
+        config,
+        numerical_metadata=numerical_metadata,
+        train_frame=train_frame,
+        train_dataset=train_dataset,
+        metadata_dir=metadata_dir,
+    )
+    save_yaml(config.to_dict(), output_dir / "config_resolved.yaml")
 
     use_graph_context = graph_conditioning_enabled(config.raw)
     if use_graph_context:
@@ -967,6 +1377,10 @@ def _train_lstm_fixed_step_from_config_once(
         "amp_dtype": str(training.get("amp_dtype", "fp16")),
         "best_checkpoint_path": str(best_path),
         "best_valid_total_loss": float(best_valid),
+        "validation_selection_metric": (
+            validation_selection_metric_name(config)
+        ),
+        "best_validation_score": float(best_valid),
         "best_step": int(best_step),
         "parameter_count": int(parameter_count),
         "peak_gpu_memory_mb": peak_gpu_memory_mb,
@@ -979,7 +1393,12 @@ def _train_lstm_fixed_step_from_config_once(
         "final_physical_batch_size": int(batch_size),
         "pretokenized_dir": str(pretokenized_dir) if pretokenized_dir else None,
         "neighbor_cache_dir": str(neighbor_cache_dir) if neighbor_cache_dir else None,
-        "architecture_changed": False,
+        "architecture_changed": bool(
+            (config.raw.get("experiment_metadata") or {}).get(
+                "baseline_architecture_changed",
+                False,
+            )
+        ),
     }
     runtime.update({key: value for key, value in train_metrics.items() if key.startswith("avg_") or key.endswith("_seconds")})
     save_json(runtime, metadata_dir / "training_runtime.json")
@@ -1068,11 +1487,20 @@ def run_lstm_fixed_steps(
     }
     microbatches = 0
     last_gradient_norm = float("nan")
+    last_gradient_groups: dict[str, float] = {}
     progress = tqdm(total=int(max_steps), desc="train_lstm_fixed_step") if tqdm is not None else None
     train_start = time.perf_counter()
     for step in range(1, int(max_steps) + 1):
         steps_completed = step
         step_start = time.perf_counter()
+        should_eval = step == int(max_steps) or (
+            steps_per_eval > 0
+            and step % int(steps_per_eval) == 0
+        )
+        should_ckpt = step == int(max_steps) or (
+            steps_per_checkpoint > 0
+            and step % int(steps_per_checkpoint) == 0
+        )
         for _ in range(int(gradient_accumulation_steps)):
             load_start = time.perf_counter()
             try:
@@ -1103,6 +1531,7 @@ def run_lstm_fixed_steps(
                     batch["categorical_ids"],
                     batch["text_ids"],
                     graph_context=graph_context,
+                    numerical_values=batch.get("numerical_values"),
                 )
                 loss, component = lstm_joint_loss(
                     logits,
@@ -1127,6 +1556,11 @@ def run_lstm_fixed_steps(
             microbatches += 1
         optimizer_start = time.perf_counter()
         scaler.unscale_(optimizer)
+        if should_eval:
+            last_gradient_groups = numerical_gradient_norms(
+                model,
+                graph_encoder,
+            )
         gradient_norm = torch.nn.utils.clip_grad_norm_(
             list(model.parameters())
             + (list(graph_encoder.parameters()) if graph_encoder is not None else []),
@@ -1148,8 +1582,6 @@ def run_lstm_fixed_steps(
                 step_s=f"{(elapsed / max(step, 1)):.3f}",
             )
             progress.update(1)
-        should_eval = step == int(max_steps) or (steps_per_eval > 0 and step % int(steps_per_eval) == 0)
-        should_ckpt = step == int(max_steps) or (steps_per_checkpoint > 0 and step % int(steps_per_checkpoint) == 0)
         if should_eval:
             valid_metrics = run_lstm_epoch(
                 model,
@@ -1170,7 +1602,13 @@ def run_lstm_fixed_steps(
                 max_batches=validation_max_batches,
             )
             last_valid_metrics = valid_metrics
-            current = float(valid_metrics.get("total_loss", float("inf")))
+            current = validation_selection_value(
+                valid_metrics,
+                config,
+            )
+            selection_metric = validation_selection_metric_name(
+                config
+            )
             improved = current < (best_valid - min_delta)
             if improved:
                 best_valid = current
@@ -1204,9 +1642,16 @@ def run_lstm_fixed_steps(
                 ),
                 "learning_rate": float(optimizer.param_groups[0]["lr"]),
                 "gradient_norm": float(last_gradient_norm),
+                **{
+                    f"gradient_norm_{key}": value
+                    for key, value in last_gradient_groups.items()
+                },
                 **{f"train_{key}": value for key, value in train_metrics.items()},
                 **{f"valid_{key}": value for key, value in valid_metrics.items()},
                 "best_valid_total_loss": float(best_valid),
+                "validation_selection_metric": selection_metric,
+                "validation_selection_value": float(current),
+                "best_validation_score": float(best_valid),
                 "best_step": int(best_step),
                 "early_stopping_patience": int(patience),
                 "steps_without_improvement": int(without_improvement),
@@ -1240,6 +1685,10 @@ def run_lstm_fixed_steps(
     denom = max(float(microbatches), 1.0)
     return {
         "best_valid_total_loss": float(best_valid),
+        "validation_selection_metric": (
+            validation_selection_metric_name(config)
+        ),
+        "best_validation_score": float(best_valid),
         "best_step": int(best_step),
         "steps_completed": int(steps_completed),
         "stopped_early": bool(stopped_early),
@@ -1285,7 +1734,12 @@ def finalize_lstm_component_metrics(
         count = max(float(counts.get(key, 0.0)), 1.0)
         value = float(totals[key] / count)
         metrics[f"{key}_loss"] = value
-        total += float(loss_weights.get(key, 1.0)) * value
+        is_numerical_breakdown = is_numerical_loss_breakdown(
+            key,
+            schema,
+        )
+        if not is_numerical_breakdown:
+            total += float(loss_weights.get(key, 1.0)) * value
         if key in cat_metric_names:
             metrics[f"{key}_accuracy"] = float(corrects.get(key, 0) / count)
     smoothing = text_label_smoothing_from_config(config)
@@ -1294,6 +1748,86 @@ def finalize_lstm_component_metrics(
         metrics[metric_key] = float(value)
     metrics["total_loss"] = float(total)
     return metrics
+
+
+def is_numerical_loss_breakdown(
+    key: str,
+    schema: ConditionalTABDLMSchema,
+) -> bool:
+    return any(
+        key == f"{column}_{suffix}"
+        for column in schema.numerical_targets
+        for suffix in (
+            "nll",
+            "ordinal",
+            "global_calibration",
+        )
+    )
+
+
+def numerical_gradient_norms(
+    model: JointLSTMRelationalAttributeGenerator,
+    graph_encoder: TemporalStructureOnlyGraphEncoder | None,
+) -> dict[str, float]:
+    """Report gradient reachability for numerical conditioning paths."""
+
+    groups: dict[str, list[torch.nn.Parameter]] = {
+        "numerical_head": [
+            *model.numerical_heads.parameters(),
+            *model.support_numerical_heads.parameters(),
+        ],
+        "shared_row_layers": [
+            *model.condition_mlp.parameters(),
+            *model.row_encoder.parameters(),
+        ],
+        "temporal_encoder": list(
+            model.datetime_encoder.parameters()
+        ),
+        "graph_encoder": (
+            list(graph_encoder.parameters())
+            if graph_encoder is not None
+            else []
+        ),
+    }
+    roles = model.numerical_event_roles
+    if roles:
+        source_index = int(roles["source_fk_index"])
+        destination_index = int(roles["destination_fk_index"])
+        groups["source_encoder"] = list(
+            model.foreign_key_embeddings[source_index].parameters()
+        )
+        groups["destination_encoder"] = list(
+            model.foreign_key_embeddings[
+                destination_index
+            ].parameters()
+        )
+        if model.explicit_numerical_conditioning:
+            groups["source_encoder"].extend(
+                model.numerical_source_temporal_projection.parameters()
+            )
+            groups["destination_encoder"].extend(
+                model.numerical_destination_projection.parameters()
+            )
+            groups["destination_encoder"].extend(
+                model.numerical_destination_gate.parameters()
+            )
+    return {
+        name: parameter_gradient_norm(parameters)
+        for name, parameters in groups.items()
+    }
+
+
+def parameter_gradient_norm(
+    parameters: list[torch.nn.Parameter],
+) -> float:
+    squared = 0.0
+    for parameter in parameters:
+        if parameter.grad is None:
+            continue
+        squared += float(
+            parameter.grad.detach().float().pow(2).sum().cpu()
+        )
+    return float(math.sqrt(squared))
 
 
 def build_fixed_step_lstm_loader(
@@ -1422,6 +1956,261 @@ def bool_value(value: Any) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def numerical_predictions_for_validation(
+    model: JointLSTMRelationalAttributeGenerator,
+    outputs: dict[str, Any],
+) -> torch.Tensor:
+    predictions: list[torch.Tensor] = []
+    for column in model.schema.numerical_targets:
+        output = outputs[column]
+        if not isinstance(output, dict):
+            predictions.append(output[:, 0].float())
+            continue
+        if output["mode"] == "discrete_support":
+            support_ids = output["logits"].argmax(dim=1)
+            predictions.append(
+                output["support_standardized"][support_ids]
+            )
+            continue
+        head = model.support_numerical_heads[column]
+        coarse_ids = output["coarse_logits"].argmax(dim=1)
+        support_ids = torch.empty_like(coarse_ids)
+        prior_logits = output.get("prior_logits")
+        for bin_id, layer in enumerate(head.fine):
+            selected = coarse_ids == bin_id
+            if not selected.any():
+                continue
+            local_logits = layer(output["hidden"][selected])
+            start = int(head.offsets[bin_id].item())
+            end = int(head.offsets[bin_id + 1].item())
+            if prior_logits is not None:
+                local_logits = (
+                    local_logits
+                    + head.prior.lambda_prior
+                    * prior_logits[selected, start:end]
+                )
+            support_ids[selected] = (
+                local_logits.argmax(dim=1) + start
+            )
+        predictions.append(
+            output["support_standardized"][support_ids]
+        )
+    return torch.stack(predictions, dim=1)
+
+
+def validation_numerical_metrics(
+    collected: dict[str, list[np.ndarray]],
+    schema: ConditionalTABDLMSchema,
+    config: ConditionalTABDLMConfig | None,
+) -> dict[str, float]:
+    target = np.concatenate(collected["target"], axis=0)
+    prediction = np.concatenate(
+        collected["prediction"],
+        axis=0,
+    )
+    source = np.concatenate(collected["source"], axis=0)
+    destination = np.concatenate(
+        collected["destination"],
+        axis=0,
+    )
+    timestamp = np.concatenate(
+        collected["timestamp"],
+        axis=0,
+    )
+    metrics: dict[str, float] = {}
+    composite_values: list[float] = []
+    selection_cfg = (
+        (config.raw.get("numerical_heads") or {}).get(
+            "validation_selection"
+        )
+        if config is not None
+        else {}
+    ) or {}
+    trend_weight = float(selection_cfg.get("trend_weight", 0.1))
+    metadata_columns = (
+        (
+            config.raw.get("_numerical_head_metadata") or {}
+        ).get("columns")
+        if config is not None
+        else {}
+    ) or {}
+    for index, column in enumerate(schema.numerical_targets):
+        real_values = target[:, index]
+        predicted_values = prediction[:, index]
+        scale = max(float(np.std(real_values)), 1e-12)
+        ks = float(ks_distance(real_values, predicted_values))
+        wasserstein = float(
+            wasserstein_1d(real_values, predicted_values)
+        )
+        quantiles = [0.05, 0.25, 0.5, 0.75, 0.95]
+        quantile_mae = float(
+            np.mean(
+                np.abs(
+                    np.quantile(real_values, quantiles)
+                    - np.quantile(predicted_values, quantiles)
+                )
+            )
+        )
+        destination_mae = grouped_standardized_mean_mae(
+            real_values,
+            predicted_values,
+            destination,
+            scale,
+        )
+        source_mae = grouped_standardized_mean_mae(
+            real_values,
+            predicted_values,
+            source,
+            scale,
+        )
+        time_groups = timestamp_quantile_groups(timestamp, 8)
+        trend = grouped_standardized_mean_mae(
+            real_values,
+            predicted_values,
+            time_groups,
+            scale,
+        )
+        support = np.asarray(
+            (
+                metadata_columns.get(column) or {}
+            ).get("support_values_standardized", []),
+            dtype=float,
+        )
+        support_overlap = (
+            float(np.mean(np.isin(predicted_values, support)))
+            if len(support)
+            else float("nan")
+        )
+        _, predicted_counts = np.unique(
+            predicted_values,
+            return_counts=True,
+        )
+        predicted_probabilities = (
+            predicted_counts.astype(float)
+            / max(float(predicted_counts.sum()), 1.0)
+        )
+        support_entropy = float(
+            -np.sum(
+                predicted_probabilities
+                * np.log(
+                    np.clip(
+                        predicted_probabilities,
+                        1e-12,
+                        None,
+                    )
+                )
+            )
+        )
+        normalized_support_entropy = (
+            float(
+                support_entropy
+                / np.log(max(len(support), 2))
+            )
+            if len(support)
+            else float("nan")
+        )
+        prefix = f"numerical_{column}_"
+        metrics.update(
+            {
+                prefix + "ks": ks,
+                prefix + "wasserstein": wasserstein,
+                prefix + "quantile_mae": quantile_mae,
+                prefix
+                + "destination_conditioned_standardized_mae": (
+                    destination_mae
+                ),
+                prefix
+                + "source_conditioned_standardized_mae": source_mae,
+                prefix + "temporal_trend_error": trend,
+                prefix + "support_overlap": support_overlap,
+                prefix + "support_entropy": support_entropy,
+                prefix
+                + "normalized_support_entropy": (
+                    normalized_support_entropy
+                ),
+                prefix + "unique_value_ratio": float(
+                    len(np.unique(predicted_values))
+                    / max(len(predicted_values), 1)
+                ),
+            }
+        )
+        composite_values.append(
+            ks + destination_mae + trend_weight * trend
+        )
+    metrics["numerical_validation_composite"] = float(
+        np.mean(composite_values)
+    )
+    return metrics
+
+
+def grouped_standardized_mean_mae(
+    target: np.ndarray,
+    prediction: np.ndarray,
+    groups: np.ndarray,
+    scale: float,
+) -> float:
+    frame = pd.DataFrame(
+        {
+            "target": target,
+            "prediction": prediction,
+            "group": groups,
+        }
+    )
+    grouped = frame.groupby("group", dropna=False)
+    means = grouped[["target", "prediction"]].mean()
+    weights = grouped.size().reindex(means.index).to_numpy(float)
+    errors = (
+        means["target"] - means["prediction"]
+    ).abs().to_numpy(float)
+    return float(
+        np.average(errors, weights=weights) / max(scale, 1e-12)
+    )
+
+
+def timestamp_quantile_groups(
+    timestamps: np.ndarray,
+    num_bins: int,
+) -> np.ndarray:
+    values = pd.Series(np.asarray(timestamps, dtype=float))
+    try:
+        return pd.qcut(
+            values.rank(method="first"),
+            q=min(max(int(num_bins), 1), len(values)),
+            labels=False,
+            duplicates="drop",
+        ).to_numpy(dtype=np.int64)
+    except ValueError:
+        return np.zeros(len(values), dtype=np.int64)
+
+
+def validation_selection_value(
+    metrics: dict[str, float],
+    config: ConditionalTABDLMConfig,
+) -> float:
+    metric = validation_selection_metric_name(config)
+    value = metrics.get(metric)
+    if value is None:
+        raise KeyError(
+            f"Validation selection metric {metric!r} was not computed"
+        )
+    return float(value)
+
+
+def validation_selection_metric_name(
+    config: ConditionalTABDLMConfig,
+) -> str:
+    selection = (
+        (config.raw.get("numerical_heads") or {}).get(
+            "validation_selection"
+        )
+        or {}
+    )
+    metric = str(selection.get("metric", "total_loss"))
+    if metric == "numerical_composite":
+        metric = "numerical_validation_composite"
+    return metric
+
+
 def run_lstm_epoch(
     model: JointLSTMRelationalAttributeGenerator,
     loader: DataLoader,
@@ -1447,6 +2236,14 @@ def run_lstm_epoch(
     totals: dict[str, float] = {}
     counts: dict[str, float] = {}
     corrects: dict[str, int] = {}
+    last_gradient_groups: dict[str, float] = {}
+    numerical_validation: dict[str, list[np.ndarray]] = {
+        "target": [],
+        "prediction": [],
+        "source": [],
+        "destination": [],
+        "timestamp": [],
+    }
     iterator = loader
     if tqdm is not None:
         iterator = tqdm(loader, leave=False, desc="train_lstm" if training else "valid_lstm")
@@ -1476,6 +2273,7 @@ def run_lstm_epoch(
                     batch["categorical_ids"],
                     batch["text_ids"],
                     graph_context=graph_context,
+                    numerical_values=batch.get("numerical_values"),
                 )
                 loss, component = lstm_joint_loss(
                     logits,
@@ -1487,9 +2285,77 @@ def run_lstm_epoch(
                     config=config,
                     categorical_vocabs=getattr(model, "categorical_vocabs", None),
                 )
+                if (
+                    not training
+                    and model.schema.numerical_targets
+                ):
+                    numerical_validation["target"].append(
+                        batch["numerical_values"]
+                        .detach()
+                        .float()
+                        .cpu()
+                        .numpy()
+                    )
+                    numerical_validation["prediction"].append(
+                        numerical_predictions_for_validation(
+                            model,
+                            logits["numerical"],
+                        )
+                        .detach()
+                        .float()
+                        .cpu()
+                        .numpy()
+                    )
+                    roles = (
+                        model.numerical_head_metadata.get(
+                            "event_roles"
+                        )
+                        or (
+                            resolve_event_role_indices(
+                                config.raw,
+                                model.schema.foreign_key_columns,
+                                model.schema.datetime_columns,
+                            )
+                            if config is not None
+                            else {}
+                        )
+                    )
+                    if not roles:
+                        raise ValueError(
+                            "Validation numerical metrics require "
+                            "schema-derived event roles"
+                        )
+                    source_index = int(roles["source_fk_index"])
+                    destination_index = int(
+                        roles["destination_fk_index"]
+                    )
+                    timestamp_index = int(roles["timestamp_index"])
+                    numerical_validation["source"].append(
+                        batch["foreign_key_ids"][:, source_index]
+                        .detach()
+                        .cpu()
+                        .numpy()
+                    )
+                    numerical_validation["destination"].append(
+                        batch["foreign_key_ids"][:, destination_index]
+                        .detach()
+                        .cpu()
+                        .numpy()
+                    )
+                    numerical_validation["timestamp"].append(
+                        batch["datetime_values"][:, timestamp_index]
+                        .detach()
+                        .float()
+                        .cpu()
+                        .numpy()
+                    )
         if training:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
+            last_gradient_groups = numerical_gradient_norms(
+                model,
+                graph_encoder,
+            )
             torch.nn.utils.clip_grad_norm_(list(model.parameters()) + (list(graph_encoder.parameters()) if graph_encoder is not None else []), clip_norm)
             scaler.step(optimizer)
             scaler.update()
@@ -1511,7 +2377,8 @@ def run_lstm_epoch(
             metrics[key] = value
             continue
         metrics[f"{key}_loss"] = value
-        total += float(loss_weights.get(key, 1.0)) * value
+        if not is_numerical_loss_breakdown(key, model.schema):
+            total += float(loss_weights.get(key, 1.0)) * value
         if key in model.schema.model_categorical_targets:
             metrics[f"{key}_accuracy"] = float(corrects.get(key, 0) / count)
     smoothing = text_label_smoothing_from_config(config)
@@ -1519,6 +2386,20 @@ def run_lstm_epoch(
         metric_key = "label_smoothing_summary" if column == "summary" else f"label_smoothing_{column}"
         metrics[metric_key] = float(value)
     metrics["total_loss"] = float(total)
+    if numerical_validation["target"]:
+        metrics.update(
+            validation_numerical_metrics(
+                numerical_validation,
+                model.schema,
+                config,
+            )
+        )
+    metrics.update(
+        {
+            f"gradient_norm_{key}": value
+            for key, value in last_gradient_groups.items()
+        }
+    )
     return metrics
 
 
@@ -1563,11 +2444,46 @@ def lstm_joint_loss(
     if numerical_values is not None:
         for idx, column in enumerate(schema.numerical_targets):
             target = numerical_values[:, idx]
-            loss_values = gaussian_nll_from_params(logits["numerical"][column], target)
-            loss_sum = loss_values.sum()
             count = int(target.numel())
-            losses.append(float(loss_weights.get(column, 1.0)) * (loss_sum / max(count, 1)))
-            component[column] = {"loss_sum": float(loss_sum.detach().cpu()), "count": count}
+            numerical_output = logits["numerical"][column]
+            if isinstance(numerical_output, dict):
+                numerical_loss, numerical_components = (
+                    support_numerical_loss(
+                        numerical_output,
+                        target,
+                    )
+                )
+                losses.append(
+                    float(loss_weights.get(column, 1.0))
+                    * numerical_loss
+                )
+                component[column] = {
+                    "loss_sum": float(
+                        numerical_loss.detach().cpu()
+                    )
+                    * count,
+                    "count": count,
+                }
+                for name, value in numerical_components.items():
+                    component[f"{column}_{name}"] = {
+                        "loss_sum": float(value.detach().cpu())
+                        * count,
+                        "count": count,
+                    }
+            else:
+                loss_values = gaussian_nll_from_params(
+                    numerical_output,
+                    target,
+                )
+                loss_sum = loss_values.sum()
+                losses.append(
+                    float(loss_weights.get(column, 1.0))
+                    * (loss_sum / max(count, 1))
+                )
+                component[column] = {
+                    "loss_sum": float(loss_sum.detach().cpu()),
+                    "count": count,
+                }
     for column in schema.text_targets:
         labels = batch["text_ids"][column][:, 1:].contiguous()
         mask = labels != tokenizer.pad_id
@@ -1797,6 +2713,12 @@ def sample_lstm_from_config(
                 tokenizer,
                 graph_context=graph_context,
                 temperature=temperature,
+                numerical_temperature=float(
+                    sampling.get(
+                        "numerical_temperature",
+                        sampling.get("temperature", 0.9),
+                    )
+                ),
                 top_p=top_p,
                 min_tokens=min_tokens,
                 repetition_penalty=repetition,
@@ -1804,11 +2726,19 @@ def sample_lstm_from_config(
         for column in ckpt_config.schema.categorical_targets:
             attrs[column].extend(generated["categorical"][column])
         for column in ckpt_config.schema.numerical_targets:
-            sampled = sample_gaussian_params(
-                generated["numerical_params"][column],
-                temperature=float(sampling.get("numerical_temperature", sampling.get("temperature", 0.9))),
-            )
-            values = inverse_transform_numerical(sampled, numerical_metadata.get(column, {})).detach().cpu().tolist()
+            if column in generated.get("numerical_values", {}):
+                values = (
+                    generated["numerical_values"][column]
+                    .detach()
+                    .cpu()
+                    .tolist()
+                )
+            else:
+                sampled = sample_gaussian_params(
+                    generated["numerical_params"][column],
+                    temperature=float(sampling.get("numerical_temperature", sampling.get("temperature", 0.9))),
+                )
+                values = inverse_transform_numerical(sampled, numerical_metadata.get(column, {})).detach().cpu().tolist()
             attrs[column].extend(values)
         for column in ckpt_config.schema.text_targets:
             attrs[column].extend(generated["text"][column])

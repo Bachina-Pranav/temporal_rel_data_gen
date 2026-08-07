@@ -150,6 +150,12 @@ def load_config_with_overrides(args: argparse.Namespace) -> ConditionalTABDLMCon
 
 def write_training_metadata(config: ConditionalTABDLMConfig, best_path: Path, elapsed: float) -> None:
     training = config.raw.get("training", {})
+    architecture_changed = bool(
+        (config.raw.get("experiment_metadata") or {}).get(
+            "baseline_architecture_changed",
+            False,
+        )
+    )
     runtime_path = config.output_dir / "metadata" / "training_runtime.json"
     runtime = {}
     if runtime_path.exists():
@@ -167,8 +173,10 @@ def write_training_metadata(config: ConditionalTABDLMConfig, best_path: Path, el
         "synthetic_spine_path": str(config.synthetic_spine_path),
         "architecture": config.raw.get("model_type", "conditional_tabdlm_lstm_joint_full_text"),
         "model_family": config.raw.get("model_family", "conditional_tabdlm_lstm_joint_full_text"),
-        "architecture_changed_from_amazon_toy": False,
-        "architecture_changed": False,
+        "architecture_changed_from_amazon_toy": (
+            architecture_changed
+        ),
+        "architecture_changed": architecture_changed,
         "train_mode": runtime.get("train_mode", "epoch"),
         "epoch_mode": bool(training.get("epoch_mode", True)),
         "max_steps": training.get("max_steps"),
@@ -189,7 +197,10 @@ def write_training_metadata(config: ConditionalTABDLMConfig, best_path: Path, el
         "mixed_precision_used": runtime.get("mixed_precision_used", training.get("mixed_precision")),
         "amp_dtype": runtime.get("amp_dtype", training.get("amp_dtype", "fp16")),
         "total_training_seconds": runtime.get("total_training_seconds", float(elapsed)),
-        "validation_metrics": best_validation_metrics(config.output_dir / "train_log.jsonl"),
+        "validation_metrics": best_validation_metrics(
+            config.output_dir / "train_log.jsonl",
+            config,
+        ),
         "dataset_fingerprint_sha256": sha256_file(config.train_data_path),
         "configuration_fingerprint_sha256": sha256_json(config.to_dict()),
         "git_commit": git_revision(),
@@ -210,7 +221,10 @@ def prepared_row_count(path: Path) -> int | None:
             return None
 
 
-def best_validation_metrics(path: Path) -> dict[str, Any]:
+def best_validation_metrics(
+    path: Path,
+    config: ConditionalTABDLMConfig,
+) -> dict[str, Any]:
     if not path.exists():
         return {}
     rows = []
@@ -222,7 +236,34 @@ def best_validation_metrics(path: Path) -> dict[str, Any]:
                 continue
     if not rows:
         return {}
-    return min(rows, key=lambda row: float(row.get("valid_total_loss", row.get("best_valid_total_loss", float("inf")))))
+    selection = (
+        (config.raw.get("numerical_heads") or {}).get(
+            "validation_selection"
+        )
+        or {}
+    )
+    metric = str(selection.get("metric", "total_loss"))
+    if metric == "numerical_composite":
+        metric = "numerical_validation_composite"
+    key = f"valid_{metric}"
+    return min(
+        rows,
+        key=lambda row: float(
+            row.get(
+                key,
+                row.get(
+                    "validation_selection_value",
+                    row.get(
+                        "valid_total_loss",
+                        row.get(
+                            "best_valid_total_loss",
+                            float("inf"),
+                        ),
+                    ),
+                ),
+            )
+        ),
+    )
 
 
 def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
