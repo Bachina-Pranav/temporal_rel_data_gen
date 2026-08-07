@@ -90,11 +90,15 @@ def main() -> None:
         print_paths(config_paths)
         return
     if args.stage == "calibration":
+        calibration_root = matrix.get(
+            "calibration_baseline_experiment_root",
+            matrix["baseline_experiment_root"],
+        )
         command = [
             python(),
             "src/scripts/run_lstm_numerical_calibration_diagnostics.py",
             "--experiment-root",
-            str(matrix["baseline_experiment_root"]),
+            str(calibration_root),
             "--output-dir",
             str(output_root / "calibration_q0_q4"),
             "--seeds",

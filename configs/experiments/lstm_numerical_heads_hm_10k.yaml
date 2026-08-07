@@ -1,7 +1,8 @@
 experiment_name: lstm_numerical_heads_hm_10k
 base_config: configs/attribute_generation/lstm_hm_10k_customers.yaml
 evaluation_config: configs/evaluation/single_event_table_paper_metrics_hm_10k_customers.yaml
-baseline_experiment_root: outputs/hm-10k-customers/lstm_v53_three_seed
+calibration_baseline_experiment_root: outputs/hm-10k-customers/lstm_v53_three_seed
+baseline_experiment_root: outputs/hm-10k-customers/lstm_v53_explicit_split_three_seed
 pretokenized_dir: data/processed/interaction_benchmarks/hm_10k_customers/pretokenized_lstm
 neighbor_cache_dir: data/processed/interaction_benchmarks/hm_10k_customers/neighbor_cache
 output_root: outputs/hm-10k-customers/lstm_numerical_heads
