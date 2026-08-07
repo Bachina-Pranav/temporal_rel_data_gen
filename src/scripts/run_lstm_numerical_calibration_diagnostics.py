@@ -96,7 +96,7 @@ def main() -> None:
     output_dir = ensure_dir(
         args.output_dir or root / "numerical_calibration"
     )
-    shared = root / "shared"
+    shared = resolve_shared_spine_directory(root)
     train_path = shared / "train_real.csv"
     real_path = shared / "test_real.csv"
     require_files([train_path, real_path])
@@ -485,6 +485,22 @@ def resolve_event_role(
             f"schema role {schema_role!r} matched {matches}"
         )
     return matches[0]
+
+
+def resolve_shared_spine_directory(root: Path) -> Path:
+    """Resolve current and legacy multiseed shared-table layouts."""
+
+    candidates = [
+        root / "shared" / "spines",
+        root / "shared",
+    ]
+    for candidate in candidates:
+        if (
+            (candidate / "train_real.csv").is_file()
+            and (candidate / "test_real.csv").is_file()
+        ):
+            return candidate
+    return candidates[0]
 
 
 def require_files(paths: list[Path]) -> None:

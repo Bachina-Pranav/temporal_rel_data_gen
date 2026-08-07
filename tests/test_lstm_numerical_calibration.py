@@ -15,6 +15,9 @@ from attribute_generation.conditional_tabdlm.numerical_calibration import (  # n
     calibrate_numerical_column,
     empirical_rank_map,
 )
+from scripts.run_lstm_numerical_calibration_diagnostics import (  # noqa: E402
+    resolve_shared_spine_directory,
+)
 
 
 def test_global_quantile_calibration_preserves_order_and_training_support():
@@ -92,6 +95,17 @@ def test_empirical_rank_map_keeps_nan_and_tie_ranks():
     assert np.isnan(mapped[1])
     assert mapped[2] == mapped[3]
     assert mapped[2] < mapped[4] < mapped[0]
+
+
+def test_calibration_resolves_multiseed_shared_spine_layout(
+    tmp_path: Path,
+):
+    shared = tmp_path / "shared" / "spines"
+    shared.mkdir(parents=True)
+    (shared / "train_real.csv").write_text("value\n1\n")
+    (shared / "test_real.csv").write_text("value\n1\n")
+
+    assert resolve_shared_spine_directory(tmp_path) == shared
 
 
 def frame(
