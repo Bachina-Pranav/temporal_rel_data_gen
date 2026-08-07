@@ -146,9 +146,8 @@ def main() -> None:
         base_config_path,
         config.train_data_path,
         Path(args.neighbor_cache_dir),
-        len(pd.read_csv(config.train_data_path, usecols=[schema.datetime_columns[0]]))
-        if not args.dry_run
-        else None,
+        expected_materialized_rows(expected_splits)
+        if not args.dry_run else None,
         args,
         logs,
     )
@@ -800,6 +799,17 @@ def ensure_neighbor_cache(
         ],
         logs / "neighbor_cache.log",
         args,
+    )
+
+
+def expected_materialized_rows(
+    expected_splits: dict[str, Any],
+) -> int:
+    return int(
+        sum(
+            int((expected_splits.get(name) or {}).get("rows", 0))
+            for name in ("train", "validation", "test")
+        )
     )
 
 

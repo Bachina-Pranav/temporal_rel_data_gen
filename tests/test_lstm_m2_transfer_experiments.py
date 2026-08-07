@@ -19,6 +19,7 @@ from scripts.run_lstm_m2_transfer_experiments import (  # noqa: E402
 )
 from scripts.run_lstm_multiseed_experiment import (  # noqa: E402
     attribute_diagnostics_command,
+    expected_materialized_rows,
     resolve_evaluation_scope,
 )
 from attribute_generation.conditional_tabdlm.schema import (  # noqa: E402
@@ -76,6 +77,11 @@ def test_amazon_m2_changes_only_rating_target_family_and_numerical_head():
     assert derived["training"] == base["training"]
     assert derived["loss_weights"] == base["loss_weights"]
     assert derived["sampling"]["numerical_temperature"] == 1.0
+    assert derived["event_spine"] == {
+        "source_fk": "customer_id",
+        "destination_fk": "product_id",
+        "timestamp": "review_time",
+    }
 
 
 def test_movielens_m2_uses_training_derived_support_without_hardcoded_values():
@@ -120,6 +126,16 @@ def test_implicit_split_materialization_matches_legacy_90_5_5():
     latest = frame["event_time"].idxmax()
     assert labels.loc[earliest] == "train"
     assert labels.loc[latest] == "test"
+
+
+def test_neighbor_cache_expected_rows_use_filtered_split_total():
+    assert expected_materialized_rows(
+        {
+            "train": {"rows": 71_669},
+            "validation": {"rows": 3_982},
+            "test": {"rows": 3_982},
+        }
+    ) == 79_633
 
 
 def test_configured_spine_scope_uses_original_real_and_fixed_spine():

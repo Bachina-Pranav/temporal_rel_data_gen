@@ -152,6 +152,7 @@ def derive_m2_config(
         dict.fromkeys([*numerical, *selected])
     )
     targets["text"] = text
+    ensure_event_spine_roles(derived)
     derived["numerical_heads"] = copy.deepcopy(numerical_head)
     derived["experiment_name"] = variant_name
     derived["base_experiment"] = base.get("experiment_name")
@@ -174,6 +175,40 @@ def derive_m2_config(
     )
     validate_target_partition(derived)
     return derived
+
+
+def ensure_event_spine_roles(config: dict[str, Any]) -> None:
+    """Add explicit role names required by M2 to legacy configs."""
+
+    conditions = config.get("columns", {}).get("condition", {})
+    foreign_keys = [
+        str(value) for value in conditions.get("foreign_keys", [])
+    ]
+    datetimes = [
+        str(value) for value in conditions.get("datetimes", [])
+    ]
+    event_spine = config.setdefault("event_spine", {})
+    missing_fk_roles = [
+        role
+        for role in ("source_fk", "destination_fk")
+        if not event_spine.get(role)
+    ]
+    if missing_fk_roles and len(foreign_keys) != 2:
+        raise ValueError(
+            "Cannot infer source/destination event roles: expected exactly "
+            f"two foreign-key conditions, found {foreign_keys}"
+        )
+    if not event_spine.get("source_fk"):
+        event_spine["source_fk"] = foreign_keys[0]
+    if not event_spine.get("destination_fk"):
+        event_spine["destination_fk"] = foreign_keys[1]
+    if not event_spine.get("timestamp"):
+        if len(datetimes) != 1:
+            raise ValueError(
+                "Cannot infer event timestamp role: expected exactly one "
+                f"datetime condition, found {datetimes}"
+            )
+        event_spine["timestamp"] = datetimes[0]
 
 
 def validate_target_partition(config: dict[str, Any]) -> None:
