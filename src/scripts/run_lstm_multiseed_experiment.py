@@ -586,17 +586,33 @@ def ensure_pretokenized(
 ) -> None:
     metadata_path = output_dir / "metadata.json"
     valid = False
+    expected = {
+        "train_rows": int(expected_splits["train"]["rows"]),
+        "valid_rows": int(expected_splits["validation"]["rows"]),
+        "test_rows": int(expected_splits["test"]["rows"]),
+    }
+    cache_counts: dict[str, int] | None = None
     if metadata_path.exists() and not args.dry_run:
         metadata = load_json(metadata_path)
-        expected = {
-            "train_rows": int(expected_splits["train"]["rows"]),
-            "valid_rows": int(expected_splits["validation"]["rows"]),
-            "test_rows": int(expected_splits["test"]["rows"]),
+        metadata_counts = {
+            key: int(metadata.get(key, -1))
+            for key in expected
         }
-        valid = all(int(metadata.get(key, -1)) == value for key, value in expected.items())
+        cache_counts = pretokenized_split_counts(output_dir)
+        valid = (
+            cache_counts == expected
+            if cache_counts is not None
+            else metadata_counts == expected
+        )
         if valid:
+            source = (
+                "split index arrays"
+                if cache_counts == expected
+                else "metadata"
+            )
             print(
-                f"[pretokenized] reusing {output_dir}; split counts match {expected}",
+                f"[pretokenized] reusing {output_dir}; "
+                f"{source} match {expected}",
                 flush=True,
             )
     if valid:
@@ -604,7 +620,9 @@ def ensure_pretokenized(
     if output_dir.exists() and any(output_dir.iterdir()):
         if not args.rebuild_precomputed:
             raise RuntimeError(
-                f"Pretokenized cache at {output_dir} does not match the explicit split. "
+                f"Pretokenized cache at {output_dir} does not match "
+                f"the explicit split. expected={expected}, "
+                f"index_counts={cache_counts}. "
                 "Rerun with --rebuild-precomputed."
             )
         shutil.rmtree(output_dir)
@@ -624,6 +642,25 @@ def ensure_pretokenized(
         logs / "pretokenize.log",
         args,
     )
+
+
+def pretokenized_split_counts(
+    output_dir: Path,
+) -> dict[str, int] | None:
+    paths = {
+        "train_rows": output_dir / "train_indices.npy",
+        "valid_rows": output_dir / "valid_indices.npy",
+        "test_rows": output_dir / "test_indices.npy",
+    }
+    if not all(path.is_file() for path in paths.values()):
+        return None
+    try:
+        return {
+            key: int(len(np.load(path, mmap_mode="r")))
+            for key, path in paths.items()
+        }
+    except (OSError, ValueError):
+        return None
 
 
 def ensure_neighbor_cache(

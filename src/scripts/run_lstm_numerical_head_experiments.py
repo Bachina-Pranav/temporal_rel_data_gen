@@ -55,6 +55,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample-batch-size", default="8192")
     parser.add_argument("--smoke-rows", type=int, default=256)
     parser.add_argument("--skip-existing", action="store_true")
+    parser.add_argument(
+        "--rebuild-precomputed",
+        action="store_true",
+        help=(
+            "Rebuild stale shared pretokenized and neighbor caches. "
+            "The first variant rebuilds them; later variants reuse them."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
         "--real-numerical-oracle-c2st",
@@ -161,6 +169,8 @@ def main() -> None:
             command.append("--skip-smoke")
         if args.skip_existing:
             command.append("--skip-existing")
+        if args.rebuild_precomputed:
+            command.append("--rebuild-precomputed")
         if args.dry_run:
             command.append("--dry-run")
         run(command, args)

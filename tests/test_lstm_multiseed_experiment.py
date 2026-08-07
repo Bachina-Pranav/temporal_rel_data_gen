@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 
@@ -12,6 +13,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from scripts.run_lstm_multiseed_experiment import (  # noqa: E402
     attribute_diagnostics_command,
     flatten_numeric_scalars,
+    pretokenized_split_counts,
     prepare_evaluation_real,
     resolve_seed_config,
 )
@@ -110,3 +112,17 @@ def test_seed_config_uses_materialized_training_table_for_numerical_head():
         resolved["paths"]["numerical_head_training_table_path"]
         == "train_real.csv"
     )
+
+
+def test_pretokenized_split_counts_read_actual_index_arrays(
+    tmp_path: Path,
+):
+    np.save(tmp_path / "train_indices.npy", np.arange(7))
+    np.save(tmp_path / "valid_indices.npy", np.arange(2))
+    np.save(tmp_path / "test_indices.npy", np.arange(3))
+
+    assert pretokenized_split_counts(tmp_path) == {
+        "train_rows": 7,
+        "valid_rows": 2,
+        "test_rows": 3,
+    }
