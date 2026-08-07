@@ -34,7 +34,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-real", required=True)
     parser.add_argument("--evaluation-real", required=True)
     parser.add_argument("--synthetic", required=True)
-    parser.add_argument("--graph-history-prefix", required=True)
+    parser.add_argument("--graph-history-prefix", default=None)
     parser.add_argument("--evaluation-config", default=None)
     parser.add_argument("--output", required=True)
     parser.add_argument("--seed", type=int, default=42)
@@ -54,7 +54,11 @@ def main() -> None:
     train = pd.read_csv(args.train_real, low_memory=False)
     real = pd.read_csv(args.evaluation_real, low_memory=False)
     synthetic = pd.read_csv(args.synthetic, low_memory=False)
-    prefix = pd.read_csv(args.graph_history_prefix, low_memory=False)
+    prefix = (
+        pd.read_csv(args.graph_history_prefix, low_memory=False)
+        if args.graph_history_prefix
+        else pd.DataFrame(columns=config.schema.condition_columns)
+    )
     evaluation_config = (
         load_mapping(args.evaluation_config)
         if args.evaluation_config
@@ -220,6 +224,10 @@ def numerical_metrics(
         "quantile_mae": float(np.mean(np.abs(real_q - syn_q))),
         "ks_distance": ks_distance(real_valid, syn_valid),
         "wasserstein_distance": wasserstein_1d(real_valid, syn_valid),
+        "support_total_variation": total_variation(
+            real_valid,
+            syn_valid,
+        ),
         "invalid_rate": float(invalid.mean()),
         "out_of_train_range_rate": float(out_of_range.mean()),
         "training_support_size": int(len(train_support)),
@@ -241,6 +249,8 @@ def numerical_metrics(
         "unique_value_ratio_synthetic": float(
             syn_valid.nunique() / max(len(syn_valid), 1)
         ),
+        "num_unique_real": int(real_valid.nunique()),
+        "num_unique_synthetic": int(syn_valid.nunique()),
         "support_entropy_real": empirical_entropy(real_valid),
         "support_entropy_synthetic": empirical_entropy(syn_valid),
         "missingness_rate_error": float(

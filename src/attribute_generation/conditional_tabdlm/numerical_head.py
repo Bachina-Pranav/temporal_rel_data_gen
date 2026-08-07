@@ -1084,12 +1084,20 @@ class DiscreteSupportNumericalHead(nn.Module):
         *,
         temperature: float,
     ) -> torch.Tensor:
+        ids = self.sample_ids(output, temperature=temperature)
+        return self.support_original[ids]
+
+    def sample_ids(
+        self,
+        output: dict[str, Any],
+        *,
+        temperature: float,
+    ) -> torch.Tensor:
         logits = output["logits"] / max(float(temperature), 1e-6)
-        ids = torch.multinomial(
+        return torch.multinomial(
             torch.softmax(logits.float(), dim=-1),
             num_samples=1,
         ).squeeze(1)
-        return self.support_original[ids]
 
 
 class HierarchicalSupportNumericalHead(nn.Module):
@@ -1320,6 +1328,18 @@ class HierarchicalSupportNumericalHead(nn.Module):
         *,
         temperature: float,
     ) -> torch.Tensor:
+        support_ids = self.sample_ids(
+            output,
+            temperature=temperature,
+        )
+        return self.support_original[support_ids]
+
+    def sample_ids(
+        self,
+        output: dict[str, Any],
+        *,
+        temperature: float,
+    ) -> torch.Tensor:
         coarse = torch.multinomial(
             torch.softmax(
                 output["coarse_logits"].float()
@@ -1382,7 +1402,7 @@ class HierarchicalSupportNumericalHead(nn.Module):
                 1,
             ).squeeze(1)
             support_ids[selected] = local + self.offsets[bin_id]
-        return self.support_original[support_ids]
+        return support_ids
 
 
 def support_numerical_loss(

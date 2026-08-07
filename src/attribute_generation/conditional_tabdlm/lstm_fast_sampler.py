@@ -499,9 +499,11 @@ def sample_lstm_fast_batch(
             datetime_values,
             graph_context,
         )
-        support_values = model.sample_support_numerical(
-            numerical_output,
-            temperature=numerical_temperature,
+        support_values, support_ids = (
+            model.sample_support_numerical_with_ids(
+                numerical_output,
+                temperature=numerical_temperature,
+            )
         )
         for column, params in numerical_output.items():
             if column in support_values:
@@ -537,7 +539,11 @@ def sample_lstm_fast_batch(
         dtype=torch.long,
         device=device,
     )
-    context = model.categorical_context(row, categorical_ids)
+    context = model.categorical_context(
+        row,
+        categorical_ids,
+        support_ids,
+    )
     text_ids: dict[str, torch.Tensor] = {}
     text_lengths: dict[str, list[int]] = {}
     policies = text_field_policies or [default_text_field_policy(schema, column) for column in schema.text_targets]

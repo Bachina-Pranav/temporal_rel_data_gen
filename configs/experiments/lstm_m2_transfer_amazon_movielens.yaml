@@ -1,0 +1,75 @@
+experiment_name: lstm_m2_global_support_transfer_seed42
+seed: 42
+comparison_output_dir: outputs/lstm-m2-transfer-amazon-movielens/seed_42
+numerical_sampling_temperature: 1.0
+
+numerical_head:
+  mode: support
+  direct_support_max_values: 8192
+  hierarchical_num_bins: 64
+  class_frequency_weighting: inverse_sqrt
+  label_smoothing: 0.01
+  ordinal_regularization_weight: 0.0
+  global_calibration_weight: 0.0
+  conditioning:
+    explicit_destination: false
+    include_support_in_text_context: true
+  prior:
+    enabled: false
+  type_inference:
+    low_cardinality_max_values: 64
+    direct_support_max_values: 8192
+    hierarchical_support_max_values: 200000
+    repeated_max_unique_ratio: 0.25
+    repeated_min_observation_mass: 0.50
+    holdout_min_support_overlap: 0.75
+    precision_min_dominant_mass: 0.70
+    spacing_max_coefficient_of_variation: 2.0
+    top_values_min_observation_mass: 0.10
+    minimum_structured_signals: 3
+
+datasets:
+  amazon_toy:
+    display_name: Amazon-toy
+    base_config: configs/attribute_generation/conditional_tabdlm_amazon_toy_exp5_1_lstm_privacy_alignment.yaml
+    evaluation_config: configs/evaluation/single_event_table_paper_metrics_amazon_toy.yaml
+    numerical_attributes: [rating]
+    output_root: outputs/amazon-toy/lstm_m2_global_support
+    sampling_policy: v53-length-preserving
+    pretokenized_dir: data/processed/lstm_m2_transfer/amazon_toy/pretokenized_lstm
+    neighbor_cache_dir: data/processed/lstm_m2_transfer/amazon_toy/neighbor_cache
+    previous_metrics:
+      - outputs/amazon-toy/conditional_tabdlm_exp5_3_lstm_length_preserving_privacy_sampler/runs/v51_length_preserving_exact_block/evaluation/paper_grade/metrics.json
+      - outputs/amazon-toy/conditional_tabdlm_exp5_3_lstm_length_preserving_privacy_sampler/runs/v51_length_preserving_exact_block/evaluation/paper_grade/paper_metrics.json
+      - outputs/amazon-toy/conditional_tabdlm_exp5_1_lstm_privacy_alignment/evaluation/paper_grade/metrics.json
+      - outputs/amazon-toy/conditional_tabdlm_exp5_lstm_joint_full_review_text/evaluation/paper_grade/metrics.json
+    previous_attribute_diagnostics:
+      - outputs/amazon-toy/conditional_tabdlm_exp5_3_lstm_length_preserving_privacy_sampler/runs/v51_length_preserving_exact_block/evaluation/attribute_diagnostics.json
+    previous_legacy_metrics:
+      - outputs/amazon-toy/conditional_tabdlm_exp5_3_lstm_length_preserving_privacy_sampler/runs/v51_length_preserving_exact_block/evaluation/paper_grade/legacy_diagnostic_metrics.json
+      - outputs/amazon-toy/conditional_tabdlm_exp5_3_lstm_length_preserving_privacy_sampler/runs/v51_length_preserving_exact_block/evaluation/legacy_diagnostic_metrics.json
+    previous_sampling_metadata:
+      - outputs/amazon-toy/conditional_tabdlm_exp5_3_lstm_length_preserving_privacy_sampler/runs/v51_length_preserving_exact_block/metadata/runtime_sampling_fast.json
+      - outputs/amazon-toy/conditional_tabdlm_exp5_3_lstm_length_preserving_privacy_sampler/runs/v51_length_preserving_exact_block/samples/metadata/runtime_sampling_fast.json
+
+  movielens_toy:
+    display_name: MovieLens-toy
+    base_config: configs/attribute_generation/lstm_movielens_100k.yaml
+    evaluation_config: configs/evaluation/single_event_table_paper_metrics_movielens_100k.yaml
+    numerical_attributes: [rating]
+    output_root: outputs/movielens-toy/lstm_m2_global_support
+    sampling_policy: fast
+    pretokenized_dir: data/processed/lstm_m2_transfer/movielens_100k/pretokenized_lstm
+    neighbor_cache_dir: data/processed/lstm_m2_transfer/movielens_100k/neighbor_cache
+    previous_metrics:
+      - outputs/movielens-100k/lstm_v53/evaluation/synthetic_spine_primary/metrics.json
+      - outputs/movielens-100k/lstm_v53/evaluation/synthetic_spine_primary/paper_metrics.json
+      - outputs/movielens-100k/lstm_v53/evaluation/paper_grade/metrics.json
+    previous_attribute_diagnostics:
+      - outputs/movielens-100k/lstm_v53/evaluation/attribute_diagnostics.json
+      - outputs/movielens-100k/lstm_v53/evaluation/synthetic_spine_primary/attribute_diagnostics.json
+    previous_legacy_metrics:
+      - outputs/movielens-100k/lstm_v53/evaluation/synthetic_spine_primary/legacy_diagnostic_metrics.json
+      - outputs/movielens-100k/lstm_v53/evaluation/paper_grade/legacy_diagnostic_metrics.json
+    previous_sampling_metadata:
+      - outputs/movielens-100k/lstm_v53/samples/metadata/runtime_sampling_fast.json

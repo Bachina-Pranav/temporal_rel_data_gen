@@ -28,6 +28,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", default=DEFAULT_CONFIG)
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--synthetic-spine", default=None)
+    parser.add_argument(
+        "--graph-history-prefix",
+        default=None,
+        help="Optional condition-only rows preceding the sampled spine in temporal graph history.",
+    )
     parser.add_argument("--num-rows", default=None)
     parser.add_argument("--output", default=None)
     parser.add_argument("--batch-size", default=None)
@@ -95,6 +100,7 @@ def main() -> None:
         batch_size=args.batch_size,
         device=args.device,
         synthetic_spine_path=args.synthetic_spine,
+        graph_history_prefix_path=args.graph_history_prefix,
         options=options,
     )
 

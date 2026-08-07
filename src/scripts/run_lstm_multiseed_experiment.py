@@ -27,6 +27,7 @@ if not __package__:
 from attribute_generation.conditional_tabdlm.schema import (  # noqa: E402
     ConditionalTABDLMConfig,
     ConditionalTABDLMSchema,
+    resolve_auto_review_text_config,
 )
 
 
@@ -40,6 +41,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seeds", nargs="+", type=int, default=[17, 42, 73])
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--sample-batch-size", default="8192")
+    parser.add_argument(
+        "--sampling-policy",
+        choices=["fast", "v53-length-preserving"],
+        default="fast",
+        help=(
+            "Use the ordinary optimized sampler, or the established v5.3 "
+            "length-preserving exact-overlap policy for text datasets."
+        ),
+    )
+    parser.add_argument(
+        "--evaluation-scope",
+        choices=["heldout-test", "configured-spine"],
+        default="heldout-test",
+        help=(
+            "Evaluate on the held-out real test spine (default), or on "
+            "the config's fixed full evaluation spine and full real table."
+        ),
+    )
     parser.add_argument("--smoke-rows", type=int, default=64)
     parser.add_argument("--skip-smoke", action="store_true")
     parser.add_argument("--smoke-only", action="store_true")
@@ -69,7 +88,7 @@ def main() -> None:
     for path in [output_root, shared, logs]:
         path.mkdir(parents=True, exist_ok=True)
 
-    base = load_yaml(base_config_path)
+    base = resolve_auto_review_text_config(load_yaml(base_config_path))
     schema = ConditionalTABDLMSchema.from_config_dict(base)
     config = ConditionalTABDLMConfig(
         raw=base,
@@ -171,6 +190,11 @@ def main() -> None:
             shared=shared,
             pretokenized_dir=Path(args.pretokenized_dir),
             neighbor_cache_dir=Path(args.neighbor_cache_dir),
+            evaluation_scope=resolve_evaluation_scope(
+                config,
+                shared,
+                args.evaluation_scope,
+            ),
             args=args,
             smoke=True,
         )
@@ -192,6 +216,11 @@ def main() -> None:
                 shared=shared,
                 pretokenized_dir=Path(args.pretokenized_dir),
                 neighbor_cache_dir=Path(args.neighbor_cache_dir),
+                evaluation_scope=resolve_evaluation_scope(
+                    config,
+                    shared,
+                    args.evaluation_scope,
+                ),
                 args=args,
                 smoke=False,
             )
@@ -213,12 +242,13 @@ def run_seed(
     shared: Path,
     pretokenized_dir: Path,
     neighbor_cache_dir: Path,
+    evaluation_scope: dict[str, Path | str],
     args: argparse.Namespace,
     smoke: bool,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     real_for_eval = prepare_evaluation_real(
-        shared / "spines" / "test_real.csv",
+        Path(evaluation_scope["real_table"]),
         output_dir,
         smoke_rows=int(args.smoke_rows) if smoke else None,
         dry_run=bool(args.dry_run),
@@ -227,7 +257,7 @@ def run_seed(
         base,
         seed,
         output_dir,
-        shared / "spines" / "test_spine.csv",
+        Path(evaluation_scope["spine"]),
         pretokenized_dir,
         neighbor_cache_dir,
         numerical_head_training_table=(
@@ -295,38 +325,46 @@ def run_seed(
         require_file(checkpoint, f"best checkpoint for seed {seed}")
 
     sample_rows = str(args.smoke_rows) if smoke else "all"
+    sample_command = [
+        python(),
+        "src/scripts/sample_lstm_joint_full_review_text_fast.py",
+        "--config",
+        str(config_path),
+        "--checkpoint",
+        str(checkpoint),
+        "--synthetic-spine",
+        str(evaluation_scope["spine"]),
+        "--output",
+        str(synthetic),
+        "--num-rows",
+        sample_rows,
+        "--batch-size",
+        str(args.sample_batch_size),
+        "--device",
+        args.device,
+        "--seed",
+        str(seed),
+        "--mixed-precision",
+        "--profile",
+    ]
+    graph_history_prefix = evaluation_scope.get("graph_history_prefix")
+    if graph_history_prefix is not None:
+        sample_command.extend(
+            ["--graph-history-prefix", str(graph_history_prefix)]
+        )
+    if args.sampling_policy == "v53-length-preserving":
+        sample_command[1] = (
+            "src/scripts/"
+            "sample_lstm_joint_length_preserving_privacy_fast.py"
+        )
     run_stage(
-        [
-            python(),
-            "src/scripts/sample_lstm_joint_full_review_text_fast.py",
-            "--config",
-            str(config_path),
-            "--checkpoint",
-            str(checkpoint),
-            "--synthetic-spine",
-            str(shared / "spines" / "test_spine.csv"),
-            "--graph-history-prefix",
-            str(shared / "spines" / "history_prefix_spine.csv"),
-            "--output",
-            str(synthetic),
-            "--num-rows",
-            sample_rows,
-            "--batch-size",
-            str(args.sample_batch_size),
-            "--device",
-            args.device,
-            "--seed",
-            str(seed),
-            "--mixed-precision",
-            "--cache-graph-context",
-            "--profile",
-        ],
+        sample_command,
         output_dir / "logs" / "sample.log",
         args,
     )
     if not args.dry_run:
         validation = validate_sampled_table(
-            shared / "spines" / "test_spine.csv",
+            Path(evaluation_scope["spine"]),
             synthetic,
             shared / "spines" / "train_real.csv",
             ConditionalTABDLMSchema.from_config_dict(resolved),
@@ -367,7 +405,9 @@ def run_seed(
             evaluation_real_path=real_for_eval,
             synthetic_path=synthetic,
             graph_history_prefix_path=(
-                shared / "spines" / "history_prefix_spine.csv"
+                Path(graph_history_prefix)
+                if graph_history_prefix is not None
+                else None
             ),
             output_path=(
                 output_dir
@@ -382,6 +422,32 @@ def run_seed(
     return collect_seed_result(seed, output_dir)
 
 
+def resolve_evaluation_scope(
+    config: ConditionalTABDLMConfig,
+    shared: Path,
+    mode: str,
+) -> dict[str, Path | str]:
+    """Resolve fixed real/spine inputs without exposing target attributes."""
+
+    if mode == "heldout-test":
+        return {
+            "mode": mode,
+            "real_table": shared / "spines" / "test_real.csv",
+            "spine": shared / "spines" / "test_spine.csv",
+            "graph_history_prefix": (
+                shared / "spines" / "history_prefix_spine.csv"
+            ),
+        }
+    if mode == "configured-spine":
+        return {
+            "mode": mode,
+            "real_table": config.train_data_path,
+            "spine": config.synthetic_spine_path,
+            "graph_history_prefix": None,
+        }
+    raise ValueError(f"Unknown evaluation scope: {mode!r}")
+
+
 def attribute_diagnostics_command(
     *,
     config_path: Path,
@@ -389,11 +455,11 @@ def attribute_diagnostics_command(
     train_real_path: Path,
     evaluation_real_path: Path,
     synthetic_path: Path,
-    graph_history_prefix_path: Path,
+    graph_history_prefix_path: Path | None,
     output_path: Path,
     seed: int,
 ) -> list[str]:
-    return [
+    command = [
         python(),
         "src/scripts/evaluate_lstm_attribute_diagnostics.py",
         "--config",
@@ -404,8 +470,6 @@ def attribute_diagnostics_command(
         str(evaluation_real_path),
         "--synthetic",
         str(synthetic_path),
-        "--graph-history-prefix",
-        str(graph_history_prefix_path),
         "--evaluation-config",
         str(evaluation_config_path),
         "--output",
@@ -413,6 +477,11 @@ def attribute_diagnostics_command(
         "--seed",
         str(seed),
     ]
+    if graph_history_prefix_path is not None:
+        command.extend(
+            ["--graph-history-prefix", str(graph_history_prefix_path)]
+        )
+    return command
 
 
 def prepare_evaluation_real(

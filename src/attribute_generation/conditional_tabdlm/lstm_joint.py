@@ -40,6 +40,7 @@ from .numerical_head import (
     fit_numerical_head_metadata,
     numerical_head_config,
     numerical_head_feature_enabled,
+    nearest_support_indices_torch,
     resolve_event_role_indices,
     support_numerical_loss,
 )
@@ -266,6 +267,28 @@ class JointLSTMRelationalAttributeGenerator(nn.Module):
                 for column in schema.model_categorical_targets
             }
         )
+        self.support_numerical_text_context = bool(
+            schema.text_targets
+            and self.numerical_conditioning.get(
+                "include_support_in_text_context",
+                False,
+            )
+        )
+        self.numerical_context_columns = tuple(
+            column
+            for column in schema.numerical_targets
+            if self.support_numerical_text_context
+            and column in self.support_numerical_heads
+        )
+        self.numerical_context_embeddings = nn.ModuleDict(
+            {
+                column: nn.Embedding(
+                    int(column_metadata[column]["support_size"]),
+                    self.categorical_context_dim,
+                )
+                for column in self.numerical_context_columns
+            }
+        )
         self.text_embedding = (
             nn.Embedding(self.text_vocab_size, self.text_embedding_dim, padding_idx=text_tokenizer.pad_id)
             if schema.text_targets
@@ -274,7 +297,10 @@ class JointLSTMRelationalAttributeGenerator(nn.Module):
         self.text_decoders = nn.ModuleDict()
         self.text_heads = nn.ModuleDict()
         self.text_initializers = nn.ModuleDict()
-        decoder_context_dim = self.row_hidden_dim + len(schema.model_categorical_targets) * self.categorical_context_dim
+        decoder_context_dim = self.row_hidden_dim + (
+            len(schema.model_categorical_targets)
+            + len(self.numerical_context_columns)
+        ) * self.categorical_context_dim
         self.decoder_context_dim = int(decoder_context_dim)
         self.summary_condition_projector = (
             nn.Sequential(
@@ -495,10 +521,64 @@ class JointLSTMRelationalAttributeGenerator(nn.Module):
             )
         return values
 
-    def categorical_context(self, row_latent: torch.Tensor, categorical_ids: torch.Tensor) -> torch.Tensor:
+    def sample_support_numerical_with_ids(
+        self,
+        output: dict[str, Any],
+        *,
+        temperature: float,
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        values: dict[str, torch.Tensor] = {}
+        ids: dict[str, torch.Tensor] = {}
+        for column, head in self.support_numerical_heads.items():
+            sampled_ids = head.sample_ids(
+                output[column],
+                temperature=temperature,
+            )
+            ids[column] = sampled_ids
+            values[column] = head.support_original[sampled_ids]
+        return values, ids
+
+    def numerical_context_target_ids(
+        self,
+        numerical_values: torch.Tensor | None,
+    ) -> dict[str, torch.Tensor]:
+        if not self.numerical_context_columns:
+            return {}
+        if numerical_values is None:
+            raise ValueError(
+                "Support numerical text context requires target values "
+                "during training"
+            )
+        ids: dict[str, torch.Tensor] = {}
+        for column in self.numerical_context_columns:
+            index = self.schema.numerical_targets.index(column)
+            head = self.support_numerical_heads[column]
+            ids[column] = nearest_support_indices_torch(
+                numerical_values[:, index],
+                head.support_standardized,
+            )
+        return ids
+
+    def categorical_context(
+        self,
+        row_latent: torch.Tensor,
+        categorical_ids: torch.Tensor,
+        numerical_context_ids: dict[str, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
         pieces = [row_latent]
         for idx, column in enumerate(self.schema.model_categorical_targets):
             pieces.append(self.categorical_context_embeddings[column](categorical_ids[:, idx]))
+        numerical_context_ids = numerical_context_ids or {}
+        for column in self.numerical_context_columns:
+            if column not in numerical_context_ids:
+                raise ValueError(
+                    f"Missing support context ids for {column!r}"
+                )
+            pieces.append(
+                self.numerical_context_embeddings[column](
+                    numerical_context_ids[column]
+                )
+            )
         return torch.cat(pieces, dim=1)
 
     def decoder_context(self, column: str, context: torch.Tensor, summary_repr: torch.Tensor | None = None) -> torch.Tensor:
@@ -593,7 +673,11 @@ class JointLSTMRelationalAttributeGenerator(nn.Module):
             graph_context,
             target_values=numerical_values,
         )
-        context = self.categorical_context(row, categorical_ids)
+        context = self.categorical_context(
+            row,
+            categorical_ids,
+            self.numerical_context_target_ids(numerical_values),
+        )
         text_logits: dict[str, torch.Tensor] = {}
         summary_repr = None
         for column in self.schema.text_targets:
@@ -631,7 +715,10 @@ class JointLSTMRelationalAttributeGenerator(nn.Module):
             datetime_values,
             graph_context,
         )
-        support_numerical_values = self.sample_support_numerical(
+        (
+            support_numerical_values,
+            support_numerical_ids,
+        ) = self.sample_support_numerical_with_ids(
             numerical_params,
             temperature=(
                 float(numerical_temperature)
@@ -648,7 +735,11 @@ class JointLSTMRelationalAttributeGenerator(nn.Module):
         categorical_ids = torch.stack(sampled_cat_columns, dim=1) if sampled_cat_columns else torch.empty(
             (foreign_key_ids.shape[0], 0), dtype=torch.long, device=foreign_key_ids.device
         )
-        context = self.categorical_context(row, categorical_ids)
+        context = self.categorical_context(
+            row,
+            categorical_ids,
+            support_numerical_ids,
+        )
         text_ids: dict[str, torch.Tensor] = {}
         decoded_text: dict[str, list[str]] = {}
         lengths: dict[str, list[int]] = {}
@@ -677,6 +768,7 @@ class JointLSTMRelationalAttributeGenerator(nn.Module):
             "categorical": decoded_cats,
             "numerical_params": numerical_params,
             "numerical_values": support_numerical_values,
+            "numerical_ids": support_numerical_ids,
             "text_ids": text_ids,
             "text": decoded_text,
             "text_lengths": lengths,
@@ -765,6 +857,9 @@ class JointLSTMRelationalAttributeGenerator(nn.Module):
             "text_vocab_size": self.text_vocab_size,
             "numerical_targets": list(self.schema.numerical_targets),
             "numerical_head_modes": dict(self.numerical_head_modes),
+            "support_numerical_text_context": bool(
+                self.support_numerical_text_context
+            ),
             "explicit_numerical_conditioning": bool(
                 self.explicit_numerical_conditioning
             ),

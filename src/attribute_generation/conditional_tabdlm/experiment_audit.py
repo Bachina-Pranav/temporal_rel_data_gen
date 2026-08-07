@@ -42,6 +42,21 @@ def audit_interaction_experiment(
     errors: list[str] = []
     warnings: list[str] = []
 
+    parsed_time = (
+        pd.to_datetime(frame[timestamp], errors="coerce", utc=True)
+        if timestamp in frame
+        else pd.Series(pd.NaT, index=frame.index)
+    )
+    split_source = "explicit_split_column"
+    if "split" not in frame and not parsed_time.isna().any():
+        frame = frame.copy()
+        frame["split"] = implicit_chronological_split(parsed_time)
+        split_source = "legacy_time_aware_90_5_5"
+        warnings.append(
+            "No explicit split column was present; the audit used the "
+            "same chronological 90/5/5 fallback as pretokenization."
+        )
+
     required = list(dict.fromkeys([*primary_keys, *conditions, *targets, "split"]))
     missing_required = [column for column in required if column not in frame.columns]
     if missing_required:
@@ -76,11 +91,6 @@ def audit_interaction_experiment(
     fk_report = foreign_key_report(frame, columns_cfg)
     errors.extend(fk_report.pop("errors"))
 
-    parsed_time = (
-        pd.to_datetime(frame[timestamp], errors="coerce", utc=True)
-        if timestamp in frame
-        else pd.Series(pd.NaT, index=frame.index)
-    )
     timestamp_parse_error_rate = float(parsed_time.isna().mean()) if len(frame) else 0.0
     if timestamp_parse_error_rate:
         errors.append(
@@ -91,6 +101,7 @@ def audit_interaction_experiment(
         timestamp,
         parsed_time,
         primary_keys,
+        split_source=split_source,
     )
     errors.extend(split_report.pop("errors"))
     warnings.extend(split_report.pop("warnings"))
@@ -238,8 +249,12 @@ def primary_key_report(
     errors = []
     if not primary_keys:
         return {
-            "valid": False,
-            "errors": ["No primary key configured for the interaction table"],
+            "valid": True,
+            "status": "not_applicable",
+            "columns": [],
+            "null_row_count": 0,
+            "duplicate_row_count": 0,
+            "errors": [],
         }
     missing = [column for column in primary_keys if column not in frame]
     if missing:
@@ -304,6 +319,8 @@ def split_integrity_report(
     timestamp_column: str,
     parsed_time: pd.Series,
     primary_keys: list[str],
+    *,
+    split_source: str = "explicit_split_column",
 ) -> dict[str, Any]:
     errors: list[str] = []
     warnings: list[str] = []
@@ -368,7 +385,7 @@ def split_integrity_report(
         )
     return {
         "valid": not errors,
-        "split_source": "explicit_split_column",
+        "split_source": split_source,
         "bounds": bounds,
         "primary_key_overlap": overlap,
         "globally_chronological_row_order": chronological_ordered,
@@ -376,6 +393,19 @@ def split_integrity_report(
         "errors": errors,
         "warnings": warnings,
     }
+
+
+def implicit_chronological_split(parsed_time: pd.Series) -> pd.Series:
+    """Return labels matching the established time-aware 90/5/5 split."""
+
+    order = parsed_time.sort_values(kind="mergesort").index.to_numpy()
+    train_end = int(len(parsed_time) * 0.90)
+    validation_end = int(len(parsed_time) * 0.95)
+    labels = pd.Series(index=parsed_time.index, dtype="object")
+    labels.loc[order[:train_end]] = "train"
+    labels.loc[order[train_end:validation_end]] = "validation"
+    labels.loc[order[validation_end:]] = "test"
+    return labels
 
 
 def categorical_target_report(
