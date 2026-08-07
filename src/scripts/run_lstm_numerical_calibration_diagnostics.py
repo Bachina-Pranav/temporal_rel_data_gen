@@ -87,6 +87,14 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional C2ST error from replacing generated numerical values with aligned real values.",
     )
+    parser.add_argument(
+        "--finalize-only",
+        action="store_true",
+        help=(
+            "Rebuild the Markdown report from completed aggregate "
+            "CSV/JSON outputs without rerunning calibration."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -96,6 +104,9 @@ def main() -> None:
     output_dir = ensure_dir(
         args.output_dir or root / "numerical_calibration"
     )
+    if args.finalize_only:
+        finalize_existing_results(output_dir)
+        return
     shared = resolve_shared_spine_directory(root)
     train_path = shared / "train_real.csv"
     real_path = shared / "test_real.csv"
@@ -233,6 +244,25 @@ def main() -> None:
     print(output_dir / "calibration_results.csv")
     print(output_dir / "calibration_results_aggregate.csv")
     print(output_dir / "calibration_interpretation.json")
+
+
+def finalize_existing_results(output_dir: Path) -> None:
+    aggregate_path = (
+        output_dir / "calibration_results_aggregate.csv"
+    )
+    interpretation_path = (
+        output_dir / "calibration_interpretation.json"
+    )
+    require_files([aggregate_path, interpretation_path])
+    aggregate = pd.read_csv(aggregate_path)
+    interpretation = json.loads(
+        interpretation_path.read_text(encoding="utf-8")
+    )
+    report_path = output_dir / "calibration_report.md"
+    write_markdown(aggregate, interpretation, report_path)
+    print(aggregate_path)
+    print(interpretation_path)
+    print(report_path)
 
 
 def evaluate_calibration(
@@ -557,7 +587,7 @@ def write_markdown(
     lines = [
         "# Numerical calibration Q0-Q4",
         "",
-        aggregate[columns].to_markdown(index=False),
+        dataframe_to_markdown(aggregate[columns]),
         "",
         "## Interpretation",
         "",
@@ -567,6 +597,33 @@ def write_markdown(
         "",
     ]
     path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def dataframe_to_markdown(frame: pd.DataFrame) -> str:
+    """Render a compact Markdown table without optional dependencies."""
+
+    headers = [markdown_cell(column) for column in frame.columns]
+    lines = [
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join("---" for _ in headers) + " |",
+    ]
+    for row in frame.itertuples(index=False, name=None):
+        lines.append(
+            "| "
+            + " | ".join(markdown_cell(value) for value in row)
+            + " |"
+        )
+    return "\n".join(lines)
+
+
+def markdown_cell(value: Any) -> str:
+    if pd.isna(value):
+        return ""
+    if isinstance(value, (float, np.floating)):
+        text = f"{float(value):.6g}"
+    else:
+        text = str(value)
+    return text.replace("|", "\\|").replace("\n", " ")
 
 
 if __name__ == "__main__":

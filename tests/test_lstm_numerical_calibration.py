@@ -16,6 +16,7 @@ from attribute_generation.conditional_tabdlm.numerical_calibration import (  # n
     empirical_rank_map,
 )
 from scripts.run_lstm_numerical_calibration_diagnostics import (  # noqa: E402
+    finalize_existing_results,
     resolve_shared_spine_directory,
 )
 
@@ -106,6 +107,31 @@ def test_calibration_resolves_multiseed_shared_spine_layout(
     (shared / "test_real.csv").write_text("value\n1\n")
 
     assert resolve_shared_spine_directory(tmp_path) == shared
+
+
+def test_finalize_calibration_report_needs_no_tabulate(
+    tmp_path: Path,
+):
+    pd.DataFrame(
+        {
+            "calibration": ["Q0"],
+            "full_row_c2st_mean": [0.5],
+        }
+    ).to_csv(
+        tmp_path / "calibration_results_aggregate.csv",
+        index=False,
+    )
+    (
+        tmp_path / "calibration_interpretation.json"
+    ).write_text('{"status": "complete"}')
+
+    finalize_existing_results(tmp_path)
+
+    report = (
+        tmp_path / "calibration_report.md"
+    ).read_text()
+    assert "| calibration | full_row_c2st_mean |" in report
+    assert '"status": "complete"' in report
 
 
 def frame(
