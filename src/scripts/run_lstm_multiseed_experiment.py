@@ -47,6 +47,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rebuild-precomputed", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--comparison-metrics", nargs="*", default=[])
+    parser.add_argument(
+        "--minimum-free-disk-gb",
+        type=float,
+        default=2.0,
+        help=(
+            "Refuse to start a non-reused seed below this free-space "
+            "threshold."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -253,6 +262,12 @@ def run_seed(
     ):
         print(f"[seed {seed}] reusing completed run at {output_dir}", flush=True)
         return collect_seed_result(seed, output_dir)
+    if not args.dry_run:
+        require_free_disk_space(
+            output_dir,
+            minimum_gb=float(args.minimum_free_disk_gb),
+            context=f"seed {seed} training",
+        )
 
     train_command = [
         python(),
@@ -1064,6 +1079,25 @@ def run_stage(
         return_code = process.wait()
     if return_code:
         raise subprocess.CalledProcessError(return_code, command)
+
+
+def require_free_disk_space(
+    path: Path,
+    *,
+    minimum_gb: float,
+    context: str,
+) -> None:
+    usage = shutil.disk_usage(path)
+    free_gb = float(usage.free / (1024**3))
+    free_inodes = int(os.statvfs(path).f_favail)
+    if free_gb < float(minimum_gb) or free_inodes <= 0:
+        raise RuntimeError(
+            f"Insufficient filesystem capacity for {context}: "
+            f"{free_gb:.2f} GiB free and {free_inodes:,} free inodes "
+            f"at {path}. Required free disk: {minimum_gb:.2f} GiB. "
+            "Remove stale *.pt.tmp files and unneeded completed-run "
+            "last.pt checkpoints, then retry with --skip-existing."
+        )
 
 
 def require_file(path: Path, description: str) -> None:

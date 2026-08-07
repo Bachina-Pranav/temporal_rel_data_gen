@@ -60,6 +60,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--sample-batch-size", default="8192")
     parser.add_argument("--smoke-rows", type=int, default=256)
+    parser.add_argument(
+        "--minimum-free-disk-gb",
+        type=float,
+        default=5.0,
+        help=(
+            "Minimum free filesystem space required before each seed "
+            "starts."
+        ),
+    )
     parser.add_argument("--skip-existing", action="store_true")
     parser.add_argument(
         "--rebuild-precomputed",
@@ -227,6 +236,8 @@ def main() -> None:
             str(args.sample_batch_size),
             "--smoke-rows",
             str(args.smoke_rows),
+            "--minimum-free-disk-gb",
+            str(args.minimum_free_disk_gb),
             "--seeds",
             *[str(seed) for seed in seeds],
         ]
@@ -365,6 +376,8 @@ def run_baseline(
         args.device,
         "--sample-batch-size",
         str(args.sample_batch_size),
+        "--minimum-free-disk-gb",
+        str(args.minimum_free_disk_gb),
         "--seeds",
         *[str(seed) for seed in matrix["seeds"]],
         "--skip-smoke",

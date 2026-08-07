@@ -5,6 +5,8 @@ from __future__ import annotations
 import gc
 import json
 import math
+import os
+import shutil
 import time
 from contextlib import nullcontext
 from pathlib import Path
@@ -1160,7 +1162,16 @@ def _train_lstm_from_config_once(
         if improved:
             best_valid = current
             without_improvement = 0
-            save_lstm_checkpoint(best_path, model, config, categorical_vocabs, tokenizer, epoch, valid_metrics, graph_encoder=graph_encoder, optimizer=optimizer, scaler=scaler)
+            save_lstm_checkpoint(
+                best_path,
+                model,
+                config,
+                categorical_vocabs,
+                tokenizer,
+                epoch,
+                valid_metrics,
+                graph_encoder=graph_encoder,
+            )
         else:
             without_improvement += 1
         if patience > 0 and without_improvement >= patience:
@@ -1644,8 +1655,6 @@ def run_lstm_fixed_steps(
                     step,
                     valid_metrics,
                     graph_encoder=graph_encoder,
-                    optimizer=optimizer,
-                    scaler=scaler,
                 )
             else:
                 without_improvement += 1
@@ -2619,25 +2628,61 @@ def save_lstm_checkpoint(
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     numerical_metadata = load_numerical_metadata(config)
-    torch.save(
-        {
-            "model_state_dict": model.state_dict(),
-            "model_config": model.to_config(),
-            "raw_config": config.raw,
-            "schema": config.schema.to_dict(),
-            "categorical_vocabs": {column: vocab.to_dict() for column, vocab in categorical_vocabs.items()},
-            "tokenizer_metadata": tokenizer.to_dict(),
-            "numerical_metadata": numerical_metadata,
-            "epoch": int(epoch),
-            "valid_metrics": valid_metrics,
-            "graph_encoder_state_dict": graph_encoder.state_dict() if graph_encoder is not None else None,
-            "graph_encoder_config": graph_encoder.to_config() if graph_encoder is not None else None,
-            "graph_conditioning_metadata": graph_metadata(config.raw, real_graph_used_at_sampling=False),
-            "optimizer_state_dict": optimizer.state_dict() if optimizer is not None else None,
-            "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
+    payload = {
+        "model_state_dict": model.state_dict(),
+        "model_config": model.to_config(),
+        "raw_config": config.raw,
+        "schema": config.schema.to_dict(),
+        "categorical_vocabs": {
+            column: vocab.to_dict()
+            for column, vocab in categorical_vocabs.items()
         },
-        path,
-    )
+        "tokenizer_metadata": tokenizer.to_dict(),
+        "numerical_metadata": numerical_metadata,
+        "epoch": int(epoch),
+        "valid_metrics": valid_metrics,
+        "graph_encoder_state_dict": (
+            graph_encoder.state_dict()
+            if graph_encoder is not None
+            else None
+        ),
+        "graph_encoder_config": (
+            graph_encoder.to_config()
+            if graph_encoder is not None
+            else None
+        ),
+        "graph_conditioning_metadata": graph_metadata(
+            config.raw,
+            real_graph_used_at_sampling=False,
+        ),
+        "optimizer_state_dict": (
+            optimizer.state_dict()
+            if optimizer is not None
+            else None
+        ),
+        "scaler_state_dict": (
+            scaler.state_dict()
+            if scaler is not None
+            else None
+        ),
+    }
+    temporary = path.with_name(path.name + ".tmp")
+    if temporary.exists():
+        temporary.unlink()
+    try:
+        torch.save(payload, temporary)
+        os.replace(temporary, path)
+    except Exception as exc:
+        if temporary.exists():
+            temporary.unlink()
+        usage = shutil.disk_usage(path.parent)
+        free_inodes = int(os.statvfs(path.parent).f_favail)
+        raise RuntimeError(
+            f"Failed to save checkpoint atomically to {path}. "
+            f"Free disk: {usage.free / (1024**3):.2f} GiB; "
+            f"free inodes: {free_inodes:,}. Check filesystem capacity "
+            "and remove stale .pt.tmp or unnecessary last.pt files."
+        ) from exc
 
 
 def load_lstm_checkpoint(

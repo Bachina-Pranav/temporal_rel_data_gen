@@ -5,11 +5,13 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from scripts import run_lstm_multiseed_experiment as multiseed  # noqa: E402
 from scripts.run_lstm_multiseed_experiment import (  # noqa: E402
     attribute_diagnostics_command,
     flatten_numeric_scalars,
@@ -126,3 +128,32 @@ def test_pretokenized_split_counts_read_actual_index_arrays(
         "valid_rows": 2,
         "test_rows": 3,
     }
+
+
+def test_disk_preflight_rejects_insufficient_space(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class DiskUsage:
+        free = 512 * 1024**2
+
+    class FilesystemStats:
+        f_favail = 100
+
+    monkeypatch.setattr(
+        multiseed.shutil,
+        "disk_usage",
+        lambda _: DiskUsage(),
+    )
+    monkeypatch.setattr(
+        multiseed.os,
+        "statvfs",
+        lambda _: FilesystemStats(),
+    )
+
+    with pytest.raises(RuntimeError, match="Insufficient filesystem"):
+        multiseed.require_free_disk_space(
+            tmp_path,
+            minimum_gb=2.0,
+            context="test seed",
+        )

@@ -85,3 +85,10 @@ def test_fixed_step_training_loop_runs_exact_optimizer_steps(tmp_path):
     assert summary["best_step"] in {1, 2, 3}
     assert (checkpoint_dir / "best.pt").exists()
     assert (checkpoint_dir / "last.pt").exists()
+    best = torch.load(checkpoint_dir / "best.pt", map_location="cpu")
+    last = torch.load(checkpoint_dir / "last.pt", map_location="cpu")
+    assert best["optimizer_state_dict"] is None
+    assert best["scaler_state_dict"] is None
+    assert last["optimizer_state_dict"] is not None
+    assert not (checkpoint_dir / "best.pt.tmp").exists()
+    assert not (checkpoint_dir / "last.pt.tmp").exists()
