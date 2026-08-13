@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
 import pytest
+import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -15,9 +17,12 @@ from scripts import run_lstm_multiseed_experiment as multiseed  # noqa: E402
 from scripts.run_lstm_multiseed_experiment import (  # noqa: E402
     attribute_diagnostics_command,
     completed_stage,
+    existing_run_request_is_compatible,
     flatten_numeric_scalars,
     pretokenized_split_counts,
     prepare_evaluation_real,
+    resolve_evaluation_config,
+    resolve_evaluation_scope,
     resolve_seed_config,
 )
 
@@ -190,3 +195,84 @@ def test_disk_preflight_rejects_insufficient_space(
             minimum_gb=2.0,
             context="test seed",
         )
+
+
+def test_validation_scope_uses_train_history_without_test_rows():
+    scope = resolve_evaluation_scope(
+        SimpleNamespace(),
+        Path("shared"),
+        "heldout-validation",
+    )
+
+    assert scope["real_table"] == Path("shared/spines/validation_real.csv")
+    assert scope["spine"] == Path("shared/spines/validation_spine.csv")
+    assert scope["graph_history_prefix"] == Path("shared/spines/train_spine.csv")
+
+
+def test_evaluator_seed_is_independent_of_generator_seed(tmp_path: Path):
+    train = tmp_path / "train.csv"
+    pd.DataFrame({"category": ["a", "b"], "value": [1.0, 2.0]}).to_csv(
+        train,
+        index=False,
+    )
+    schema = SimpleNamespace(
+        categorical_targets=("category",),
+        numerical_targets=("value",),
+    )
+
+    resolved = resolve_evaluation_config(
+        {"evaluation": {"random_seed": 73}, "table": {"columns": {
+            "category": {}, "value": {}
+        }}},
+        train,
+        Path("validation.csv"),
+        Path("synthetic.csv"),
+        schema,
+        evaluator_seed=42,
+    )
+
+    assert resolved["evaluation"]["random_seed"] == 42
+
+
+def test_multiseed_cli_exposes_fixed_evaluator_seed():
+    source = (
+        ROOT / "src/scripts/run_lstm_multiseed_experiment.py"
+    ).read_text(encoding="utf-8")
+
+    assert '"--evaluation-seed"' in source
+    assert "else args.evaluation_seed" in source
+
+
+def test_existing_run_reuse_ignores_only_fitted_head_metadata(
+    tmp_path: Path,
+):
+    config_path = tmp_path / "config_resolved.yaml"
+    evaluation_path = tmp_path / "evaluation_config_resolved.yaml"
+    requested = {
+        "model": {"row_hidden_dim": 64},
+        "training": {"seed": 42},
+    }
+    existing = {
+        **requested,
+        "_numerical_head_metadata": {"training_only": True},
+    }
+    config_path.write_text(yaml.safe_dump(existing), encoding="utf-8")
+    evaluation = {"evaluation": {"random_seed": 42}}
+    evaluation_path.write_text(
+        yaml.safe_dump(evaluation),
+        encoding="utf-8",
+    )
+
+    assert existing_run_request_is_compatible(
+        config_path,
+        evaluation_path,
+        requested,
+        evaluation,
+    )
+    changed = {**requested, "model": {"row_hidden_dim": 128}}
+    assert not existing_run_request_is_compatible(
+        config_path,
+        evaluation_path,
+        changed,
+        evaluation,
+    )

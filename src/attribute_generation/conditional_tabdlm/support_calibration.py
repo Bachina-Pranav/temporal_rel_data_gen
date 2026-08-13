@@ -42,6 +42,10 @@ def support_probability_table(
         generated_ids,
         minlength=len(support),
     )
+    generated_on_support = values_on_support(
+        generated_values,
+        support,
+    )
     train_probability = normalized(train_counts, epsilon=0.0)
     validation_probability = normalized(
         validation_counts,
@@ -54,7 +58,7 @@ def support_probability_table(
     correction = np.log(train_probability + epsilon) - np.log(
         generated_probability + epsilon
     )
-    return pd.DataFrame(
+    table = pd.DataFrame(
         {
             "support_value": support,
             "train_count": train_counts.astype(np.int64),
@@ -73,6 +77,23 @@ def support_probability_table(
             "delta_log_probability": correction,
         }
     )
+    table.attrs.update(
+        {
+            "train_input_rows": int(len(train)),
+            "validation_input_rows": int(len(validation)),
+            "generated_input_rows": int(len(generated)),
+            "train_finite_rows": int(len(train_values)),
+            "validation_finite_rows": int(len(validation_values)),
+            "generated_finite_rows": int(len(generated_values)),
+            "generated_invalid_or_missing_rows": int(
+                len(generated) - int(generated_on_support.sum())
+            ),
+            "generated_invalid_support_rows": int(
+                len(generated_values) - int(generated_on_support.sum())
+            ),
+        }
+    )
+    return table
 
 
 def support_calibration_metrics(
@@ -152,6 +173,11 @@ def support_calibration_metrics(
             generated,
             epsilon,
         ),
+        "kl_generated_to_train": kl_divergence(
+            generated,
+            train,
+            epsilon,
+        ),
         "head_value_frequency_correlation": safe_correlation(
             train[order[: min(100, len(order))]],
             generated[order[: min(100, len(order))]],
@@ -169,9 +195,29 @@ def support_calibration_metrics(
         ),
         "rare_support_mass_train": float(train[rare].sum()),
         "rare_support_mass_generated": float(generated[rare].sum()),
+        "rare_support_overproduction": float(
+            max(generated[rare].sum() - train[rare].sum(), 0.0)
+        ),
         "dominant_support_mass_train": float(train[dominant].sum()),
         "dominant_support_mass_generated": float(
             generated[dominant].sum()
+        ),
+        "dominant_support_underproduction": float(
+            max(train[dominant].sum() - generated[dominant].sum(), 0.0)
+        ),
+        "missing_support_rate": float(
+            np.mean(
+                (table["train_count"].to_numpy(dtype=float) > 0)
+                & (table["generated_count"].to_numpy(dtype=float) == 0)
+            )
+        ),
+        "invalid_support_rate": float(
+            table.attrs.get("generated_invalid_support_rows", 0)
+            / max(table.attrs.get("generated_input_rows", 0), 1)
+        ),
+        "invalid_or_missing_rate": float(
+            table.attrs.get("generated_invalid_or_missing_rows", 0)
+            / max(table.attrs.get("generated_input_rows", 0), 1)
         ),
         "central_absolute_distance_train": train_central_distance,
         "central_absolute_distance_generated": (
@@ -194,6 +240,21 @@ def support_calibration_metrics(
             ),
         },
     }
+
+
+def values_on_support(
+    values: np.ndarray,
+    support: np.ndarray,
+) -> np.ndarray:
+    """Return exact-support membership with a small floating tolerance."""
+
+    values = np.asarray(values, dtype=float)
+    support = np.asarray(support, dtype=float)
+    if not len(values):
+        return np.zeros(0, dtype=bool)
+    ids = nearest_support_indices_numpy(values, support)
+    nearest = support[ids]
+    return np.isclose(values, nearest, rtol=1e-7, atol=1e-10)
 
 
 def corrected_logit_bias(

@@ -52,11 +52,25 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--evaluation-scope",
-        choices=["heldout-test", "configured-spine"],
+        choices=[
+            "heldout-validation",
+            "heldout-test",
+            "configured-spine",
+        ],
         default="heldout-test",
         help=(
             "Evaluate on the held-out real test spine (default), or on "
             "the config's fixed full evaluation spine and full real table."
+        ),
+    )
+    parser.add_argument(
+        "--evaluation-seed",
+        type=int,
+        default=None,
+        help=(
+            "Fixed evaluator/classifier seed. When omitted, retain the "
+            "legacy behavior of using each generator seed. Architecture "
+            "selection runs should pass one fixed value such as 42."
         ),
     )
     parser.add_argument("--smoke-rows", type=int, default=64)
@@ -265,17 +279,61 @@ def run_seed(
         smoke=smoke,
     )
     config_path = output_dir / "config_resolved.yaml"
-    write_yaml(resolved, config_path)
     eval_resolved = resolve_evaluation_config(
         eval_template,
         shared / "spines" / "train_real.csv",
         real_for_eval,
         output_dir / "samples" / "synthetic_interactions.csv",
         ConditionalTABDLMSchema.from_config_dict(resolved),
-        seed,
+        seed if args.evaluation_seed is None else args.evaluation_seed,
     )
     eval_path = output_dir / "evaluation_config_resolved.yaml"
+    existing_compatible = existing_run_request_is_compatible(
+        config_path,
+        eval_path,
+        resolved,
+        eval_resolved,
+    )
+    existing_artifacts = any(
+        path.exists()
+        for path in (
+            output_dir / "checkpoints" / "best.pt",
+            output_dir / "training_metadata.json",
+            output_dir / "samples" / "synthetic_interactions.csv",
+            output_dir / "evaluation" / "paper_grade" / "metrics.json",
+        )
+    )
+    if args.skip_existing and existing_artifacts and not existing_compatible:
+        raise RuntimeError(
+            f"Refusing to reuse incompatible artifacts at {output_dir}. "
+            "Use a new output root or intentionally rerun without "
+            "--skip-existing."
+        )
+    persisted_resolved = (
+        load_yaml(config_path)
+        if existing_compatible and existing_artifacts
+        else resolved
+    )
+    write_yaml(persisted_resolved, config_path)
     write_yaml(eval_resolved, eval_path)
+    write_json(
+        {
+            "version": 1,
+            "generator_seed": int(seed),
+            "evaluator_seed": int(
+                seed
+                if args.evaluation_seed is None
+                else args.evaluation_seed
+            ),
+            "evaluation_scope": str(evaluation_scope["mode"]),
+            "sampling_policy": str(args.sampling_policy),
+            "model_request_sha256": object_sha256(
+                comparable_model_config(resolved)
+            ),
+            "evaluation_request_sha256": object_sha256(eval_resolved),
+        },
+        output_dir / "run_request.json",
+    )
     checkpoint = output_dir / "checkpoints" / "best.pt"
     training_metadata = output_dir / "training_metadata.json"
     synthetic = output_dir / "samples" / "synthetic_interactions.csv"
@@ -413,7 +471,11 @@ def run_seed(
         "--output-dir",
         str(output_dir / "evaluation" / "paper_grade"),
         "--seed",
-        str(seed),
+        str(
+            seed
+            if args.evaluation_seed is None
+            else args.evaluation_seed
+        ),
     ]
     if smoke:
         eval_command.extend(["--sample-size", str(args.smoke_rows)])
@@ -466,6 +528,13 @@ def resolve_evaluation_scope(
 ) -> dict[str, Path | str]:
     """Resolve fixed real/spine inputs without exposing target attributes."""
 
+    if mode == "heldout-validation":
+        return {
+            "mode": mode,
+            "real_table": shared / "spines" / "validation_real.csv",
+            "spine": shared / "spines" / "validation_spine.csv",
+            "graph_history_prefix": shared / "spines" / "train_spine.csv",
+        }
     if mode == "heldout-test":
         return {
             "mode": mode,
@@ -590,12 +659,14 @@ def resolve_evaluation_config(
     test_real_path: Path,
     synthetic_path: Path,
     schema: ConditionalTABDLMSchema,
-    seed: int,
+    evaluator_seed: int,
 ) -> dict[str, Any]:
     resolved = copy.deepcopy(template)
     resolved["real_table_path"] = str(test_real_path)
     resolved["synthetic_table_path"] = str(synthetic_path)
-    resolved.setdefault("evaluation", {})["random_seed"] = int(seed)
+    resolved.setdefault("evaluation", {})["random_seed"] = int(
+        evaluator_seed
+    )
     train = pd.read_csv(train_real_path, low_memory=False)
     columns = resolved.setdefault("table", {}).setdefault("columns", {})
     for column in schema.categorical_targets:
@@ -1227,6 +1298,37 @@ def require_file(path: Path, description: str) -> None:
 def load_yaml(path: str | Path) -> dict[str, Any]:
     with Path(path).open(encoding="utf-8") as handle:
         return yaml.safe_load(handle)
+
+
+def existing_run_request_is_compatible(
+    config_path: Path,
+    evaluation_path: Path,
+    requested_config: dict[str, Any],
+    requested_evaluation: dict[str, Any],
+) -> bool:
+    if not config_path.is_file() or not evaluation_path.is_file():
+        return False
+    existing_config = comparable_model_config(load_yaml(config_path))
+    requested = comparable_model_config(requested_config)
+    return (
+        object_sha256(existing_config) == object_sha256(requested)
+        and object_sha256(load_yaml(evaluation_path))
+        == object_sha256(requested_evaluation)
+    )
+
+
+def comparable_model_config(raw: dict[str, Any]) -> dict[str, Any]:
+    """Remove only training-fitted metadata before request comparison."""
+
+    comparable = copy.deepcopy(raw)
+    comparable.pop("_numerical_head_metadata", None)
+    comparable.pop("_categorical_head_metadata", None)
+    return comparable
+
+
+def object_sha256(value: Any) -> str:
+    payload = json.dumps(value, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def write_yaml(value: dict[str, Any], path: Path) -> None:

@@ -82,6 +82,7 @@ variants:
     numerical_heads:
       mode: support_prior
       class_frequency_weighting: none
+      label_smoothing: 0.0
       conditioning:
         explicit_destination: false
       prior:
@@ -89,7 +90,7 @@ variants:
       global_prior:
         enabled: true
         alpha: 1.0
-        smoothing: 1.0
+        smoothing: 0.0
         residual_weight: 0.0
         residual_temperature: 1.0
         residual_norm_clip: 10.0
@@ -100,6 +101,7 @@ variants:
     numerical_heads:
       mode: support_prior
       class_frequency_weighting: none
+      label_smoothing: 0.0
       conditioning:
         explicit_destination: false
       prior:
@@ -107,7 +109,7 @@ variants:
       global_prior:
         enabled: true
         alpha: 1.0
-        smoothing: 1.0
+        smoothing: 0.0
         residual_weight: 0.25
         residual_temperature: 1.0
         residual_norm_clip: 10.0
@@ -118,6 +120,7 @@ variants:
     numerical_heads:
       mode: support_prior
       class_frequency_weighting: none
+      label_smoothing: 0.0
       conditioning:
         explicit_destination: false
       prior:
@@ -125,7 +128,7 @@ variants:
       global_prior:
         enabled: true
         alpha: 1.0
-        smoothing: 1.0
+        smoothing: 0.0
         residual_weight: 0.5
         residual_temperature: 1.0
         residual_norm_clip: 10.0
@@ -136,6 +139,7 @@ variants:
     numerical_heads:
       mode: support_prior
       class_frequency_weighting: none
+      label_smoothing: 0.0
       conditioning:
         explicit_destination: false
       prior:
@@ -143,7 +147,7 @@ variants:
       global_prior:
         enabled: true
         alpha: 1.0
-        smoothing: 1.0
+        smoothing: 0.0
         residual_weight: 1.0
         residual_temperature: 1.0
         residual_norm_clip: 10.0

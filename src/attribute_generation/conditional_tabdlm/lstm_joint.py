@@ -49,6 +49,11 @@ from .pretokenized import PretokenizedLSTMDataset, load_pretokenized_bundle
 from .schema import ConditionalTABDLMConfig, ConditionalTABDLMSchema
 from .temporal_stratified_sampler import TemporalStratifiedSampler
 from .tokenization import CategoryVocab, SimpleTextTokenizer, stable_hash_bucket
+from .categorical_head import (
+    PriorAnchoredCategoricalHead,
+    categorical_head_feature_enabled,
+    fit_categorical_head_metadata,
+)
 from .train import (
     build_graph_encoder,
     compute_graph_outputs,
@@ -96,6 +101,7 @@ class JointLSTMRelationalAttributeGenerator(nn.Module):
         decoder_input_token_dropout_replacement: str = "UNK",
         numerical_head_metadata: dict[str, Any] | None = None,
         numerical_conditioning: dict[str, Any] | None = None,
+        categorical_head_metadata: dict[str, Any] | None = None,
     ):
         super().__init__()
         self.schema = schema
@@ -132,6 +138,9 @@ class JointLSTMRelationalAttributeGenerator(nn.Module):
         self.numerical_conditioning = dict(
             numerical_conditioning or {}
         )
+        self.categorical_head_metadata = dict(
+            categorical_head_metadata or {}
+        )
 
         self.foreign_key_embeddings = nn.ModuleList(
             [nn.Embedding(self.num_hash_buckets, self.id_embedding_dim) for _ in schema.foreign_key_columns]
@@ -155,12 +164,25 @@ class JointLSTMRelationalAttributeGenerator(nn.Module):
             nn.GELU(),
             nn.LayerNorm(self.row_hidden_dim),
         )
-        self.categorical_heads = nn.ModuleDict(
-            {
-                column: nn.Linear(self.row_hidden_dim, categorical_vocabs[column].size)
-                for column in schema.model_categorical_targets
-            }
+        categorical_columns = (
+            self.categorical_head_metadata.get("columns") or {}
         )
+        self.categorical_heads = nn.ModuleDict()
+        for column in schema.model_categorical_targets:
+            metadata = categorical_columns.get(column) or {}
+            if bool(metadata.get("enabled", False)):
+                self.categorical_heads[column] = (
+                    PriorAnchoredCategoricalHead(
+                        self.row_hidden_dim,
+                        categorical_vocabs[column].size,
+                        metadata,
+                    )
+                )
+            else:
+                self.categorical_heads[column] = nn.Linear(
+                    self.row_hidden_dim,
+                    categorical_vocabs[column].size,
+                )
         column_metadata = (
             self.numerical_head_metadata.get("columns") or {}
         )
@@ -938,7 +960,34 @@ def build_lstm_model(
                 "conditioning"
             )
         ),
+        categorical_head_metadata=config.raw.get(
+            "_categorical_head_metadata"
+        ),
     )
+
+
+def prepare_categorical_head_config(
+    config: ConditionalTABDLMConfig,
+    *,
+    categorical_vocabs: dict[str, CategoryVocab],
+    train_frame: pd.DataFrame | None,
+    train_dataset: Any | None,
+    metadata_dir: Path,
+) -> dict[str, Any]:
+    if not categorical_head_feature_enabled(config.raw):
+        return {}
+    metadata = fit_categorical_head_metadata(
+        config,
+        categorical_vocabs,
+        train_frame=train_frame,
+        train_dataset=train_dataset,
+    )
+    config.raw["_categorical_head_metadata"] = metadata
+    save_json(
+        metadata,
+        metadata_dir / "categorical_head_metadata.json",
+    )
+    return metadata
 
 
 def prepare_numerical_head_config(
@@ -1027,6 +1076,38 @@ def prepare_numerical_head_config(
         },
         metadata_dir / "numerical_type_inference.json",
     )
+    save_json(
+        {
+            "dataset": config.raw.get("dataset_name"),
+            "training_only": True,
+            "columns": [
+                {
+                    "column": column,
+                    "train_rows": (
+                        report.get("inferred_type") or {}
+                    ).get("num_rows"),
+                    "unique_count": (
+                        report.get("inferred_type") or {}
+                    ).get("support_size"),
+                    "unique_ratio": (
+                        report.get("inferred_type") or {}
+                    ).get("unique_value_ratio"),
+                    "inferred_type": (
+                        report.get("inferred_type") or {}
+                    ).get("label"),
+                    "chosen_head": report.get("selected_head"),
+                    "implementation_mode": report.get("resolved_mode"),
+                    "diagnostic_statistics": report.get(
+                        "inferred_type"
+                    ),
+                }
+                for column, report in (
+                    metadata.get("columns") or {}
+                ).items()
+            ],
+        },
+        metadata_dir / "numerical_head_routing.json",
+    )
     return metadata
 
 
@@ -1099,6 +1180,13 @@ def _train_lstm_from_config_once(
     prepare_numerical_head_config(
         config,
         numerical_metadata=numerical_metadata,
+        train_frame=train_frame,
+        train_dataset=None,
+        metadata_dir=metadata_dir,
+    )
+    prepare_categorical_head_config(
+        config,
+        categorical_vocabs=categorical_vocabs,
         train_frame=train_frame,
         train_dataset=None,
         metadata_dir=metadata_dir,
@@ -1344,6 +1432,13 @@ def _train_lstm_fixed_step_from_config_once(
     prepare_numerical_head_config(
         config,
         numerical_metadata=numerical_metadata,
+        train_frame=train_frame,
+        train_dataset=train_dataset,
+        metadata_dir=metadata_dir,
+    )
+    prepare_categorical_head_config(
+        config,
+        categorical_vocabs=categorical_vocabs,
         train_frame=train_frame,
         train_dataset=train_dataset,
         metadata_dir=metadata_dir,

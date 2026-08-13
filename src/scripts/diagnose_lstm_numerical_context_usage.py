@@ -206,6 +206,23 @@ def context_usage_diagnostics(
             )
             for column, summary in columns.items()
         }
+    support_head_calibration = {}
+    for column, summary in baseline.items():
+        calibration = dict(summary.get("calibration_diagnostics") or {})
+        if (
+            real is not None
+            and summary.get("probabilities") is not None
+            and column in real
+        ):
+            calibration["support_probability_ece"] = (
+                support_probability_ece(
+                    summary["probabilities"],
+                    summary["support_original"],
+                    real[column],
+                )
+            )
+        if calibration:
+            support_head_calibration[column] = calibration
     return {
         "checkpoint": "loaded",
         "num_rows": int(len(query_frame)),
@@ -215,6 +232,7 @@ def context_usage_diagnostics(
         "event_roles": roles,
         "conditions": list(variants),
         "comparisons": comparisons,
+        "support_head_calibration": support_head_calibration,
         "continuous_variance_diagnostics": {
             column: baseline[column].get("variance_diagnostics")
             for column in config.schema.numerical_targets
@@ -315,14 +333,101 @@ def numerical_output_summary(
         )
     support = output["support_original"].float()
     expected = probabilities @ support
+    calibration = support_logit_diagnostics(
+        model.support_numerical_heads[column],
+        output,
+        probabilities,
+    )
     return {
         "mode": output["mode"],
         "probabilities": probabilities,
         "top_ids": probabilities.argmax(dim=1),
         "expected_original": expected,
+        "support_original": support,
         "global_probability": output.get("global_probability"),
+        "calibration_diagnostics": calibration,
         "variance_diagnostics": None,
     }
+
+
+def support_logit_diagnostics(
+    head: Any,
+    output: dict[str, Any],
+    probabilities: torch.Tensor,
+) -> dict[str, Any]:
+    eps = 1e-12
+    entropy_by_row = -(
+        probabilities.clamp_min(eps)
+        * probabilities.clamp_min(eps).log()
+    ).sum(dim=1)
+    global_probability = output["global_probability"].float()
+    target_entropy = -(
+        global_probability.clamp_min(eps)
+        * global_probability.clamp_min(eps).log()
+    ).sum()
+    if output["mode"] == "discrete_support":
+        total = output["logits"].float()
+        residual = output.get("residual_logits")
+        prior = output.get("global_prior_logits")
+    else:
+        total = probabilities.clamp_min(eps).log()
+        residual = hierarchical_dense_residual_logits(head, output)
+        prior = output.get("global_prior_logits")
+    residual = residual.float() if residual is not None else None
+    prior = prior.float() if prior is not None else None
+    ratio = None
+    if residual is not None and prior is not None:
+        prior_norm = prior.norm().clamp_min(eps)
+        ratio = float(
+            (residual.norm(dim=1) / prior_norm).mean().cpu()
+        )
+    return {
+        "mean_max_softmax_probability": float(
+            probabilities.max(dim=1).values.mean().cpu()
+        ),
+        "mean_predictive_entropy_nats": float(
+            entropy_by_row.mean().cpu()
+        ),
+        "target_entropy_nats": float(target_entropy.cpu()),
+        "logit_mean": float(total.mean().cpu()),
+        "logit_std": float(total.std().cpu()),
+        "residual_logit_mean": tensor_stat(residual, "mean"),
+        "residual_logit_std": tensor_stat(residual, "std"),
+        "prior_logit_mean": tensor_stat(prior, "mean"),
+        "prior_logit_std": tensor_stat(prior, "std"),
+        "gamma_scaled_residual_to_prior_norm_ratio": ratio,
+    }
+
+
+def hierarchical_dense_residual_logits(
+    head: Any,
+    output: dict[str, Any],
+) -> torch.Tensor:
+    rows = len(output["hidden"])
+    dense = output["hidden"].new_zeros(
+        (rows, len(head.support_standardized)),
+        dtype=torch.float32,
+    )
+    coarse = output["coarse_residual_logits"].float()
+    if head.global_prior.enabled:
+        coarse = head.global_prior.residual_logits(coarse)
+    for bin_id, layer in enumerate(head.fine):
+        start = int(head.offsets[bin_id].item())
+        end = int(head.offsets[bin_id + 1].item())
+        local = layer(output["hidden"]).float()
+        if head.global_prior.enabled:
+            local = head.global_prior.residual_logits(local)
+        dense[:, start:end] = coarse[:, bin_id : bin_id + 1] + local
+    return dense
+
+
+def tensor_stat(
+    value: torch.Tensor | None,
+    statistic: str,
+) -> float | None:
+    if value is None or not value.numel():
+        return None
+    return float(getattr(value, statistic)().cpu())
 
 
 def hierarchical_dense_probabilities(
@@ -341,10 +446,17 @@ def hierarchical_dense_probabilities(
         dtype=torch.float32,
     )
     prior = output.get("prior_logits")
+    global_prior = output.get("global_prior_logits")
     for bin_id, layer in enumerate(head.fine):
         start = int(head.offsets[bin_id].item())
         end = int(head.offsets[bin_id + 1].item())
         local_logits = layer(output["hidden"]).float()
+        if global_prior is not None:
+            local_logits = (
+                head.global_prior.residual_logits(local_logits)
+                if head.global_prior.enabled
+                else local_logits
+            ) + global_prior[start:end].unsqueeze(0)
         if prior is not None:
             local_logits = (
                 local_logits
@@ -427,6 +539,12 @@ def compare_output_summaries(
                 .sum()
                 .cpu()
             )
+        if real is not None and numerical_column in real:
+            result["support_probability_ece"] = support_probability_ece(
+                candidate["probabilities"],
+                candidate["support_original"],
+                real[numerical_column],
+            )
     else:
         first_mean = baseline["mean"]
         second_mean = candidate["mean"]
@@ -487,6 +605,56 @@ def compare_output_summaries(
             else None
         )
     return result
+
+
+def support_probability_ece(
+    probabilities: torch.Tensor,
+    support: torch.Tensor,
+    target: pd.Series,
+    *,
+    num_bins: int = 10,
+) -> float | None:
+    numeric = pd.to_numeric(target, errors="coerce").to_numpy(dtype=float)
+    valid = np.isfinite(numeric)
+    if not valid.any():
+        return None
+    rows = np.flatnonzero(valid)
+    rows = rows[rows < len(probabilities)]
+    if not len(rows):
+        return None
+    support_np = support.detach().cpu().numpy().astype(float)
+    target_np = numeric[rows]
+    distances = np.abs(target_np[:, None] - support_np[None, :])
+    target_ids = distances.argmin(axis=1)
+    exact = np.isclose(
+        target_np,
+        support_np[target_ids],
+        rtol=1e-7,
+        atol=1e-10,
+    )
+    rows = rows[exact]
+    target_ids = target_ids[exact]
+    if not len(rows):
+        return None
+    row_ids = torch.as_tensor(
+        rows,
+        dtype=torch.long,
+        device=probabilities.device,
+    )
+    selected = probabilities[row_ids]
+    confidence, prediction = selected.max(dim=1)
+    correct = prediction.detach().cpu().numpy() == target_ids
+    confidence_np = confidence.detach().cpu().numpy()
+    edges = np.linspace(0.0, 1.0, int(num_bins) + 1)
+    ece = 0.0
+    for lower, upper in zip(edges[:-1], edges[1:]):
+        member = (confidence_np > lower) & (confidence_np <= upper)
+        if member.any():
+            ece += float(member.mean()) * abs(
+                float(correct[member].mean())
+                - float(confidence_np[member].mean())
+            )
+    return float(ece)
 
 
 if __name__ == "__main__":

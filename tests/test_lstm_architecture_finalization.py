@@ -1,0 +1,234 @@
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
+import pandas as pd
+import pytest
+import torch
+import yaml
+
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+from attribute_generation.conditional_tabdlm.categorical_head import (  # noqa: E402
+    PriorAnchoredCategoricalHead,
+    fit_categorical_head_metadata,
+)
+from attribute_generation.conditional_tabdlm.support_calibration import (  # noqa: E402
+    support_calibration_metrics,
+    support_probability_table,
+)
+from scripts.run_lstm_architecture_finalization import (  # noqa: E402
+    evaluator_fingerprint,
+    promote_schema_numeric_ordinals,
+    require_lock,
+    select_validation_winner,
+    validation_comparability,
+)
+
+
+class Vocab:
+    size = 3
+
+    def encode(self, value):
+        return {"a": 0, "b": 1, "c": 2}.get(value, 2)
+
+
+def test_categorical_prior_head_starts_at_training_distribution():
+    head = PriorAnchoredCategoricalHead(
+        4,
+        3,
+        {
+            "enabled": True,
+            "probabilities": [0.8, 0.15, 0.05],
+            "alpha": 1.0,
+            "residual_weight": 0.5,
+            "residual_init_scale": 0.0,
+        },
+    )
+    probability = torch.softmax(head(torch.zeros(5, 4)), dim=1)
+
+    assert torch.allclose(
+        probability,
+        torch.tensor([[0.8, 0.15, 0.05]]).expand(5, -1),
+        atol=1e-6,
+    )
+
+
+def test_categorical_prior_masks_categories_absent_from_training():
+    head = PriorAnchoredCategoricalHead(
+        2,
+        3,
+        {
+            "enabled": True,
+            "probabilities": [0.8, 0.2, 0.0],
+            "residual_weight": 0.0,
+        },
+    )
+
+    probability = torch.softmax(head(torch.zeros(1, 2)), dim=1)
+
+    assert probability[0, 2].item() == 0.0
+
+
+def test_categorical_prior_metadata_uses_only_generated_targets():
+    raw = {
+        "categorical_heads": {"prior": {"enabled": True}},
+    }
+    schema = SimpleNamespace(
+        categorical_targets=("channel",),
+        model_categorical_targets=("channel", "auxiliary"),
+    )
+    config = SimpleNamespace(raw=raw, schema=schema)
+    frame = pd.DataFrame({"channel": ["a", "a", "b"]})
+
+    metadata = fit_categorical_head_metadata(
+        config,
+        {"channel": Vocab(), "auxiliary": Vocab()},
+        train_frame=frame,
+        train_dataset=None,
+    )
+
+    assert metadata["columns"]["channel"]["enabled"] is True
+    assert metadata["columns"]["auxiliary"]["enabled"] is False
+
+
+def test_numeric_ordinal_promotion_is_schema_driven():
+    raw = {
+        "generated_attributes": {
+            "score": {
+                "semantic_type": "ordinal_categorical",
+                "valid_domain": [0.5, 1.0, 1.5],
+            },
+            "label": {
+                "semantic_type": "categorical",
+                "valid_domain": ["low", "high"],
+            },
+        },
+        "columns": {
+            "target": {
+                "categorical": ["score", "label"],
+                "numerical": [],
+                "text": [],
+            }
+        },
+    }
+
+    resolved = promote_schema_numeric_ordinals(raw)
+
+    assert resolved["columns"]["target"]["numerical"] == ["score"]
+    assert resolved["columns"]["target"]["categorical"] == ["label"]
+    assert raw["columns"]["target"]["categorical"] == ["score", "label"]
+
+
+def test_support_diagnostics_report_reverse_kl_and_invalid_support():
+    table = support_probability_table(
+        pd.Series([1.0, 1.0, 2.0]),
+        pd.Series([1.0, 2.0]),
+        pd.Series([1.0, 1.5, np.nan]),
+    )
+
+    metrics = support_calibration_metrics(table)
+
+    assert metrics["kl_generated_to_train"] >= 0
+    assert metrics["invalid_support_rate"] == pytest.approx(1 / 3)
+    assert metrics["invalid_or_missing_rate"] == pytest.approx(2 / 3)
+
+
+def test_test_stage_requires_fully_validation_frozen_lock(tmp_path: Path):
+    with pytest.raises(RuntimeError, match="not validation-locked"):
+        require_lock(tmp_path, require_fully_frozen=True)
+
+
+def test_evaluator_hash_ignores_only_run_specific_table_paths(tmp_path: Path):
+    source = ROOT / "configs/evaluation/single_event_table_paper_metrics_hm_10k_customers.yaml"
+    raw = yaml.safe_load(source.read_text(encoding="utf-8"))
+    raw["real_table_path"] = "run/validation_real.csv"
+    raw["synthetic_table_path"] = "run/synthetic.csv"
+    resolved = tmp_path / "resolved.yaml"
+    resolved.write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+    assert (
+        evaluator_fingerprint(source)["evaluator_hash"]
+        == evaluator_fingerprint(resolved)["evaluator_hash"]
+    )
+    raw["evaluation"]["max_rows_for_c2st"] = 123
+    resolved.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    assert (
+        evaluator_fingerprint(source)["evaluator_hash"]
+        != evaluator_fingerprint(resolved)["evaluator_hash"]
+    )
+
+
+def test_validation_comparability_rejects_split_mismatch(tmp_path: Path):
+    variants = {"A": {}, "B": {}}
+    matrix = {"variants": variants}
+    common_config = {
+        "dataset": {"name": "example"},
+        "event_spine": {"timestamp": "time"},
+        "columns": {"target": {"numerical": ["value"]}},
+        "schema": {"fields": {"value": {"type": "numerical"}}},
+    }
+    for model in variants:
+        config_path = tmp_path / "resolved_configs/rel_hm" / f"{model}.yaml"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(yaml.safe_dump(common_config), encoding="utf-8")
+        manifest_path = (
+            tmp_path
+            / "rel_hm/validation"
+            / model
+            / "shared/comparability_manifest.json"
+        )
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest = {
+            "evaluation_config_sha256": "eval",
+            "c2st_source_sha256": "source",
+            "split_fingerprints": {"train_real.csv": "same"},
+            "precomputed_split_fingerprints": {},
+            "pretokenized_metadata_sha256": "pretok",
+            "neighbor_cache_metadata_sha256": "neighbor",
+        }
+        if model == "B":
+            manifest["split_fingerprints"]["train_real.csv"] = "different"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    result = validation_comparability(matrix, tmp_path)
+
+    assert result["comparable"] is False
+    assert result["mismatches"] == {"B": ["split_fingerprints"]}
+
+
+def test_validation_selection_prefers_simplicity_within_equivalence_band():
+    candidates = [
+        {
+            "model": "simple",
+            "full_row_c2st": 0.50,
+            "numerical_only_c2st": 0.40,
+            "support_tv": 0.05,
+            "seed_std": 0.02,
+            "complexity_rank": 1,
+        },
+        {
+            "model": "complex",
+            "full_row_c2st": 0.495,
+            "numerical_only_c2st": 0.395,
+            "support_tv": 0.045,
+            "seed_std": 0.01,
+            "complexity_rank": 4,
+        },
+    ]
+    policy = {
+        "full_c2st_equivalence_tolerance": 0.01,
+        "numerical_c2st_equivalence_tolerance": 0.02,
+        "support_tv_equivalence_tolerance": 0.01,
+    }
+
+    winner, trace = select_validation_winner(candidates, policy)
+
+    assert winner["model"] == "simple"
+    assert len(trace["stages"]) == 3

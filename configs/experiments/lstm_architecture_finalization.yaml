@@ -1,0 +1,167 @@
+experiment_name: lstm_architecture_finalization
+output_root: outputs/architecture_finalization
+seeds: [17, 42, 73]
+evaluator_seed: 42
+
+selection:
+  minimum_rows_per_second: 1000.0
+  full_c2st_equivalence_tolerance: 0.01
+  numerical_c2st_equivalence_tolerance: 0.02
+  support_tv_equivalence_tolerance: 0.01
+  m0_trend_regression_tolerance: 0.02
+  categorical_c2st_regression_tolerance: 0.02
+  categorical_tv_regression_tolerance: 0.01
+  bootstrap_samples: 2000
+
+rel_hm:
+  base_config: configs/attribute_generation/lstm_hm_10k_customers.yaml
+  evaluation_config: configs/evaluation/single_event_table_paper_metrics_hm_10k_customers.yaml
+  pretokenized_dir: data/processed/interaction_benchmarks/hm_10k_customers/pretokenized_lstm
+  neighbor_cache_dir: data/processed/interaction_benchmarks/hm_10k_customers/neighbor_cache
+  historical_roots:
+    M0_original_lstm_v53: outputs/hm-10k-customers/lstm_v53_explicit_split_three_seed
+    M2_global_support: outputs/hm-10k-customers/lstm_numerical_heads/M2_global_support
+
+numerical_head:
+  direct_support_max_values: 8192
+  hierarchical_num_bins: 64
+  ordinal_regularization_weight: 0.0
+  global_calibration_weight: 0.0
+  type_inference:
+    low_cardinality_max_values: 64
+    low_cardinality_max_unique_ratio: 0.05
+    direct_support_max_values: 8192
+    hierarchical_support_max_values: 200000
+    repeated_max_unique_ratio: 0.25
+    repeated_min_observation_mass: 0.50
+    holdout_min_support_overlap: 0.75
+    precision_min_dominant_mass: 0.70
+    spacing_max_coefficient_of_variation: 2.0
+    top_values_min_observation_mass: 0.10
+    minimum_structured_signals: 3
+
+variants:
+  M0_original_lstm_v53:
+    complexity_rank: 0
+    numerical_heads:
+      mode: continuous_baseline
+      conditioning: {explicit_destination: false}
+      prior: {enabled: false}
+
+  M2_global_support:
+    complexity_rank: 1
+    numerical_heads:
+      mode: support
+      class_frequency_weighting: inverse_sqrt
+      label_smoothing: 0.01
+      conditioning: {explicit_destination: false}
+      prior: {enabled: false}
+
+  M2U_standard_ce:
+    complexity_rank: 1
+    numerical_heads:
+      mode: support
+      class_frequency_weighting: none
+      label_smoothing: 0.0
+      conditioning: {explicit_destination: false}
+      prior: {enabled: false}
+
+  M3_destination_support:
+    complexity_rank: 3
+    numerical_heads:
+      mode: support
+      class_frequency_weighting: inverse_sqrt
+      label_smoothing: 0.01
+      conditioning: {explicit_destination: true}
+      prior: {enabled: false}
+
+  M4_destination_support_prior:
+    complexity_rank: 4
+    numerical_heads:
+      mode: support
+      class_frequency_weighting: inverse_sqrt
+      label_smoothing: 0.01
+      conditioning: {explicit_destination: true}
+      prior:
+        enabled: true
+        lambda_prior: 0.5
+        num_frequency_buckets: 4
+        num_time_buckets: 8
+        min_destination_rows: 20
+        max_exact_support_values: 64
+        time_smoothing: 100.0
+        frequency_smoothing: 100.0
+        destination_smoothing: 20.0
+        epsilon: 1.0e-8
+
+  M2P_R0_global_prior:
+    complexity_rank: 1
+    numerical_heads:
+      mode: support_prior
+      class_frequency_weighting: none
+      label_smoothing: 0.0
+      conditioning: {explicit_destination: false}
+      prior: {enabled: false}
+      global_prior: &global_prior
+        enabled: true
+        alpha: 1.0
+        smoothing: 0.0
+        residual_weight: 0.0
+        residual_temperature: 1.0
+        residual_norm_clip: 10.0
+        residual_init_scale: 0.001
+
+  M2P_R1_weak_residual:
+    complexity_rank: 2
+    numerical_heads:
+      mode: support_prior
+      class_frequency_weighting: none
+      label_smoothing: 0.0
+      conditioning: {explicit_destination: false}
+      prior: {enabled: false}
+      global_prior:
+        <<: *global_prior
+        residual_weight: 0.25
+
+  M2P_R2_moderate_residual:
+    complexity_rank: 2
+    numerical_heads:
+      mode: support_prior
+      class_frequency_weighting: none
+      label_smoothing: 0.0
+      conditioning: {explicit_destination: false}
+      prior: {enabled: false}
+      global_prior:
+        <<: *global_prior
+        residual_weight: 0.5
+
+  M2P_R3_full_residual:
+    complexity_rank: 2
+    numerical_heads:
+      mode: support_prior
+      class_frequency_weighting: none
+      label_smoothing: 0.0
+      conditioning: {explicit_destination: false}
+      prior: {enabled: false}
+      global_prior:
+        <<: *global_prior
+        residual_weight: 1.0
+
+temperature_grid: [0.7, 0.85, 1.0, 1.15]
+categorical_residual_grid: [0.5, 1.0]
+
+transfer:
+  promote_numeric_ordinal_schema_fields: true
+  datasets:
+    movielens_100k:
+      base_config: configs/attribute_generation/lstm_movielens_100k.yaml
+      evaluation_config: configs/evaluation/single_event_table_paper_metrics_movielens_100k.yaml
+      pretokenized_dir: data/processed/lstm_architecture_finalization/movielens_100k/pretokenized_lstm
+      neighbor_cache_dir: data/processed/lstm_architecture_finalization/movielens_100k/neighbor_cache
+      sampling_policy: fast
+    amazon_toy:
+      base_config: configs/attribute_generation/conditional_tabdlm_amazon_toy_exp5_1_lstm_privacy_alignment.yaml
+      evaluation_config: configs/evaluation/single_event_table_paper_metrics_amazon_toy.yaml
+      pretokenized_dir: data/processed/lstm_architecture_finalization/amazon_toy/pretokenized_lstm
+      neighbor_cache_dir: data/processed/lstm_architecture_finalization/amazon_toy/neighbor_cache
+      sampling_policy: v53-length-preserving
