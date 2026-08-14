@@ -28,6 +28,7 @@ from scripts.run_lstm_architecture_finalization import (  # noqa: E402
     load_json_optional,
     load_yaml,
     nested,
+    object_sha256,
     write_json,
 )
 
@@ -71,12 +72,16 @@ def main() -> None:
     routing.to_csv(output / "numerical_routing.csv", index=False)
 
     evaluator = evaluator_comparability(output, matrix, all_runs)
+    write_json(evaluator, output / "evaluator_comparability.json")
+    failure_path = output / "evaluator_comparability_failure.json"
     if evaluator["status"] != "passed":
-        write_json(evaluator, output / "evaluator_comparability_failure.json")
+        write_json(evaluator, failure_path)
         raise RuntimeError(
             "Evaluator comparability failed; refusing to create a mixed final "
             "table. See evaluator_comparability_failure.json."
         )
+    if failure_path.is_file():
+        failure_path.unlink()
     (output / "evaluator_audit.md").write_text(
         evaluator_markdown(evaluator), encoding="utf-8"
     )
@@ -340,18 +345,23 @@ def evaluator_comparability(
     matrix: dict[str, Any],
     all_runs: pd.DataFrame,
 ) -> dict[str, Any]:
-    expected: dict[str, str] = {
-        "rel_hm": evaluator_fingerprint(
-            Path(matrix["rel_hm"]["evaluation_config"])
-        )["evaluator_hash"]
+    config_paths: dict[str, Path] = {
+        "rel_hm": Path(matrix["rel_hm"]["evaluation_config"])
     }
     for dataset, definition in matrix["transfer"]["datasets"].items():
-        expected[dataset] = evaluator_fingerprint(
-            Path(definition["evaluation_config"])
-        )["evaluator_hash"]
+        config_paths[dataset] = Path(definition["evaluation_config"])
+    expected = {
+        dataset: evaluator_runtime_normalized_fingerprint(path)
+        for dataset, path in config_paths.items()
+    }
     missing = []
     hash_mismatches = []
     per_run_hashes = []
+    resolved_hashes_by_dataset: dict[str, set[str]] = {
+        dataset: set() for dataset in expected
+    }
+    fixed_seed = int(matrix["evaluator_seed"])
+    resolved_seed_mismatches = []
     for row in all_runs.to_dict(orient="records"):
         metrics_path = Path(str(row.get("metrics_path", "")))
         if not metrics_path.is_file():
@@ -361,43 +371,81 @@ def evaluator_comparability(
         if not evaluation_path.is_file():
             missing.append(str(evaluation_path))
             continue
-        actual = evaluator_fingerprint(evaluation_path)["evaluator_hash"]
         dataset = str(row["dataset"])
-        expected_hash = expected.get(dataset)
+        actual = evaluator_fingerprint(evaluation_path)["evaluator_hash"]
+        actual_method = evaluator_runtime_normalized_fingerprint(
+            evaluation_path
+        )
+        expected_method = expected.get(dataset)
+        resolved_hashes_by_dataset.setdefault(dataset, set()).add(actual)
         per_run_hashes.append(
             {
                 "dataset": dataset,
                 "model": row.get("model"),
                 "seed": row.get("seed"),
                 "evaluator_hash": actual,
+                "runtime_normalized_evaluator_hash": actual_method,
                 "evaluation_config": str(evaluation_path),
             }
         )
-        if actual != expected_hash:
+        if actual_method != expected_method:
             hash_mismatches.append(str(evaluation_path))
-    fixed_seed = int(matrix["evaluator_seed"])
-    resolved_seed_mismatches = []
-    for path in output.rglob("evaluation_config_resolved.yaml"):
-        raw = load_yaml(path)
+        raw = load_yaml(evaluation_path)
         seed = nested(raw, "evaluation", "random_seed")
         if seed is not None and int(seed) != fixed_seed:
-            resolved_seed_mismatches.append(str(path))
+            resolved_seed_mismatches.append(str(evaluation_path))
+    within_dataset_mismatches = {
+        dataset: sorted(hashes)
+        for dataset, hashes in resolved_hashes_by_dataset.items()
+        if len(hashes) > 1
+    }
+    resolved_hashes = {
+        dataset: next(iter(hashes)) if len(hashes) == 1 else None
+        for dataset, hashes in resolved_hashes_by_dataset.items()
+    }
     return {
         "status": (
             "passed"
             if not missing
             and not resolved_seed_mismatches
             and not hash_mismatches
+            and not within_dataset_mismatches
             else "failed"
         ),
         "fixed_evaluator_seed": fixed_seed,
-        "evaluator_hash_by_dataset": expected,
+        "evaluator_hash_by_dataset": resolved_hashes,
+        "template_runtime_normalized_hash_by_dataset": expected,
         "missing_metrics": missing,
         "hash_mismatches": hash_mismatches,
+        "within_dataset_hash_mismatches": within_dataset_mismatches,
         "per_run_hashes": per_run_hashes,
         "resolved_seed_mismatches": resolved_seed_mismatches,
         "generator_seed_decoupled_from_evaluator_seed": True,
+        "runtime_resolved_fields_excluded_from_method_hash": [
+            "table.columns.*.valid_values",
+            "table.columns.*.support",
+        ],
     }
+
+
+def evaluator_runtime_normalized_fingerprint(path: Path) -> str:
+    """Hash evaluator method settings, excluding fitted data domains."""
+
+    policy = load_yaml(path)
+    policy.pop("real_table_path", None)
+    policy.pop("synthetic_table_path", None)
+    columns = ((policy.get("table") or {}).get("columns") or {})
+    for config in columns.values():
+        if isinstance(config, dict):
+            config.pop("valid_values", None)
+            config.pop("support", None)
+    controlled = evaluator_fingerprint(path)["controlled_files"]
+    return object_sha256(
+        {
+            "runtime_normalized_policy": policy,
+            "controlled_files": controlled,
+        }
+    )
 
 
 def acceptance_checks(

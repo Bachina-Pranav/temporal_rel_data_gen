@@ -30,6 +30,9 @@ from scripts.run_lstm_architecture_finalization import (  # noqa: E402
     select_validation_winner,
     validation_comparability,
 )
+from scripts.summarize_lstm_architecture_finalization import (  # noqa: E402
+    evaluator_comparability,
+)
 
 
 class Vocab:
@@ -232,3 +235,126 @@ def test_validation_selection_prefers_simplicity_within_equivalence_band():
 
     assert winner["model"] == "simple"
     assert len(trace["stages"]) == 3
+
+
+def test_report_evaluator_comparability_allows_resolved_domains(
+    tmp_path: Path,
+):
+    base = {
+        "real_table_path": "real.csv",
+        "synthetic_table_path": "synthetic.csv",
+        "table": {
+            "columns": {
+                "rating": {
+                    "type": "categorical",
+                    "dtype": "int",
+                    "valid_values": [1, 2, 3, 4, 5, "1", "2"],
+                },
+                "price": {
+                    "type": "numerical",
+                    "support": {"min": 0.0},
+                },
+            }
+        },
+        "evaluation": {
+            "random_seed": 42,
+            "c2st": {"n_splits": 5},
+        },
+    }
+    base_path = tmp_path / "base.yaml"
+    base_path.write_text(yaml.safe_dump(base), encoding="utf-8")
+    rows = []
+    for model in ("M0", "M2"):
+        run = tmp_path / model / "runs/seed_42"
+        metrics = run / "evaluation/paper_grade/metrics.json"
+        metrics.parent.mkdir(parents=True)
+        metrics.write_text("{}\n", encoding="utf-8")
+        resolved = {
+            **base,
+            "real_table_path": "resolved_real.csv",
+            "synthetic_table_path": f"{model}_synthetic.csv",
+        }
+        resolved["table"] = {
+            "columns": {
+                "rating": {
+                    "type": "categorical",
+                    "dtype": "int",
+                    "valid_values": [1.0, 2.0, 3.0, 4.0, 5.0],
+                },
+                "price": {
+                    "type": "numerical",
+                    "support": {"min": 0.1, "max": 9.9},
+                },
+            }
+        }
+        (run / "evaluation_config_resolved.yaml").write_text(
+            yaml.safe_dump(resolved),
+            encoding="utf-8",
+        )
+        rows.append(
+            {
+                "dataset": "rel_hm",
+                "model": model,
+                "seed": 42,
+                "metrics_path": str(metrics),
+            }
+        )
+    matrix = {
+        "evaluator_seed": 42,
+        "rel_hm": {"evaluation_config": str(base_path)},
+        "transfer": {"datasets": {}},
+    }
+
+    result = evaluator_comparability(
+        tmp_path,
+        matrix,
+        pd.DataFrame(rows),
+    )
+
+    assert result["status"] == "passed"
+    assert not result["hash_mismatches"]
+    assert not result["within_dataset_hash_mismatches"]
+
+
+def test_report_evaluator_comparability_rejects_method_drift(
+    tmp_path: Path,
+):
+    base = {
+        "table": {"columns": {"rating": {"type": "categorical"}}},
+        "evaluation": {"random_seed": 42, "c2st": {"n_splits": 5}},
+    }
+    base_path = tmp_path / "base.yaml"
+    base_path.write_text(yaml.safe_dump(base), encoding="utf-8")
+    run = tmp_path / "M0/runs/seed_42"
+    metrics = run / "evaluation/paper_grade/metrics.json"
+    metrics.parent.mkdir(parents=True)
+    metrics.write_text("{}\n", encoding="utf-8")
+    changed = {
+        **base,
+        "evaluation": {"random_seed": 42, "c2st": {"n_splits": 3}},
+    }
+    (run / "evaluation_config_resolved.yaml").write_text(
+        yaml.safe_dump(changed),
+        encoding="utf-8",
+    )
+    matrix = {
+        "evaluator_seed": 42,
+        "rel_hm": {"evaluation_config": str(base_path)},
+        "transfer": {"datasets": {}},
+    }
+
+    result = evaluator_comparability(
+        tmp_path,
+        matrix,
+        pd.DataFrame(
+            [{
+                "dataset": "rel_hm",
+                "model": "M0",
+                "seed": 42,
+                "metrics_path": str(metrics),
+            }]
+        ),
+    )
+
+    assert result["status"] == "failed"
+    assert result["hash_mismatches"]
