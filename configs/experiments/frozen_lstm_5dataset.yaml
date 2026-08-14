@@ -1,0 +1,91 @@
+experiment_name: frozen_lstm_5dataset
+output_root: outputs/frozen_lstm_5dataset
+seed: 42
+evaluator_seed: 42
+target_interactions: 100000
+allowed_relative_error: 0.01
+raw_root: data/raw
+processed_root: data/processed/interaction_benchmarks
+
+frozen_architecture:
+  compact_root: outputs/architecture_finalization_compact
+  config: outputs/architecture_finalization_compact/resolved_configs/final_architecture.yaml
+  lock: outputs/architecture_finalization_compact/architecture_lock.json
+  results: outputs/architecture_finalization_compact/final_cross_dataset_results.csv
+  confirmation_manifest: outputs/architecture_finalization_compact/confirmation_manifest.json
+  text_template: configs/attribute_generation/conditional_tabdlm_amazon_toy_exp5_1_lstm_privacy_alignment.yaml
+  expected:
+    numerical_mode: auto
+    support_prior_alpha: 1.0
+    support_residual_weight: 0.25
+    support_sampling_temperature: 1.0
+    categorical_architecture: original
+    temporal_prior_lambda: 0.0
+
+datasets:
+  yelp:
+    display_name: Yelp-100K-induced
+    adapter: yelp
+    processed_name: yelp_100k
+    base_config: configs/attribute_generation/lstm_yelp_100k.yaml
+    evaluation_config: configs/evaluation/single_event_table_paper_metrics_yelp_100k.yaml
+    output_root: outputs/frozen_lstm_5dataset/datasets/yelp
+    pretokenized_dir: outputs/frozen_lstm_5dataset/datasets/yelp/precomputed/pretokenized_lstm
+    neighbor_cache_dir: outputs/frozen_lstm_5dataset/datasets/yelp/precomputed/neighbor_cache
+    sampling_policy: v53-length-preserving
+    fixed_fields: [event_id, user_id, business_id, event_time]
+    generated_categorical: [stars]
+    generated_numerical: [useful, funny, cool]
+    generated_text: [review_text]
+    excluded_fields: []
+
+  retailrocket:
+    display_name: RetailRocket-100K-induced
+    adapter: retailrocket
+    processed_name: retailrocket_100k
+    base_config: configs/attribute_generation/lstm_retailrocket_100k.yaml
+    evaluation_config: configs/evaluation/single_event_table_paper_metrics_retailrocket_100k.yaml
+    output_root: outputs/frozen_lstm_5dataset/datasets/retailrocket
+    pretokenized_dir: outputs/frozen_lstm_5dataset/datasets/retailrocket/precomputed/pretokenized_lstm
+    neighbor_cache_dir: outputs/frozen_lstm_5dataset/datasets/retailrocket/precomputed/neighbor_cache
+    sampling_policy: fast
+    fixed_fields: [event_id, visitor_id, item_id, event_time]
+    generated_categorical: [event_type]
+    generated_numerical: []
+    generated_text: []
+    excluded_fields: [transactionid, transaction_id]
+
+existing_datasets:
+  amazon_toy:
+    display_name: Amazon-Toy
+    interaction_table: data/original/rel-amazon-toy/review.csv
+    source_table: data/original/rel-amazon-toy/customer.csv
+    destination_table: data/original/rel-amazon-toy/product.csv
+    source_column: customer_id
+    destination_column: product_id
+    timestamp_column: review_time
+    generated_numerical: []
+    generated_categorical: [rating, verified]
+    generated_text: [summary, review_text]
+  movielens_100k:
+    display_name: MovieLens-100K-induced
+    interaction_table: data/processed/interaction_benchmarks/movielens_100k/interactions.csv
+    source_table: data/processed/interaction_benchmarks/movielens_100k/users.csv
+    destination_table: data/processed/interaction_benchmarks/movielens_100k/movies.csv
+    source_column: user_id
+    destination_column: movie_id
+    timestamp_column: event_time
+    generated_numerical: [rating]
+    generated_categorical: []
+    generated_text: []
+  rel_hm:
+    display_name: Rel-HM
+    interaction_table: data/processed/interaction_benchmarks/hm_10k_customers/interactions.csv
+    source_table: data/processed/interaction_benchmarks/hm_10k_customers/customers.csv
+    destination_table: data/processed/interaction_benchmarks/hm_10k_customers/articles.csv
+    source_column: customer_id
+    destination_column: article_id
+    timestamp_column: event_time
+    generated_numerical: [price]
+    generated_categorical: [sales_channel_id]
+    generated_text: []

@@ -6,11 +6,15 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
+import platform
 import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Any
+
+import torch
 
 
 if not __package__:
@@ -205,9 +209,31 @@ def write_training_metadata(config: ConditionalTABDLMConfig, best_path: Path, el
         "dataset_fingerprint_sha256": sha256_file(config.train_data_path),
         "configuration_fingerprint_sha256": sha256_json(config.to_dict()),
         "git_commit": git_revision(),
+        "hardware": hardware_metadata(),
     }
     metadata.update({key: value for key, value in runtime.items() if key not in metadata})
     save_json(metadata, config.output_dir / "training_metadata.json")
+
+
+def hardware_metadata() -> dict[str, Any]:
+    cuda_available = bool(torch.cuda.is_available())
+    return {
+        "platform": platform.platform(),
+        "machine": platform.machine(),
+        "processor": platform.processor() or None,
+        "logical_cpu_count": os.cpu_count(),
+        "cuda_available": cuda_available,
+        "cuda_device_count": (
+            int(torch.cuda.device_count()) if cuda_available else 0
+        ),
+        "cuda_device_name": (
+            torch.cuda.get_device_name(torch.cuda.current_device())
+            if cuda_available
+            else None
+        ),
+        "torch_version": torch.__version__,
+        "cuda_runtime_version": torch.version.cuda,
+    }
 
 
 def prepared_row_count(path: Path) -> int | None:

@@ -399,3 +399,39 @@ def test_sample_validation_rejects_category_outside_training_domain(
 
     assert result["valid"] is False
     assert result["categorical_targets"]["rating"]["invalid_count"] == 1
+
+
+def test_sample_validation_rejects_empty_text_target(tmp_path: Path):
+    spine = tmp_path / "spine.csv"
+    train = tmp_path / "train.csv"
+    synthetic = tmp_path / "synthetic.csv"
+    pd.DataFrame({"id": [1, 2]}).to_csv(spine, index=False)
+    pd.DataFrame(
+        {"id": [1, 2], "review_text": ["training one", "training two"]}
+    ).to_csv(train, index=False)
+    pd.DataFrame(
+        {"id": [1, 2], "review_text": ["generated", "   "]}
+    ).to_csv(synthetic, index=False)
+    schema = SimpleNamespace(
+        condition_columns=("id",),
+        target_columns=("review_text",),
+        foreign_key_columns=("id",),
+        datetime_columns=(),
+        categorical_targets=(),
+        numerical_targets=(),
+        text_targets=("review_text",),
+    )
+
+    result = validate_sampled_table(
+        spine,
+        synthetic,
+        train,
+        schema,
+        num_rows=None,
+    )
+
+    assert result["valid"] is False
+    assert result["text_targets"]["review_text"] == {
+        "invalid_or_empty_count": 1,
+        "nonempty_required": True,
+    }

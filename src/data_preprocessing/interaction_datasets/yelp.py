@@ -77,13 +77,24 @@ class YelpAdapter(InteractionDatasetAdapter):
 
     def locate_raw_files(self, raw_root) -> RawFileBundle:
         raw_dir = self.raw_dir(raw_root)
+        filenames = {
+            "review": "yelp_academic_dataset_review.json",
+            "user": "yelp_academic_dataset_user.json",
+            "business": "yelp_academic_dataset_business.json",
+        }
         files = {
-            "review": find_file(raw_dir, "yelp_academic_dataset_review.json"),
-            "user": find_file(raw_dir, "yelp_academic_dataset_user.json"),
-            "business": find_file(raw_dir, "yelp_academic_dataset_business.json"),
+            key: find_file(raw_dir, filename)
+            for key, filename in filenames.items()
         }
         if not all(files.values()):
-            raise FileNotFoundError(f"Missing Yelp JSON files under {raw_dir}")
+            missing = [
+                str(raw_dir / "**" / filenames[key])
+                for key, path in files.items()
+                if path is None
+            ]
+            raise FileNotFoundError(
+                "Missing Yelp raw files: " + ", ".join(missing)
+            )
         return RawFileBundle({key: path for key, path in files.items() if path is not None})
 
     def iter_interaction_chunks(self, raw_root, *, chunk_size: int = 100_000) -> Iterator[pd.DataFrame]:

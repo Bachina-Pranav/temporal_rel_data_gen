@@ -793,6 +793,22 @@ def validate_sampled_table(
             errors.append(
                 f"Numerical target {column!r} has {int(invalid.sum())} invalid/out-of-range values"
             )
+    text = {}
+    for column in getattr(schema, "text_targets", ()):
+        values = (
+            synthetic[column]
+            if column in synthetic
+            else pd.Series([pd.NA] * len(synthetic), index=synthetic.index)
+        )
+        invalid = values.isna() | values.astype("string").str.strip().eq("")
+        text[column] = {
+            "invalid_or_empty_count": int(invalid.sum()),
+            "nonempty_required": True,
+        }
+        if invalid.any():
+            errors.append(
+                f"Text target {column!r} has {int(invalid.sum())} null/empty values"
+            )
     return {
         "valid": not errors,
         "errors": errors,
@@ -803,6 +819,7 @@ def validate_sampled_table(
         ),
         "categorical_targets": categorical,
         "numerical_targets": numerical,
+        "text_targets": text,
         "synthetic_sha256": file_sha256(synthetic_path),
     }
 

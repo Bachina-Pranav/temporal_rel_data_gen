@@ -45,6 +45,9 @@ def test_review_text_auto_cap_uses_max_when_feasible(tmp_path):
     assert raw["review_text"]["length_cap_source"] == "max"
     assert raw["review_text"]["coverage_rate_train"] == 1.0
     assert raw["review_text"]["truncation_rate_train"] == 0.0
+    metadata = raw["_auto_text_length_metadata"]["review_text"]
+    assert metadata["fit_scope"] == "input_table"
+    assert metadata["training_only"] is False
 
 
 def test_review_text_auto_cap_records_truncation_when_feasible_cap_binds(tmp_path):
@@ -53,4 +56,3 @@ def test_review_text_auto_cap_records_truncation_when_feasible_cap_binds(tmp_pat
     assert raw["review_text"]["length_cap_source"] == "max_feasible_under_p99"
     assert raw["review_text"]["coverage_rate_train"] < 1.0
     assert raw["review_text"]["truncation_rate_train"] > 0.0
-

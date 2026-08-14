@@ -56,7 +56,10 @@ class RetailRocketAdapter(InteractionDatasetAdapter):
             "category_tree": find_file(raw_dir, "category_tree.csv"),
         }
         if files["events"] is None:
-            raise FileNotFoundError(f"Missing RetailRocket events.csv under {raw_dir}")
+            raise FileNotFoundError(
+                "Missing RetailRocket raw file: "
+                f"{raw_dir / '**' / 'events.csv'}"
+            )
         return RawFileBundle({key: path for key, path in files.items() if path is not None})
 
     def iter_interaction_chunks(self, raw_root, *, chunk_size: int = 250_000) -> Iterator[pd.DataFrame]:

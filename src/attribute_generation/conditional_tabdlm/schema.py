@@ -255,6 +255,10 @@ def resolve_auto_review_text_config(raw_config: dict[str, Any]) -> dict[str, Any
         train_path,
         chunk_size=int(raw.get("training", {}).get("auto_text_length_chunk_size", 500_000)),
     )
+    input_columns = set(pd.read_csv(train_path, nrows=0).columns)
+    length_fit_scope = (
+        "explicit_train_split" if "split" in input_columns else "input_table"
+    )
     if content_lengths.size == 0:
         raise ValueError("Cannot resolve review_text max_tokens=auto from empty review_text column")
     token_lengths = content_lengths + 2
@@ -309,6 +313,8 @@ def resolve_auto_review_text_config(raw_config: dict[str, Any]) -> dict[str, Any
     )
     raw["review_text"] = review_cfg
     raw.setdefault("_auto_text_length_metadata", {})["review_text"] = {
+        "fit_scope": length_fit_scope,
+        "training_only": length_fit_scope == "explicit_train_split",
         "review_text_max_tokens": int(cap),
         "review_text_max_content_tokens": int(max_content),
         "review_text_max_tokens_strategy": strategy,
@@ -324,7 +330,15 @@ def resolve_auto_review_text_config(raw_config: dict[str, Any]) -> dict[str, Any
 
 def review_text_content_lengths_from_csv(train_path: Path, chunk_size: int = 500_000) -> np.ndarray:
     pieces: list[np.ndarray] = []
-    for chunk in pd.read_csv(train_path, usecols=["review_text"], chunksize=int(chunk_size), low_memory=False):
+    available = set(pd.read_csv(train_path, nrows=0).columns)
+    usecols = [
+        "review_text",
+        *(["split"] if "split" in available else []),
+    ]
+    for chunk in pd.read_csv(train_path, usecols=usecols, chunksize=int(chunk_size), low_memory=False):
+        if "split" in chunk:
+            split = chunk["split"].astype(str).str.strip().str.lower()
+            chunk = chunk.loc[split.isin({"train", "training"})]
         normalized = chunk["review_text"].map(normalize_text)
         normalized = normalized[normalized.str.len() > 0]
         if len(normalized):
