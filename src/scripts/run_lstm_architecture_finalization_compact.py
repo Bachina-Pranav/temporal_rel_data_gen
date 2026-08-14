@@ -382,7 +382,7 @@ def select_compact_architecture(
     if categorical["selected"] == "prior_anchored":
         selected_lambda = 0.0
         source = Path(
-            matrix["rel_hm"]["reused_categorical_prior_root"]
+            matrix["rel_hm"]["reused_categorical_prior_validation_root"]
         )
         blocking_note = (
             "Categorical prior retained by strong cross-dataset evidence; "
@@ -911,10 +911,12 @@ def amazon_final_root(
 
 
 def require_reuse_inputs(matrix: dict[str, Any]) -> None:
-    roots = [
+    checkpoint_roots = [
         matrix["rel_hm"]["reused_original_root"],
-        matrix["rel_hm"]["reused_m2_validation_root"],
         matrix["rel_hm"]["reused_categorical_prior_validation_root"],
+    ]
+    evaluation_roots = [
+        matrix["rel_hm"]["reused_m2_validation_root"],
         matrix["rel_hm"]["reused_m0_test_root"],
         matrix["rel_hm"]["reused_m2_test_root"],
         matrix["transfer"]["movielens_100k"]["reused_m2_root"],
@@ -922,11 +924,27 @@ def require_reuse_inputs(matrix: dict[str, Any]) -> None:
         matrix["transfer"]["amazon_toy"]["reused_m2_root"],
         matrix["transfer"]["amazon_toy"]["reused_current_final_root"],
     ]
-    missing = [root for root in roots if not completed_run(Path(root))]
-    if missing:
-        raise FileNotFoundError(
-            "Required reusable outputs are missing:\n- " + "\n- ".join(missing)
-        )
+    missing_checkpoints = [
+        root for root in checkpoint_roots if not completed_run(Path(root))
+    ]
+    missing_evaluations = [
+        root
+        for root in evaluation_roots
+        if not completed_evaluation(Path(root))
+    ]
+    if missing_checkpoints or missing_evaluations:
+        sections = []
+        if missing_checkpoints:
+            sections.append(
+                "Checkpoint-source runs are incomplete:\n- "
+                + "\n- ".join(missing_checkpoints)
+            )
+        if missing_evaluations:
+            sections.append(
+                "Evaluation-only reusable runs are incomplete:\n- "
+                + "\n- ".join(missing_evaluations)
+            )
+        raise FileNotFoundError("\n".join(sections))
 
 
 def require_completed_candidates(matrix: dict[str, Any], output: Path) -> None:
@@ -979,13 +997,17 @@ def completed_training(root: Path) -> bool:
     )
 
 
-def completed_run(root: Path) -> bool:
+def completed_evaluation(root: Path) -> bool:
+    run = root / "runs/seed_42"
     return bool(
-        completed_training(root)
-        and (root / "runs/seed_42/samples/synthetic_interactions.csv").is_file()
-        and (root / "runs/seed_42/evaluation/paper_grade/metrics.json").is_file()
-        and (root / "runs/seed_42/evaluation/attribute_diagnostics.json").is_file()
+        (run / "samples/synthetic_interactions.csv").is_file()
+        and (run / "evaluation/paper_grade/metrics.json").is_file()
+        and (run / "evaluation/attribute_diagnostics.json").is_file()
     )
+
+
+def completed_run(root: Path) -> bool:
+    return completed_training(root) and completed_evaluation(root)
 
 
 def temporal_name(value: float) -> str:

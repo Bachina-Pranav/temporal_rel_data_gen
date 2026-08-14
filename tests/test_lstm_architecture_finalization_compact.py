@@ -14,6 +14,8 @@ sys.path.insert(0, str(ROOT / "src"))
 from scripts.run_lstm_architecture_finalization_compact import (  # noqa: E402
     architecture_config,
     classify_deltas,
+    completed_evaluation,
+    completed_run,
     enforce_compact_contract,
     promote_schema_numeric_ordinals,
     select_temporal_candidate,
@@ -138,3 +140,18 @@ def test_temporal_numerical_error_uses_only_numeric_timestamp_pairs():
     }
 
     assert temporal_numerical_error(attribute, config) == 0.2
+
+
+def test_evaluation_only_reuse_does_not_require_checkpoint(tmp_path):
+    run = tmp_path / "runs/seed_42"
+    required = [
+        run / "samples/synthetic_interactions.csv",
+        run / "evaluation/paper_grade/metrics.json",
+        run / "evaluation/attribute_diagnostics.json",
+    ]
+    for path in required:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}", encoding="utf-8")
+
+    assert completed_evaluation(tmp_path)
+    assert not completed_run(tmp_path)

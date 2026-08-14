@@ -66,7 +66,6 @@ rel_hm:
   reused_categorical_prior_validation_root: outputs/architecture_finalization/rel_hm/categorical/M2P_R1_weak_residual__cat_prior_1
   reused_m0_test_root: outputs/architecture_finalization/rel_hm/test/M0_original_lstm_v53
   reused_m2_test_root: outputs/architecture_finalization/rel_hm/test/M2_global_support
-  reused_categorical_prior_root: outputs/architecture_finalization/rel_hm/test/M2P_R1_weak_residual__cat_prior_1
 
 transfer:
   movielens_100k:
