@@ -33,6 +33,10 @@ from scripts.run_lstm_architecture_finalization import (  # noqa: E402
 from scripts.summarize_lstm_architecture_finalization import (  # noqa: E402
     evaluator_comparability,
 )
+from scripts.summarize_lstm_architecture_for_llm import (  # noqa: E402
+    build_summary,
+    render_markdown,
+)
 
 
 class Vocab:
@@ -235,6 +239,107 @@ def test_validation_selection_prefers_simplicity_within_equivalence_band():
 
     assert winner["model"] == "simple"
     assert len(trace["stages"]) == 3
+
+
+def test_llm_summary_keeps_decision_evidence_and_removes_nan(tmp_path: Path):
+    decision = {
+        "final_model_name": "candidate",
+        "freeze_architecture": False,
+        "freeze_recommendation": "DO NOT FREEZE",
+        "selection_policy": {
+            "architecture_selected_on": "Rel-HM validation only",
+            "test_data_used_for_selection": False,
+            "validation_selection": {
+                "selected_model": "candidate_base",
+                "selected_metrics": {
+                    "full_row_c2st": 0.25,
+                    "numerical_only_c2st": 0.20,
+                    "support_tv": 0.10,
+                },
+                "eligible_candidates": [
+                    {
+                        "model": "candidate_base",
+                        "full_row_c2st": 0.25,
+                        "numerical_only_c2st": 0.20,
+                        "support_tv": 0.10,
+                        "ignored_nan": float("nan"),
+                    }
+                ],
+                "selection_split": "validation",
+                "test_metrics_consulted": False,
+            },
+            "temperature_selection": {"selected_temperature": 1.0},
+            "categorical_selection": {"adopted": True},
+        },
+        "final_architecture": {
+            "numerical_routing": "training-only auto router",
+            "continuous_head": "Gaussian location/scale",
+            "support_head_equation": "prior + residual",
+            "temporal_relational_context": "past-only",
+            "text_architecture_changed": False,
+        },
+        "chosen_hyperparameters": {"support_sampling_temperature": 1.0},
+        "acceptance_checks": {
+            "validity": {"passed": True, "observed": 0.0},
+            "transfer": {
+                "passed": False,
+                "observed": {"amazon_toy": 0.03, "unused": float("nan")},
+            },
+        },
+        "aggregate_metrics": [
+            {
+                "dataset": "rel_hm",
+                "split": "test",
+                "model": "candidate",
+                "num_seeds": 3,
+                "full_row_c2st_mean": 0.30,
+                "full_row_c2st_std": 0.01,
+                "text_embedding_c2st_mean": float("nan"),
+                "rows_per_second_mean": 5000.0,
+            },
+            {
+                "dataset": "amazon_toy",
+                "split": "test",
+                "model": "M2_global_support",
+                "num_seeds": 1,
+                "full_row_c2st_mean": 0.58,
+            },
+            {
+                "dataset": "amazon_toy",
+                "split": "test",
+                "model": "final",
+                "num_seeds": 1,
+                "full_row_c2st_mean": 0.61,
+            },
+        ],
+        "paired_deltas": [
+            {
+                "baseline": "M2_global_support",
+                "metric": "full_row_c2st",
+                "seed": 17,
+                "candidate_minus_baseline": -0.1,
+            }
+        ],
+        "evaluator_audit": {
+            "status": "passed",
+            "fixed_evaluator_seed": 42,
+            "hash_mismatches": [],
+        },
+        "remaining_weaknesses": ["full-row discrimination remains above chance"],
+    }
+
+    summary = build_summary(decision, tmp_path / "decision.json")
+    rendered_json = json.dumps(summary, allow_nan=False)
+    rendered_markdown = render_markdown(summary)
+
+    assert "ignored_nan" not in rendered_json
+    assert "text_embedding_c2st" not in rendered_json
+    assert summary["decision"]["failed_checks"] == ["transfer"]
+    assert summary["transfer_deltas_final_minus_m2"][0][
+        "final_minus_m2"
+    ] == pytest.approx(0.03)
+    assert "DO NOT FREEZE" in rendered_markdown
+    assert "**FAIL**" in rendered_markdown
 
 
 def test_report_evaluator_comparability_allows_resolved_domains(
