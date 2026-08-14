@@ -22,6 +22,7 @@ from attribute_generation.conditional_tabdlm.posthoc_diagnostics import repeated
 from attribute_generation.conditional_tabdlm.schema import load_config  # noqa: E402
 from evaluation.paper_metrics.shape_trend import pair_trend_error  # noqa: E402
 from evaluation.paper_metrics.utils import (  # noqa: E402
+    canonicalize_categorical_series,
     ks_distance,
     total_variation,
     wasserstein_1d,
@@ -118,6 +119,11 @@ def evaluate_attribute_diagnostics(
             train[column],
             real[column],
             synthetic[column],
+            column_config=(
+                ((((evaluation_config or {}).get("table") or {}).get(
+                    "columns"
+                ) or {}).get(column) or {})
+            ),
         )
         for column in schema.categorical_targets
     }
@@ -355,11 +361,22 @@ def categorical_metrics(
     train: pd.Series,
     real: pd.Series,
     synthetic: pd.Series,
+    column_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    train_values = train.dropna().astype(str)
-    real_values = real.dropna().astype(str)
-    syn_values = synthetic.dropna().astype(str)
-    domain = sorted(set(train_values))
+    column_config = column_config or {}
+    train_values = canonicalize_categorical_series(
+        train,
+        column_config,
+    ).dropna()
+    real_values = canonicalize_categorical_series(
+        real,
+        column_config,
+    ).dropna()
+    syn_values = canonicalize_categorical_series(
+        synthetic,
+        column_config,
+    ).dropna()
+    domain = sorted(set(train_values), key=lambda value: str(value))
     invalid = ~syn_values.isin(domain)
     real_counts = real_values.value_counts()
     rare_cutoff = max(5, int(np.ceil(0.01 * max(len(real_values), 1))))
@@ -377,7 +394,10 @@ def categorical_metrics(
             syn_values,
             domain,
         ),
-        "invalid_category_rate": float(invalid.mean()) if len(syn_values) else 0.0,
+        "invalid_category_rate": (
+            float(invalid.mean()) if len(syn_values) else None
+        ),
+        "canonicalization_applied": True,
         "missingness_rate_error": float(
             abs(real.isna().mean() - synthetic.isna().mean())
         ),

@@ -432,6 +432,9 @@ def support_metadata(
                 **global_prior_cfg,
                 "enabled": bool(enable_global_prior),
             },
+            training_values=training_values_standardized,
+            support=standardized_support,
+            timestamps=timestamps,
         ),
     }
 
@@ -497,6 +500,10 @@ def resolve_implementation_mode(
 def fit_global_support_prior(
     counts: np.ndarray,
     config: dict[str, Any] | None,
+    *,
+    training_values: np.ndarray | None = None,
+    support: np.ndarray | None = None,
+    timestamps: np.ndarray | None = None,
 ) -> dict[str, Any]:
     """Fit a smoothed empirical support prior from training counts only."""
 
@@ -512,6 +519,14 @@ def fit_global_support_prior(
     if denominator <= 0:
         raise ValueError("Global support prior has zero probability mass")
     probability = smoothed / denominator
+    temporal_config = dict(raw.get("temporal_prior") or {})
+    temporal_prior = fit_temporal_support_prior(
+        training_values=training_values,
+        support=support,
+        timestamps=timestamps,
+        global_probability=probability,
+        config=temporal_config,
+    )
     return {
         "enabled": bool(raw.get("enabled", False)),
         "training_only": True,
@@ -532,7 +547,99 @@ def fit_global_support_prior(
         "residual_init_scale": float(
             raw.get("residual_init_scale", 1e-3)
         ),
+        "temporal_prior": temporal_prior,
     }
+
+
+def fit_temporal_support_prior(
+    *,
+    training_values: np.ndarray | None,
+    support: np.ndarray | None,
+    timestamps: np.ndarray | None,
+    global_probability: np.ndarray,
+    config: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Fit a generic time-bucket support prior from training rows only."""
+
+    raw = dict(config or {})
+    weight = float(raw.get("lambda_t", raw.get("weight", 0.0)))
+    enabled = bool(raw.get("enabled", False)) and weight > 0.0
+    if not 0.0 <= weight <= 1.0:
+        raise ValueError("temporal-prior lambda_t must be in [0, 1]")
+    metadata: dict[str, Any] = {
+        "enabled": enabled,
+        "training_only": True,
+        "lambda_t": weight,
+        "binning": "training_quantile",
+        "num_time_buckets_requested": int(raw.get("num_time_buckets", 8)),
+        "backoff_strength": float(raw.get("backoff_strength", 100.0)),
+        "min_bucket_rows": int(raw.get("min_bucket_rows", 20)),
+        "epsilon": float(raw.get("epsilon", 1e-8)),
+    }
+    if not enabled:
+        return metadata
+    if training_values is None or support is None or timestamps is None:
+        raise ValueError(
+            "Enabled temporal support prior requires aligned training "
+            "values, support, and timestamps"
+        )
+    values = np.asarray(training_values, dtype=float)
+    support_values = np.asarray(support, dtype=float)
+    time_values = np.asarray(timestamps, dtype=float)
+    if len(values) != len(time_values):
+        raise ValueError(
+            "Temporal support-prior values and timestamps are not aligned"
+        )
+    if not len(support_values):
+        raise ValueError("Temporal support prior requires nonempty support")
+    finite = np.isfinite(values) & np.isfinite(time_values)
+    values = values[finite]
+    time_values = time_values[finite]
+    boundaries = fit_timestamp_boundaries(
+        time_values,
+        metadata["num_time_buckets_requested"],
+    )
+    num_buckets = int(len(boundaries) + 1)
+    support_ids = nearest_support_indices_numpy(values, support_values)
+    time_ids = np.searchsorted(
+        boundaries,
+        time_values,
+        side="right",
+    ).astype(np.int64)
+    counts = grouped_support_counts(
+        time_ids,
+        support_ids,
+        num_buckets,
+        len(support_values),
+    ).astype(np.float64)
+    totals = counts.sum(axis=1)
+    backoff = max(float(metadata["backoff_strength"]), 0.0)
+    minimum = max(int(metadata["min_bucket_rows"]), 1)
+    global_probability = np.asarray(global_probability, dtype=np.float64)
+    probabilities = np.repeat(
+        global_probability.reshape(1, -1),
+        num_buckets,
+        axis=0,
+    )
+    for bucket in range(num_buckets):
+        total = float(totals[bucket])
+        if total < minimum:
+            continue
+        denominator = total + backoff
+        probabilities[bucket] = (
+            counts[bucket] + backoff * global_probability
+        ) / max(denominator, 1e-12)
+    metadata.update(
+        {
+            "num_time_buckets_resolved": num_buckets,
+            "time_boundaries_seconds": boundaries.tolist(),
+            "bucket_counts": counts.tolist(),
+            "bucket_totals": totals.tolist(),
+            "bucket_probabilities": probabilities.tolist(),
+            "sparse_bucket_backoff": "global_prior",
+        }
+    )
+    return metadata
 
 
 def equal_mass_support_bins(
@@ -927,6 +1034,42 @@ class GlobalSupportPrior(nn.Module):
         self.has_runtime_logit_bias = bool(
             torch.any(runtime_bias != 0).item()
         )
+        temporal = dict(raw.get("temporal_prior") or {})
+        self.temporal_prior_enabled = bool(
+            self.enabled and temporal.get("enabled", False)
+        )
+        self.temporal_prior_weight = float(
+            temporal.get("lambda_t", 0.0)
+        )
+        if not 0.0 <= self.temporal_prior_weight <= 1.0:
+            raise ValueError("temporal-prior lambda_t must be in [0, 1]")
+        self.temporal_epsilon = float(temporal.get("epsilon", epsilon))
+        self.register_buffer(
+            "temporal_boundaries",
+            tensor(
+                temporal.get("time_boundaries_seconds", []),
+                torch.float32,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "temporal_probability",
+            tensor(
+                temporal.get("bucket_probabilities", []),
+                torch.float32,
+            ),
+            persistent=False,
+        )
+        if self.temporal_prior_enabled:
+            expected = int(self.temporal_boundaries.numel()) + 1
+            if self.temporal_probability.ndim != 2 or tuple(
+                self.temporal_probability.shape
+            ) != (expected, int(probabilities.numel())):
+                raise ValueError(
+                    "Temporal support-prior probability shape mismatch: "
+                    f"{tuple(self.temporal_probability.shape)} != "
+                    f"{(expected, int(probabilities.numel()))}"
+                )
 
     def initialize_residual(self, layer: nn.Linear) -> None:
         if not self.enabled:
@@ -949,14 +1092,51 @@ class GlobalSupportPrior(nn.Module):
             residual = residual * scale
         return residual * self.residual_weight
 
-    def combine(self, residual_logits: torch.Tensor) -> torch.Tensor:
-        residual = self.residual_logits(residual_logits)
-        if not self.enabled:
-            return residual_logits + self.runtime_logit_bias.unsqueeze(0)
-        return (
-            residual
-            + self.alpha * self.log_probability.unsqueeze(0)
-            + self.runtime_logit_bias.unsqueeze(0)
+    def log_probabilities(
+        self,
+        timestamps: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if not self.temporal_prior_enabled:
+            return self.log_probability
+        if timestamps is None:
+            raise ValueError(
+                "Temporal support prior requires event timestamps"
+            )
+        time_ids = torch.bucketize(
+            timestamps.float(),
+            self.temporal_boundaries,
+        )
+        temporal = self.temporal_probability[time_ids]
+        global_probability = self.log_probability.exp().unsqueeze(0)
+        mixed = (
+            (1.0 - self.temporal_prior_weight) * global_probability
+            + self.temporal_prior_weight * temporal
+        )
+        return torch.log(mixed.clamp_min(self.temporal_epsilon))
+
+    def logit_bias(
+        self,
+        timestamps: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if self.enabled:
+            prior = self.alpha * self.log_probabilities(timestamps)
+        else:
+            prior = torch.zeros_like(self.runtime_logit_bias)
+        return prior + self.runtime_logit_bias
+
+    def combine(
+        self,
+        residual_logits: torch.Tensor,
+        timestamps: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        residual = (
+            self.residual_logits(residual_logits)
+            if self.enabled
+            else residual_logits
+        )
+        bias = self.logit_bias(timestamps)
+        return residual + (
+            bias.unsqueeze(0) if bias.ndim == 1 else bias
         )
 
     def set_runtime_logit_bias(
@@ -1049,7 +1229,7 @@ class DiscreteSupportNumericalHead(nn.Module):
             neural_logits
         )
         prior_logits = None
-        logits = self.global_prior.combine(neural_logits)
+        logits = self.global_prior.combine(neural_logits, timestamps)
         if self.prior.enabled:
             prior_logits = self.prior(destination_ids, timestamps)
             logits = (
@@ -1062,7 +1242,7 @@ class DiscreteSupportNumericalHead(nn.Module):
             "neural_logits": neural_logits,
             "residual_logits": residual_logits,
             "global_prior_logits": (
-                self.global_prior.log_probability
+                self.global_prior.logit_bias(timestamps)
                 if self.global_prior.enabled
                 else None
             ),
@@ -1203,29 +1383,12 @@ class HierarchicalSupportNumericalHead(nn.Module):
             self.global_prior.enabled
             or self.global_prior.has_runtime_logit_bias
         ):
-            global_prior_logits = (
-                (
-                    self.global_prior.alpha
-                    * self.global_prior.log_probability
-                    if self.global_prior.enabled
-                    else torch.zeros_like(
-                        self.global_prior.runtime_logit_bias
-                    )
-                )
-                + self.global_prior.runtime_logit_bias
+            global_prior_logits = self.global_prior.logit_bias(
+                timestamps
             )
-            coarse_global_prior = torch.stack(
-                [
-                    torch.logsumexp(
-                        global_prior_logits[start:end],
-                        dim=0,
-                    )
-                    for start, end in zip(
-                        self.offsets[:-1].tolist(),
-                        self.offsets[1:].tolist(),
-                    )
-                ],
-                dim=0,
+            coarse_global_prior = aggregate_support_logit_bins(
+                global_prior_logits,
+                self.offsets,
             )
             coarse_logits = (
                 (
@@ -1233,7 +1396,11 @@ class HierarchicalSupportNumericalHead(nn.Module):
                     if self.global_prior.enabled
                     else coarse_residual
                 )
-                + coarse_global_prior.unsqueeze(0)
+                + (
+                    coarse_global_prior.unsqueeze(0)
+                    if coarse_global_prior.ndim == 1
+                    else coarse_global_prior
+                )
             )
         if self.prior.enabled:
             prior_logits = self.prior(destination_ids, timestamps)
@@ -1289,9 +1456,15 @@ class HierarchicalSupportNumericalHead(nn.Module):
                 if self.global_prior.enabled:
                     start = int(self.offsets[bin_id].item())
                     end = int(self.offsets[bin_id + 1].item())
+                    support_prior = support_logit_slice(
+                        global_prior_logits,
+                        start,
+                        end,
+                        selected,
+                    )
                     local = (
                         self.global_prior.residual_logits(local)
-                        + global_prior_logits[start:end].unsqueeze(0)
+                        + support_prior
                     )
                 if prior_logits is not None:
                     start = int(self.offsets[bin_id].item())
@@ -1355,6 +1528,7 @@ class HierarchicalSupportNumericalHead(nn.Module):
         )
         hidden = output["hidden"]
         prior_logits = output.get("prior_logits")
+        global_prior_logits = output.get("global_prior_logits")
         for bin_id, layer in enumerate(self.fine):
             selected = coarse == bin_id
             if not selected.any():
@@ -1366,13 +1540,11 @@ class HierarchicalSupportNumericalHead(nn.Module):
             ):
                 start = int(self.offsets[bin_id].item())
                 end = int(self.offsets[bin_id + 1].item())
-                global_support_logits = (
-                    self.global_prior.alpha
-                    * self.global_prior.log_probability[start:end]
-                    if self.global_prior.enabled
-                    else torch.zeros_like(
-                        self.global_prior.runtime_logit_bias[start:end]
-                    )
+                support_prior = support_logit_slice(
+                    global_prior_logits,
+                    start,
+                    end,
+                    selected,
                 )
                 local_logits = (
                     (
@@ -1380,10 +1552,7 @@ class HierarchicalSupportNumericalHead(nn.Module):
                         if self.global_prior.enabled
                         else local_logits
                     )
-                    + (
-                        global_support_logits
-                        + self.global_prior.runtime_logit_bias[start:end]
-                    ).unsqueeze(0)
+                    + support_prior
                 )
             if prior_logits is not None:
                 start = int(self.offsets[bin_id].item())
@@ -1634,6 +1803,44 @@ def grouped_support_counts(
         1.0,
     )
     return output
+
+
+def aggregate_support_logit_bins(
+    logits: torch.Tensor,
+    offsets: torch.Tensor,
+) -> torch.Tensor:
+    """Aggregate support log-probabilities into hierarchical bins."""
+
+    if logits.ndim not in {1, 2}:
+        raise ValueError(
+            f"Support prior logits must be rank 1 or 2, got {logits.ndim}"
+        )
+    values = [
+        torch.logsumexp(
+            logits[..., int(start) : int(end)],
+            dim=-1,
+        )
+        for start, end in zip(
+            offsets[:-1].tolist(),
+            offsets[1:].tolist(),
+        )
+    ]
+    return torch.stack(values, dim=-1)
+
+
+def support_logit_slice(
+    logits: torch.Tensor,
+    start: int,
+    end: int,
+    selected: torch.Tensor,
+) -> torch.Tensor:
+    if logits.ndim == 1:
+        return logits[start:end].unsqueeze(0)
+    if logits.ndim == 2:
+        return logits[selected, start:end]
+    raise ValueError(
+        f"Support prior logits must be rank 1 or 2, got {logits.ndim}"
+    )
 
 
 def blend_dense_counts(

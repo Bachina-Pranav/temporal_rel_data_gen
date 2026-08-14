@@ -377,7 +377,11 @@ def support_logit_diagnostics(
     prior = prior.float() if prior is not None else None
     ratio = None
     if residual is not None and prior is not None:
-        prior_norm = prior.norm().clamp_min(eps)
+        prior_norm = (
+            prior.norm().clamp_min(eps)
+            if prior.ndim == 1
+            else prior.norm(dim=1).clamp_min(eps)
+        )
         ratio = float(
             (residual.norm(dim=1) / prior_norm).mean().cpu()
         )
@@ -452,11 +456,16 @@ def hierarchical_dense_probabilities(
         end = int(head.offsets[bin_id + 1].item())
         local_logits = layer(output["hidden"]).float()
         if global_prior is not None:
+            local_prior = (
+                global_prior[start:end].unsqueeze(0)
+                if global_prior.ndim == 1
+                else global_prior[:, start:end]
+            )
             local_logits = (
                 head.global_prior.residual_logits(local_logits)
                 if head.global_prior.enabled
                 else local_logits
-            ) + global_prior[start:end].unsqueeze(0)
+            ) + local_prior
         if prior is not None:
             local_logits = (
                 local_logits

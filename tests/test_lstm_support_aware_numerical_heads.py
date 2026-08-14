@@ -442,6 +442,69 @@ def test_global_prior_runtime_bias_is_deterministic_and_normalized():
     assert torch.allclose(first.sum(dim=1), torch.ones(4))
 
 
+def test_temporal_support_prior_uses_training_quantile_buckets():
+    values = torch.tensor([0.0, 0.0, 0.0, 1.0, 1.0, 1.0]).numpy()
+    timestamps = torch.tensor([1.0, 2.0, 3.0, 100.0, 101.0, 102.0]).numpy()
+    metadata = fit_global_support_prior(
+        torch.tensor([3.0, 3.0]).numpy(),
+        {
+            "enabled": True,
+            "smoothing": 0.0,
+            "residual_weight": 0.0,
+            "temporal_prior": {
+                "enabled": True,
+                "lambda_t": 1.0,
+                "num_time_buckets": 2,
+                "backoff_strength": 0.0,
+                "min_bucket_rows": 1,
+            },
+        },
+        training_values=values,
+        support=torch.tensor([0.0, 1.0]).numpy(),
+        timestamps=timestamps,
+    )
+    prior = GlobalSupportPrior(metadata)
+    logits = prior.combine(
+        torch.randn(2, 2),
+        torch.tensor([2.0, 101.0]),
+    )
+    probability = torch.softmax(logits, dim=-1)
+
+    assert metadata["temporal_prior"]["training_only"] is True
+    assert probability[0, 0] > 0.99
+    assert probability[1, 1] > 0.99
+
+
+def test_temporal_support_prior_sparse_bucket_backs_off_to_global():
+    metadata = fit_global_support_prior(
+        torch.tensor([3.0, 1.0]).numpy(),
+        {
+            "enabled": True,
+            "smoothing": 0.0,
+            "residual_weight": 0.0,
+            "temporal_prior": {
+                "enabled": True,
+                "lambda_t": 0.25,
+                "num_time_buckets": 2,
+                "backoff_strength": 0.0,
+                "min_bucket_rows": 10,
+            },
+        },
+        training_values=torch.tensor([0.0, 0.0, 0.0, 1.0]).numpy(),
+        support=torch.tensor([0.0, 1.0]).numpy(),
+        timestamps=torch.tensor([1.0, 2.0, 100.0, 101.0]).numpy(),
+    )
+    temporal = torch.tensor(
+        metadata["temporal_prior"]["bucket_probabilities"]
+    )
+    global_probability = torch.tensor(metadata["probabilities"])
+
+    assert torch.allclose(
+        temporal,
+        global_probability.unsqueeze(0).expand_as(temporal),
+    )
+
+
 def test_hierarchical_support_applies_runtime_bias_without_training_prior():
     frame, config, numerical_metadata = fixture(
         "hierarchical_support"

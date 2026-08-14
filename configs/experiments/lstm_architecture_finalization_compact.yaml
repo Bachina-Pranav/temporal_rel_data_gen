@@ -1,0 +1,87 @@
+experiment_name: lstm_architecture_finalization_compact
+output_root: outputs/architecture_finalization_compact
+previous_root: outputs/architecture_finalization
+seeds: [42]
+evaluator_seed: 42
+maximum_new_training_runs: 3
+
+selection:
+  minimum_rows_per_second: 1000.0
+  trend_minimum_improvement: 0.01
+  full_c2st_regression_tolerance: 0.02
+  numerical_c2st_regression_tolerance: 0.02
+  categorical_c2st_tie_tolerance: 0.02
+  categorical_tv_tie_tolerance: 0.01
+  shape_tie_tolerance: 0.01
+  trend_tie_tolerance: 0.01
+  text_c2st_tie_tolerance: 0.02
+
+support_head:
+  mode: support_prior
+  direct_support_max_values: 8192
+  hierarchical_num_bins: 64
+  class_frequency_weighting: none
+  label_smoothing: 0.0
+  ordinal_regularization_weight: 0.0
+  global_calibration_weight: 0.0
+  conditioning: {explicit_destination: false}
+  prior: {enabled: false}
+  global_prior:
+    enabled: true
+    alpha: 1.0
+    smoothing: 0.0
+    residual_weight: 0.25
+    residual_temperature: 1.0
+    residual_norm_clip: 10.0
+    residual_init_scale: 0.001
+    temporal_prior:
+      enabled: false
+      lambda_t: 0.0
+      num_time_buckets: 8
+      backoff_strength: 100.0
+      min_bucket_rows: 20
+      epsilon: 1.0e-8
+  type_inference:
+    low_cardinality_max_values: 64
+    low_cardinality_max_unique_ratio: 0.05
+    direct_support_max_values: 8192
+    hierarchical_support_max_values: 200000
+    repeated_max_unique_ratio: 0.25
+    repeated_min_observation_mass: 0.50
+    holdout_min_support_overlap: 0.75
+    precision_min_dominant_mass: 0.70
+    spacing_max_coefficient_of_variation: 2.0
+    top_values_min_observation_mass: 0.10
+    minimum_structured_signals: 3
+
+temporal_lambdas: [0.10, 0.25]
+
+rel_hm:
+  base_config: configs/attribute_generation/lstm_hm_10k_customers.yaml
+  evaluation_config: configs/evaluation/single_event_table_paper_metrics_hm_10k_customers.yaml
+  pretokenized_dir: data/processed/interaction_benchmarks/hm_10k_customers/pretokenized_lstm
+  neighbor_cache_dir: data/processed/interaction_benchmarks/hm_10k_customers/neighbor_cache
+  reused_original_root: outputs/architecture_finalization/rel_hm/validation/M2P_R1_weak_residual
+  reused_m2_validation_root: outputs/architecture_finalization/rel_hm/validation/M2_global_support
+  reused_categorical_prior_validation_root: outputs/architecture_finalization/rel_hm/categorical/M2P_R1_weak_residual__cat_prior_1
+  reused_m0_test_root: outputs/architecture_finalization/rel_hm/test/M0_original_lstm_v53
+  reused_m2_test_root: outputs/architecture_finalization/rel_hm/test/M2_global_support
+  reused_categorical_prior_root: outputs/architecture_finalization/rel_hm/test/M2P_R1_weak_residual__cat_prior_1
+
+transfer:
+  movielens_100k:
+    base_config: configs/attribute_generation/lstm_movielens_100k.yaml
+    evaluation_config: configs/evaluation/single_event_table_paper_metrics_movielens_100k.yaml
+    pretokenized_dir: data/processed/lstm_architecture_finalization/movielens_100k/pretokenized_lstm
+    neighbor_cache_dir: data/processed/lstm_architecture_finalization/movielens_100k/neighbor_cache
+    sampling_policy: fast
+    reused_m2_root: outputs/architecture_finalization/transfer/movielens_100k/M2_global_support
+    reused_current_final_root: outputs/architecture_finalization/transfer/movielens_100k/final
+  amazon_toy:
+    base_config: configs/attribute_generation/conditional_tabdlm_amazon_toy_exp5_1_lstm_privacy_alignment.yaml
+    evaluation_config: configs/evaluation/single_event_table_paper_metrics_amazon_toy.yaml
+    pretokenized_dir: data/processed/lstm_architecture_finalization/amazon_toy/pretokenized_lstm
+    neighbor_cache_dir: data/processed/lstm_architecture_finalization/amazon_toy/neighbor_cache
+    sampling_policy: v53-length-preserving
+    reused_m2_root: outputs/architecture_finalization/transfer/amazon_toy/M2_global_support
+    reused_current_final_root: outputs/architecture_finalization/transfer/amazon_toy/final
