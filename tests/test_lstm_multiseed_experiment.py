@@ -24,6 +24,7 @@ from scripts.run_lstm_multiseed_experiment import (  # noqa: E402
     resolve_evaluation_config,
     resolve_evaluation_scope,
     resolve_seed_config,
+    validate_sampled_table,
 )
 
 
@@ -276,3 +277,125 @@ def test_existing_run_reuse_ignores_only_fitted_head_metadata(
         changed,
         evaluation,
     )
+
+
+def test_existing_run_reuse_ignores_training_runtime_metadata(
+    tmp_path: Path,
+):
+    config_path = tmp_path / "config_resolved.yaml"
+    evaluation_path = tmp_path / "evaluation_config_resolved.yaml"
+    requested = {
+        "training": {"seed": 42},
+        "paths": {"output_dir": "run"},
+    }
+    existing = {
+        **requested,
+        "_numerical_metadata": {"price": {"mean": 1.0}},
+        "config_path": "run/config_resolved.yaml",
+        "numerical_columns": {"price": {"selected_head": "continuous"}},
+        "schema_resolved": {"target_columns": {"numerical": ["price"]}},
+    }
+    existing["training"] = {
+        **requested["training"],
+        "neighbor_cache_dir": "cache/neighbors",
+        "pretokenized_dir": "cache/tokens",
+    }
+    config_path.write_text(yaml.safe_dump(existing), encoding="utf-8")
+    evaluation = {"evaluation": {"random_seed": 42}}
+    evaluation_path.write_text(yaml.safe_dump(evaluation), encoding="utf-8")
+
+    assert existing_run_request_is_compatible(
+        config_path,
+        evaluation_path,
+        requested,
+        evaluation,
+    )
+
+
+def test_sample_validation_canonicalizes_numeric_categories(tmp_path: Path):
+    spine = tmp_path / "spine.csv"
+    train = tmp_path / "train.csv"
+    synthetic = tmp_path / "synthetic.csv"
+    pd.DataFrame(
+        {
+            "customer_id": [1, 2],
+            "product_id": [10, 20],
+            "review_time": ["2020-01-01", "2020-01-02"],
+        }
+    ).to_csv(spine, index=False)
+    pd.DataFrame(
+        {
+            "customer_id": [1, 2],
+            "product_id": [10, 20],
+            "review_time": ["2020-01-01", "2020-01-02"],
+            "rating": [1.0, 5.0],
+        }
+    ).to_csv(train, index=False)
+    pd.DataFrame(
+        {
+            "customer_id": [1, 2],
+            "product_id": [10, 20],
+            "review_time": ["2020-01-01", "2020-01-02"],
+            "rating": [1, "5"],
+        }
+    ).to_csv(synthetic, index=False)
+    schema = SimpleNamespace(
+        condition_columns=("customer_id", "product_id", "review_time"),
+        target_columns=("rating",),
+        foreign_key_columns=("customer_id", "product_id"),
+        datetime_columns=("review_time",),
+        categorical_targets=("rating",),
+        numerical_targets=(),
+    )
+
+    result = validate_sampled_table(
+        spine,
+        synthetic,
+        train,
+        schema,
+        num_rows=None,
+        categorical_configs={
+            "rating": {
+                "type": "categorical",
+                "dtype": "int",
+                "valid_values": [1, 2, 3, 4, 5],
+            }
+        },
+    )
+
+    assert result["valid"] is True
+    assert result["categorical_targets"]["rating"]["invalid_count"] == 0
+
+
+def test_sample_validation_rejects_category_outside_training_domain(
+    tmp_path: Path,
+):
+    spine = tmp_path / "spine.csv"
+    train = tmp_path / "train.csv"
+    synthetic = tmp_path / "synthetic.csv"
+    pd.DataFrame({"id": [1], "rating": [1.0]}).to_csv(train, index=False)
+    pd.DataFrame({"id": [1]}).to_csv(spine, index=False)
+    pd.DataFrame({"id": [1], "rating": [7.0]}).to_csv(
+        synthetic,
+        index=False,
+    )
+    schema = SimpleNamespace(
+        condition_columns=("id",),
+        target_columns=("rating",),
+        foreign_key_columns=("id",),
+        datetime_columns=(),
+        categorical_targets=("rating",),
+        numerical_targets=(),
+    )
+
+    result = validate_sampled_table(
+        spine,
+        synthetic,
+        train,
+        schema,
+        num_rows=None,
+        categorical_configs={"rating": {"dtype": "int"}},
+    )
+
+    assert result["valid"] is False
+    assert result["categorical_targets"]["rating"]["invalid_count"] == 1

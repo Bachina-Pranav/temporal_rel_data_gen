@@ -29,6 +29,9 @@ from attribute_generation.conditional_tabdlm.schema import (  # noqa: E402
     ConditionalTABDLMSchema,
     resolve_auto_review_text_config,
 )
+from evaluation.paper_metrics.utils import (  # noqa: E402
+    canonicalize_categorical_series,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -442,16 +445,29 @@ def run_seed(
             args,
         )
     if not args.dry_run:
-        if sampling_reused and sampling_validation.is_file():
+        validation = (
+            load_json(sampling_validation)
+            if sampling_reused and sampling_validation.is_file()
+            else None
+        )
+        if validation is not None and validation.get("valid"):
             print(f"[seed {seed}] reusing sampling validation", flush=True)
-            validation = load_json(sampling_validation)
         else:
+            if validation is not None:
+                print(
+                    f"[seed {seed}] rechecking previously failed sampling "
+                    "validation with current canonicalization",
+                    flush=True,
+                )
             validation = validate_sampled_table(
                 Path(evaluation_scope["spine"]),
                 synthetic,
                 shared / "spines" / "train_real.csv",
                 ConditionalTABDLMSchema.from_config_dict(resolved),
                 num_rows=int(args.smoke_rows) if smoke else None,
+                categorical_configs=(
+                    ((eval_resolved.get("table") or {}).get("columns") or {})
+                ),
             )
             write_json(validation, sampling_validation)
         if not validation["valid"]:
@@ -693,6 +709,7 @@ def validate_sampled_table(
     train_path: Path,
     schema: ConditionalTABDLMSchema,
     num_rows: int | None,
+    categorical_configs: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     spine = pd.read_csv(spine_path, low_memory=False)
     if num_rows is not None:
@@ -737,11 +754,21 @@ def validate_sampled_table(
             errors.append(f"Timestamp column changed or was reordered: {column}")
     categorical = {}
     for column in schema.categorical_targets:
-        domain = set(train[column].dropna().astype(str))
-        invalid = ~synthetic[column].astype(str).isin(domain)
+        column_config = (categorical_configs or {}).get(column) or {}
+        train_values = canonicalize_categorical_series(
+            train[column],
+            column_config,
+        )
+        synthetic_values = canonicalize_categorical_series(
+            synthetic[column],
+            column_config,
+        )
+        domain = set(train_values.dropna())
+        invalid = synthetic_values.isna() | ~synthetic_values.isin(domain)
         categorical[column] = {
-            "train_domain": sorted(domain),
+            "train_domain": sorted(domain, key=lambda value: str(value)),
             "invalid_count": int(invalid.sum()),
+            "canonicalization_applied": True,
         }
         if invalid.any():
             errors.append(
@@ -1323,6 +1350,17 @@ def comparable_model_config(raw: dict[str, Any]) -> dict[str, Any]:
     comparable = copy.deepcopy(raw)
     comparable.pop("_numerical_head_metadata", None)
     comparable.pop("_categorical_head_metadata", None)
+    for key in (
+        "_numerical_metadata",
+        "config_path",
+        "numerical_columns",
+        "schema_resolved",
+    ):
+        comparable.pop(key, None)
+    training = comparable.get("training")
+    if isinstance(training, dict):
+        training.pop("neighbor_cache_dir", None)
+        training.pop("pretokenized_dir", None)
     return comparable
 
 
