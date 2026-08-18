@@ -15,14 +15,14 @@ MAIN_ROWS = [
     ("Attribute/text fidelity", "Shape Error", "shape_error", "down"),
     ("Attribute/text fidelity", "Trend Error", "trend_error", "down"),
     ("Attribute/text fidelity", "Text Embedding C2ST Error", "text_embedding_c2st_error", "down"),
-    ("Attribute/text fidelity", "Single-Table C2ST Error", "single_table_c2st_error", "down"),
+    ("Structured attribute fidelity", "Structured C2ST Error", "structured_c2st_error", "down"),
 ]
 
 
 def write_markdown_report(metrics: dict[str, Any], output_path: str | Path) -> None:
     summary = metrics.get("paper_metrics_summary", {})
     dataset = metrics.get("dataset", {})
-    top_features = (metrics.get("single_table_c2st") or {}).get("top_features") or []
+    top_features = (metrics.get("structured_c2st") or {}).get("top_features") or []
     lines = [
         "# Main Dashboard",
         "",
@@ -46,7 +46,7 @@ def write_markdown_report(metrics: dict[str, Any], output_path: str | Path) -> N
     else:
         lines.append("- No immediate red flags from the main dashboard thresholds.")
     if top_features:
-        lines.extend(["", "Top Single-Table C2ST features:", ""])
+        lines.extend(["", "Top Structured C2ST features:", ""])
         lines.append("| Rank | Classifier | Feature | Importance |")
         lines.append("|---:|---|---|---:|")
         for idx, item in enumerate(top_features[:10], start=1):
@@ -90,7 +90,7 @@ def verdict(key: str, value: Any) -> str:
         return "ok" if value == 0 else "inspect"
     if key == "fk_cardinality_similarity":
         return "ok" if value >= 0.9 else "inspect"
-    if key in {"temporal_event_distance", "shape_error", "trend_error", "text_embedding_c2st_error", "single_table_c2st_error"}:
+    if key in {"temporal_event_distance", "shape_error", "trend_error", "text_embedding_c2st_error", "structured_c2st_error"}:
         return "ok" if value <= 0.1 else "inspect"
     return "computed"
 
@@ -109,8 +109,8 @@ def inspection_notes(summary: dict[str, Any]) -> list[str]:
         notes.append("Trend Error is high; inspect `per_pair_trend_metrics.csv`.")
     if gt(summary.get("text_embedding_c2st_error"), 0.1):
         notes.append("Text Embedding C2ST Error is high; inspect `text_embedding_c2st_report.json`.")
-    if gt(summary.get("single_table_c2st_error"), 0.1):
-        notes.append("Single-Table C2ST Error is high; inspect `c2st_feature_importance.csv`.")
+    if gt(summary.get("structured_c2st_error"), 0.1):
+        notes.append("Structured C2ST Error is high; inspect `structured_c2st_feature_importance.csv`.")
     return notes
 
 

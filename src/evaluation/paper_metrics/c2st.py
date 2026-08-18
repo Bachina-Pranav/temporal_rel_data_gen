@@ -11,7 +11,6 @@ import pandas as pd
 from .utils import (
     canonicalize_categorical_series,
     char_lengths,
-    datetime_normalized,
     datetime_series,
     numeric_series,
     text_hash_embedding,
@@ -19,13 +18,97 @@ from .utils import (
 )
 
 
-def single_table_c2st_metrics(real: pd.DataFrame, synthetic: pd.DataFrame, config: dict[str, Any]) -> tuple[dict[str, Any], pd.DataFrame]:
+def structured_c2st_metrics(
+    real: pd.DataFrame,
+    synthetic: pd.DataFrame,
+    config: dict[str, Any],
+) -> tuple[dict[str, Any], pd.DataFrame]:
+    """C2ST over generated structured attributes only.
+
+    Text, text-derived lengths, identifiers, foreign keys, and timestamps are
+    intentionally excluded. The resolved policy is returned with the metric
+    so every evaluation can be audited independently of dataset naming.
+    """
+
+    table_cfg = config.get("table") or {}
+    manifest = structured_c2st_feature_manifest(table_cfg)
+    if not manifest["included_columns"]:
+        return {
+            "status": "skipped",
+            "reason": "no_generated_structured_attributes",
+            "error": None,
+            "metric_name": "structured_c2st_error",
+            "feature_manifest": manifest,
+        }, pd.DataFrame()
+    structured_table = {
+        "columns": {
+            column: (table_cfg.get("columns") or {})[column]
+            for column in manifest["included_columns"]
+        }
+    }
+    metrics, importance = _c2st_metrics(
+        real,
+        synthetic,
+        config,
+        structured_table,
+    )
+    metrics.update(
+        {
+            "metric_name": "structured_c2st_error",
+            "feature_policy": (
+                "generated numerical + categorical attributes only"
+            ),
+            "feature_manifest": manifest,
+        }
+    )
+    return metrics, importance
+
+
+def single_table_c2st_metrics(
+    real: pd.DataFrame,
+    synthetic: pd.DataFrame,
+    config: dict[str, Any],
+) -> tuple[dict[str, Any], pd.DataFrame]:
+    """Backward-compatible alias for the structured-only primary C2ST."""
+
+    return structured_c2st_metrics(real, synthetic, config)
+
+
+def legacy_full_row_c2st_metrics(
+    real: pd.DataFrame,
+    synthetic: pd.DataFrame,
+    config: dict[str, Any],
+) -> tuple[dict[str, Any], pd.DataFrame]:
+    """Reproduce the historical all-schema-column C2ST for audit only."""
+
+    metrics, importance = _c2st_metrics(
+        real,
+        synthetic,
+        config,
+        config.get("table") or {},
+    )
+    metrics.update(
+        {
+            "metric_name": "legacy_full_row_c2st_error",
+            "feature_policy": (
+                "historical policy: all non-primary-key schema columns"
+            ),
+        }
+    )
+    return metrics, importance
+
+
+def _c2st_metrics(
+    real: pd.DataFrame,
+    synthetic: pd.DataFrame,
+    config: dict[str, Any],
+    table_cfg: dict[str, Any],
+) -> tuple[dict[str, Any], pd.DataFrame]:
     c2st_cfg = ((config.get("evaluation") or {}).get("c2st") or {})
     if not bool(c2st_cfg.get("enabled", True)):
         return {"status": "skipped", "reason": "disabled"}, pd.DataFrame()
     max_rows = c2st_cfg.get("max_rows") or c2st_cfg.get("max_rows_for_c2st") or (config.get("evaluation") or {}).get("max_rows_for_c2st", 100000)
     seed = int((config.get("evaluation") or {}).get("random_seed", 42))
-    table_cfg = config.get("table") or {}
     classifiers = c2st_cfg.get("classifiers") or ["logistic_regression"]
     x, y, feature_names, balanced_n = featurize_real_synthetic(real, synthetic, table_cfg, max_rows=max_rows, seed=seed)
     results = run_binary_classifiers(
@@ -60,6 +143,114 @@ def single_table_c2st_metrics(real: pd.DataFrame, synthetic: pd.DataFrame, confi
         "feature_names": feature_names,
         "top_features": top_features,
     }, importance
+
+
+def structured_c2st_feature_manifest(
+    table_cfg: dict[str, Any],
+) -> dict[str, Any]:
+    """Resolve the structured C2ST columns from schema roles and types."""
+
+    primary_key = table_cfg.get("primary_key")
+    primary_keys = (
+        {str(value) for value in primary_key}
+        if isinstance(primary_key, (list, tuple, set))
+        else ({str(primary_key)} if primary_key else set())
+    )
+    included: list[str] = []
+    numerical: list[str] = []
+    categorical: list[str] = []
+    excluded: list[dict[str, str]] = []
+    columns = table_cfg.get("columns", {}) or {}
+    for column, raw_cfg in columns.items():
+        cfg = dict(raw_cfg or {})
+        col_type = str(cfg.get("type", "categorical")).strip().lower()
+        semantic = str(cfg.get("semantic_type", "")).strip().lower()
+        role = str(cfg.get("role", "")).strip().lower()
+        reason = structured_exclusion_reason(
+            str(column), cfg, col_type, semantic, role, primary_keys
+        )
+        if reason is not None:
+            excluded.append({"column": str(column), "reason": reason})
+            continue
+        included.append(str(column))
+        if col_type in {"numerical", "numeric", "number"}:
+            numerical.append(str(column))
+        else:
+            categorical.append(str(column))
+    return {
+        "metric_name": "structured_c2st_error",
+        "policy": "generated numerical + categorical attributes only",
+        "included_columns": included,
+        "included_numerical_columns": numerical,
+        "included_categorical_columns": categorical,
+        "excluded_columns": excluded,
+        "explicitly_excludes": [
+            "text and text embeddings",
+            "text/token/character/sequence lengths",
+            "primary keys and event IDs",
+            "source/destination foreign keys and arbitrary identifiers",
+            "timestamps and fixed event-spine features",
+        ],
+    }
+
+
+def structured_exclusion_reason(
+    column: str,
+    cfg: dict[str, Any],
+    col_type: str,
+    semantic: str,
+    role: str,
+    primary_keys: set[str],
+) -> str | None:
+    if column in primary_keys or col_type in {"primary_key", "id"}:
+        return "primary key / event identifier"
+    if col_type in {"foreign_key", "foreignkey"}:
+        return "fixed source/destination foreign key"
+    if col_type in {"datetime", "timestamp", "date"}:
+        return "fixed event-spine timestamp"
+    if col_type in {"text", "string_text"}:
+        return "free-form text evaluated separately"
+    if role in {
+        "condition",
+        "conditioning",
+        "fixed",
+        "source_foreign_key",
+        "destination_foreign_key",
+        "timestamp",
+        "primary_key",
+    }:
+        return f"fixed/conditioning schema role: {role}"
+    if bool(cfg.get("text_derived", False)) or "text_length" in semantic:
+        return "text-derived feature"
+    lowered = column.lower()
+    length_markers = (
+        "text_length",
+        "review_length",
+        "summary_length",
+        "token_length",
+        "word_count",
+        "char_length",
+        "character_count",
+        "sequence_length",
+        "padding_length",
+        "eos_position",
+        "length_bucket",
+    )
+    if any(marker in lowered for marker in length_markers):
+        return "text-derived length feature"
+    if col_type not in {
+        "numerical",
+        "numeric",
+        "number",
+        "categorical",
+        "ordinal",
+        "boolean",
+        "bool",
+    }:
+        return f"unsupported/non-generated structured type: {col_type}"
+    if cfg.get("generated") is False:
+        return "schema marks field as fixed/non-generated"
+    return None
 
 
 def featurize_real_synthetic(
@@ -104,7 +295,12 @@ def featurize_frame(frame: pd.DataFrame, table_cfg: dict[str, Any]) -> tuple[np.
             names.extend([column, f"{column}_missing"])
         elif col_type == "datetime":
             parsed = datetime_series(frame[column])
-            seconds = parsed.array.asi8.astype(float) / 1e9
+            seconds = (
+                parsed.to_numpy(dtype="datetime64[ns]")
+                .astype("int64")
+                .astype(float)
+                / 1e9
+            )
             seconds = np.where(parsed.isna(), 0.0, seconds)
             month = parsed.dt.month.fillna(0).to_numpy(dtype=float)
             day = parsed.dt.dayofweek.fillna(0).to_numpy(dtype=float)

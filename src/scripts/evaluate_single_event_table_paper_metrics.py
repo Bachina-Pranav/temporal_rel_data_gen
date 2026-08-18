@@ -20,7 +20,7 @@ if not __package__:
 
 from attribute_generation.conditional_tabdlm.evaluate import evaluate_from_config as legacy_evaluate_from_config  # noqa: E402
 from attribute_generation.conditional_tabdlm.schema import load_config as load_legacy_config  # noqa: E402
-from evaluation.paper_metrics.c2st import single_table_c2st_metrics  # noqa: E402
+from evaluation.paper_metrics.c2st import structured_c2st_metrics  # noqa: E402
 from evaluation.paper_metrics.fk_cardinality import fk_cardinality_metrics  # noqa: E402
 from evaluation.paper_metrics.reporting import write_markdown_report, write_table  # noqa: E402
 from evaluation.paper_metrics.schema_validation import constraint_violation_metrics  # noqa: E402
@@ -98,15 +98,28 @@ def evaluate_paper_metrics(config: dict[str, Any], output_dir: Path) -> dict[str
     shape, column_df = shape_metrics(real, synthetic, table_cfg, config)
     trend, pair_df = trend_metrics(real, synthetic, table_cfg, config)
     text_embedding = text_embedding_c2st_metrics(real, synthetic, config, output_dir)
-    c2st, feature_importance = single_table_c2st_metrics(real, synthetic, config)
+    c2st, feature_importance = structured_c2st_metrics(
+        real, synthetic, config
+    )
     categorical_diagnostics = categorical_diagnostics_for_table(real, synthetic, table_cfg)
 
     write_table(column_df, output_dir / "per_column_metrics.csv")
     write_table(pair_df, output_dir / "per_pair_trend_metrics.csv")
     write_table(fk_df, output_dir / "per_fk_metrics.csv")
     write_table(temporal_df, output_dir / "per_temporal_metrics.csv")
+    write_table(
+        feature_importance,
+        output_dir / "structured_c2st_feature_importance.csv",
+    )
+    # Keep historical filenames as aliases so old result collectors continue
+    # to work while the metric itself follows the corrected feature policy.
     write_table(feature_importance, output_dir / "c2st_feature_importance.csv")
+    write_json(c2st, output_dir / "structured_c2st_report.json")
     write_json(c2st, output_dir / "c2st_report.json")
+    write_json(
+        c2st.get("feature_manifest") or {},
+        output_dir / "structured_c2st_feature_manifest.json",
+    )
     write_json(text_embedding, output_dir / "text_embedding_c2st_report.json")
     write_json({"warnings": evaluator_warnings}, output_dir / "evaluator_warnings.json")
 
@@ -117,6 +130,9 @@ def evaluate_paper_metrics(config: dict[str, Any], output_dir: Path) -> dict[str
         "shape_error": shape.get("macro_non_id_shape_error", shape.get("macro_attribute_shape_error", shape.get("macro_shape_error"))),
         "trend_error": trend.get("macro_headline_trend_error", trend.get("macro_attribute_trend_error", trend.get("macro_trend_error"))),
         "text_embedding_c2st_error": text_embedding.get("macro_error"),
+        "structured_c2st_error": c2st.get("error"),
+        # Deprecated compatibility alias. This is now the structured-only
+        # score and must not be described as a text-inclusive row C2ST.
         "single_table_c2st_error": c2st.get("error"),
     }
     skipped = {
@@ -131,6 +147,7 @@ def evaluate_paper_metrics(config: dict[str, Any], output_dir: Path) -> dict[str
     }
     return {
         "paper_metrics_version": config.get("paper_metrics_version", PAPER_METRICS_VERSION),
+        "c2st_feature_policy_version": "structured_generated_attributes_v1",
         "dataset": {
             "dataset_name": config.get("dataset_name"),
             "evaluation_level": config.get("evaluation_level", "single_event_table"),
@@ -151,6 +168,7 @@ def evaluate_paper_metrics(config: dict[str, Any], output_dir: Path) -> dict[str
         "shape": shape,
         "trend": trend,
         "text_embedding_c2st": text_embedding,
+        "structured_c2st": c2st,
         "single_table_c2st": c2st,
         "skipped_metrics": skipped,
     }
@@ -190,7 +208,7 @@ def internal_overall_score(summary: dict[str, Any]) -> dict[str, Any]:
         "shape_error": lambda x: 1.0 - x,
         "trend_error": lambda x: 1.0 - x,
         "text_embedding_c2st_error": lambda x: 1.0 - x,
-        "single_table_c2st_error": lambda x: 1.0 - x,
+        "structured_c2st_error": lambda x: 1.0 - x,
     }
     for key, fn in mappings.items():
         value = summary.get(key)

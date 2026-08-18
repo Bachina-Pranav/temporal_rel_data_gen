@@ -1,0 +1,30 @@
+experiment_name: final_evaluation_cleanup
+output_root: outputs/evaluation_cleanup
+length_output_root: outputs/length_head_analysis
+seed: 42
+minimum_entity_interactions: 5
+text_embedding_model: sentence-transformers/all-MiniLM-L6-v2
+
+frozen_lstm:
+  matrix: configs/experiments/frozen_lstm_5dataset.yaml
+  compact_manifest: outputs/architecture_finalization_compact/confirmation_manifest.json
+  compact_results: outputs/architecture_finalization_compact/final_cross_dataset_results.csv
+
+diffusion_amazon_toy:
+  evaluation_config: configs/evaluation/single_event_table_paper_metrics_amazon_toy.yaml
+  synthetic_candidates:
+    - outputs/amazon-toy/conditional_tabdlm_hierarchical_v41/synthetic_review_attrs_full.csv
+    - outputs/amazon-toy/conditional_tabdlm_hierarchical_v41/synthetic_review_attrs.csv
+  old_metrics_candidates:
+    - outputs/amazon-toy/conditional_tabdlm_hierarchical_v41/evaluation/paper_grade_full/metrics.json
+    - outputs/amazon-toy/conditional_tabdlm_hierarchical_v41/evaluation/paper_grade/metrics.json
+
+feature_policy:
+  before: all non-primary-key schema columns, including fixed event-spine and text-derived features
+  after: generated numerical and categorical attributes only
+  excluded:
+    - raw text and text embeddings
+    - text/token/word/character/sequence lengths
+    - primary keys and event identifiers
+    - source and destination foreign keys
+    - fixed event-spine timestamps
