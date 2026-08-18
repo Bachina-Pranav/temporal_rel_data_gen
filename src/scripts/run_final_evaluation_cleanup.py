@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import shutil
 import subprocess
@@ -110,17 +111,19 @@ def main() -> None:
     if args.stage == "inspect":
         return
     if args.stage in {"c2st", "all"}:
+        text_embedding_model = str(
+            matrix.get(
+                "text_embedding_model",
+                "sentence-transformers/all-MiniLM-L6-v2",
+            )
+        )
+        require_text_embedding_dependency(targets, text_embedding_model)
         run_c2st_evaluations(
             targets,
             output,
             skip_existing=args.skip_existing,
             sample_size=args.evaluation_sample_size,
-            text_embedding_model=str(
-                matrix.get(
-                    "text_embedding_model",
-                    "sentence-transformers/all-MiniLM-L6-v2",
-                )
-            ),
+            text_embedding_model=text_embedding_model,
         )
     if args.stage in {"length", "all"}:
         run_length_analysis(
@@ -134,6 +137,32 @@ def main() -> None:
         if length_output.exists():
             write_length_reports(length_output)
     print_final_console(targets, output, length_output)
+
+
+def require_text_embedding_dependency(
+    targets: list[EvaluationTarget],
+    model_name: str,
+) -> None:
+    """Fail before evaluation when a required sentence encoder is unavailable."""
+    if model_name in {"dummy", "deterministic_hash", "hash"}:
+        return
+    if not any(target.available and target_has_text(target) for target in targets):
+        return
+    if importlib.util.find_spec("sentence_transformers") is None:
+        raise RuntimeError(
+            "Text embedding C2ST requires the 'sentence-transformers' package. "
+            "Install it in the active environment with: "
+            "python -m pip install sentence-transformers"
+        )
+
+
+def target_has_text(target: EvaluationTarget) -> bool:
+    config = load_yaml(Path(target.evaluation_config))
+    columns = ((config.get("table") or {}).get("columns") or {})
+    return any(
+        str((definition or {}).get("type")) == "text"
+        for definition in columns.values()
+    )
 
 
 def inspect_repository(

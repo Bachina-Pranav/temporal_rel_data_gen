@@ -25,7 +25,8 @@ dependencies = [
   "gdown",
   "relbench[full]",
   "tomli==2.0.1",
-  "syntheval"
+  "syntheval",
+  "sentence-transformers"
 ]
 
 [project.urls]
