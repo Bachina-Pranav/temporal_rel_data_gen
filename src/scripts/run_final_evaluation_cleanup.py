@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
 import shutil
 import subprocess
@@ -148,12 +147,14 @@ def require_text_embedding_dependency(
         return
     if not any(target.available and target_has_text(target) for target in targets):
         return
-    if importlib.util.find_spec("sentence_transformers") is None:
+    try:
+        from sentence_transformers import SentenceTransformer  # noqa: F401
+    except Exception as exc:
         raise RuntimeError(
-            "Text embedding C2ST requires the 'sentence-transformers' package. "
-            "Install it in the active environment with: "
-            "python -m pip install sentence-transformers"
-        )
+            "Text embedding C2ST requires a working, PyTorch-compatible "
+            "Sentence Transformers installation. Install the repository-pinned "
+            "version with: python -m pip install 'sentence-transformers==2.7.0'"
+        ) from exc
 
 
 def target_has_text(target: EvaluationTarget) -> bool:
