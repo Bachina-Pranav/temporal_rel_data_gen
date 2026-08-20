@@ -91,6 +91,22 @@ class NoOp(torch.nn.Module):
         return input
 
 
+class ZeroFeatureLinear(torch.nn.Module):
+    """Affine projection for an empty feature vector.
+
+    ``nn.Linear(0, d)`` is mathematically a learned bias, but its CUDA backward
+    path is unsupported by some PyTorch versions. This module implements the
+    same operation without a zero-width matrix.
+    """
+
+    def __init__(self, out_features: int):
+        super().__init__()
+        self.bias = nn.Parameter(torch.zeros(out_features))
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        return self.bias.unsqueeze(0).expand(input.shape[0], -1)
+
+
 class GraphDiff(nn.Module):
     def __init__(
         self,
@@ -147,7 +163,9 @@ class GraphDiff(nn.Module):
             )
             # ignore the first CLS token.
             d_in = num_features * d_token
-            self.projs[table_name] = nn.Linear(d_in, dim_t)
+            self.projs[table_name] = (
+                ZeroFeatureLinear(dim_t) if d_in == 0 else nn.Linear(d_in, dim_t)
+            )
             self.noise_embeds[table_name] = Embedding(dim_t)
 
             # Positional encoding

@@ -376,6 +376,7 @@ def code_audit(
         "UPSTREAM_CORE_CHANGES_ALREADY_PRESENT": [
             "src/reldiff/models/model.py: float32 positional-embedding compatibility cast",
             "src/reldiff/trainer.py: cross-version AMP compatibility",
+            "src/reldiff/models/joint.py: bias-only equivalent for zero-feature dimension projections",
         ],
         "BASELINE_COMPATIBILITY_CHANGES": [
             "train/sample CLI seed option",

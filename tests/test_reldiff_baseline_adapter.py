@@ -232,6 +232,13 @@ def test_upstream_entry_points_only_add_adapter_execution_flags():
     assert "--seed" in train and "--seed" in sample
 
 
+def test_zero_feature_projection_is_bias_only_and_avoids_linear_zero_width():
+    joint = (ROOT / "src/reldiff/models/joint.py").read_text()
+    assert "class ZeroFeatureLinear" in joint
+    assert "ZeroFeatureLinear(dim_t) if d_in == 0" in joint
+    assert "self.bias.unsqueeze(0).expand(input.shape[0], -1)" in joint
+
+
 def temporary_config(
     interaction_path: Path,
     *,

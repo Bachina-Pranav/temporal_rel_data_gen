@@ -565,7 +565,8 @@ def write_manifest(
             "CLI seed plumbing in train/sample entry points",
             "CLI explicit-table-node flag in train/sample entry points",
             "CLI skip-preprocess reuse flag",
-            "No model, loss, schedule, diffusion, GNN, or D2K+SBM core change",
+            "Bias-only equivalent for unsupported Linear(0, dim) dimension projections",
+            "No change to losses, schedules, diffusion, GNN, or D2K+SBM behavior",
         ],
         "adapter_files": [
             "src/baselines/reldiff/schema.py",
@@ -611,8 +612,9 @@ def build_implementation_manifest(
         "modifications_to_upstream": [
             "Existing float32 positional-embedding compatibility cast",
             "Existing cross-version AMP compatibility in trainer",
+            "Bias-only equivalent for zero-feature ID-only dimension projections",
             "Adapter CLI seed, explicit-node, and skip-preprocess flags",
-            "No change to model architecture, losses, schedules, or D2K+SBM core",
+            "No architecture, loss, schedule, diffusion, GNN, or D2K+SBM change",
         ],
         "adapter_files": [
             "src/baselines/reldiff/schema.py",
