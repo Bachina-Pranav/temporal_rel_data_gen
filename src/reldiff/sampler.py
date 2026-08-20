@@ -64,7 +64,11 @@ class MultiTableSampler:
             metrics = self.metrics_dict[table_name]
             info = metrics.info
 
-            num_all_zero_row = (syn_data.sum(dim=1) == 0).sum()
+            num_all_zero_row = (
+                (syn_data.sum(dim=1) == 0).sum()
+                if syn_data.shape[1] > 0
+                else 0
+            )
             if num_all_zero_row:
                 print(
                     f"The generated samples contain {num_all_zero_row} Nan instances!!!"

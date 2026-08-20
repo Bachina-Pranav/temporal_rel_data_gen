@@ -2,10 +2,17 @@ from __future__ import annotations
 
 import json
 import sys
+import typing
+import types
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+if not hasattr(typing, "Literal"):
+    from typing_extensions import Literal
+
+    typing.Literal = Literal
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,6 +31,7 @@ from baselines.reldiff.schema import RelDiffDatasetConfig, load_dataset_config  
 from scripts.preflight_reldiff_baseline import annotate_audit_frame  # noqa: E402
 from scripts.run_reldiff_baseline import ROOT as RUNNER_ROOT  # noqa: E402
 from scripts.run_reldiff_baseline import repository_command_path  # noqa: E402
+from scripts.run_reldiff_baseline import run_timed_or_reuse  # noqa: E402
 
 
 def test_declared_datasets_have_requested_roles_and_no_text_surrogates():
@@ -143,6 +151,37 @@ def test_repository_command_path_accepts_relative_and_absolute_repo_paths():
     assert repository_command_path(absolute) == str(relative)
 
 
+def test_stage_level_skip_existing_reuses_completed_timed_record(tmp_path: Path):
+    resource = tmp_path / "runtime.json"
+    artifact = tmp_path / "artifact.bin"
+    resource.write_text(
+        json.dumps(
+            {
+                "command": ["command-that-must-not-run"],
+                "elapsed_seconds": 12.5,
+                "maximum_resident_set_kb": 10,
+            }
+        ),
+        encoding="utf-8",
+    )
+    artifact.write_text("complete", encoding="utf-8")
+    checkpoint = tmp_path / "best_model_1.pt"
+    checkpoint.write_text("checkpoint", encoding="utf-8")
+
+    record = run_timed_or_reuse(
+        ["command-that-must-not-run"],
+        tmp_path / "stage.log",
+        resource,
+        skip_existing=True,
+        stage="test stage",
+        required_paths=[artifact],
+        required_globs=[str(tmp_path / "best_model*")],
+    )
+
+    assert record["elapsed_seconds"] == 12.5
+    assert not (tmp_path / "stage.log").exists()
+
+
 def test_generated_postprocessing_restores_entity_labels_timestamp_and_validity(tmp_path: Path):
     source = pd.DataFrame({"user_id": ["u1", "u2"]})
     destination = pd.DataFrame({"movie_id": ["m1", "m2"]})
@@ -239,6 +278,32 @@ def test_zero_feature_projection_is_bias_only_and_avoids_linear_zero_width():
     assert "class ZeroFeatureLinear" in joint
     assert "ZeroFeatureLinear(dim_t) if d_in == 0" in joint
     assert "self.bias.unsqueeze(0).expand(input.shape[0], -1)" in joint
+
+
+def test_zero_feature_table_recovery_preserves_rows_for_primary_keys():
+    module = types.ModuleType("reldiff_data_utils_for_test")
+    utils_path = ROOT / "src/reldiff/data/utils.py"
+    source = "from __future__ import annotations\n" + utils_path.read_text()
+    exec(compile(source, str(utils_path), "exec"), module.__dict__)
+
+    num_rows = 5
+    recovered = module.recover_data(
+        np.empty((num_rows, 0), dtype=np.float32),
+        np.empty((num_rows, 0), dtype=np.int64),
+        np.empty((num_rows, 0), dtype=np.int64),
+        {
+            "task_type": None,
+            "num_col_idx": [],
+            "cat_col_idx": [],
+            "target_col_idx": [],
+            "column_info": {},
+            "idx_mapping": {},
+        },
+    )
+
+    assert recovered.shape == (num_rows, 0)
+    recovered["entity_id"] = np.arange(len(recovered))
+    assert recovered["entity_id"].tolist() == list(range(num_rows))
 
 
 def temporary_config(

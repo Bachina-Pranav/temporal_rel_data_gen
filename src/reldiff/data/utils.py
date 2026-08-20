@@ -371,7 +371,11 @@ def recover_data(syn_num, syn_cat, syn_target, info):
     idx_mapping = info["idx_mapping"]
     idx_mapping = {int(key): value for key, value in idx_mapping.items()}
 
-    syn_df = pd.DataFrame()
+    # A table may contain only a primary key and therefore have no modeled
+    # numerical, categorical, or target columns.  Preserve its generated row
+    # count so the sampler can add primary keys and reconstruct child foreign
+    # keys without producing an empty parent table.
+    syn_df = pd.DataFrame(index=pd.RangeIndex(syn_num.shape[0]))
 
     if info["task_type"] == "regression":
         for i in range(len(num_col_idx) + len(cat_col_idx) + len(target_col_idx)):

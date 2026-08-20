@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import time
+from glob import glob
 from pathlib import Path
 from typing import Any
 
@@ -189,7 +190,7 @@ def run_one(
     runtime_dir.mkdir(parents=True, exist_ok=True)
     commands: list[list[str]] = []
 
-    preprocessing = run_timed(
+    preprocessing = run_timed_or_reuse(
         [
             sys.executable,
             "src/scripts/preprocess_data.py",
@@ -202,10 +203,14 @@ def run_one(
         ],
         logs / "preprocess.log",
         runtime_dir / "preprocess_resource.json",
+        skip_existing=skip_existing,
+        stage="preprocessing",
+        required_paths=[ROOT / "data/processed" / staged_name],
     )
     commands.append(preprocessing["command"])
 
-    to_nx = run_timed(
+    original_structure_path = ROOT / "data/structure" / f"{staged_name}_graph.pkl"
+    to_nx = run_timed_or_reuse(
         [
             sys.executable,
             "src/structure/to_networkx.py",
@@ -217,10 +222,13 @@ def run_one(
         ],
         logs / "to_networkx.log",
         runtime_dir / "to_networkx_resource.json",
+        skip_existing=skip_existing,
+        stage="graph conversion",
+        required_paths=[original_structure_path],
     )
     commands.append(to_nx["command"])
     structure_path = ROOT / "data/structure" / f"{staged_name}_graph_gen.pkl"
-    structure = run_timed(
+    structure = run_timed_or_reuse(
         [
             sys.executable,
             "src/scripts/generate_reldiff_baseline_structure.py",
@@ -239,6 +247,12 @@ def run_one(
         ],
         logs / "structure.log",
         runtime_dir / "structure_resource.json",
+        skip_existing=skip_existing,
+        stage="structure generation",
+        required_paths=[
+            structure_path,
+            runtime_dir / "structure_runtime.json",
+        ],
     )
     commands.append(structure["command"])
 
@@ -277,13 +291,16 @@ def run_one(
     ]
     if experiment["training"].get("mixed_precision"):
         train_command.append("--mixed-precision")
-    training = run_timed(
+    upstream_checkpoint_dir = ROOT / "ckpt" / staged_name / f"multi{run_id}"
+    training = run_timed_or_reuse(
         train_command,
         logs / "train.log",
         runtime_dir / "training_resource.json",
+        skip_existing=skip_existing,
+        stage="diffusion training",
+        required_globs=[str(upstream_checkpoint_dir / "best_model*")],
     )
     commands.append(training["command"])
-    upstream_checkpoint_dir = ROOT / "ckpt" / staged_name / f"multi{run_id}"
     copy_tree(upstream_checkpoint_dir, work_root / "checkpoints")
 
     sample_command = [
@@ -657,6 +674,31 @@ def run_timed(command: list[str], log_path: Path, resource_path: Path) -> dict[s
     }
     write_json(record, resource_path)
     return record
+
+
+def run_timed_or_reuse(
+    command: list[str],
+    log_path: Path,
+    resource_path: Path,
+    *,
+    skip_existing: bool,
+    stage: str,
+    required_paths: list[Path] | None = None,
+    required_globs: list[str] | None = None,
+) -> dict[str, Any]:
+    required_paths = required_paths or []
+    required_globs = required_globs or []
+    reusable = (
+        skip_existing
+        and resource_path.is_file()
+        and all(path.exists() for path in required_paths)
+        and all(glob(pattern) for pattern in required_globs)
+    )
+    if reusable:
+        record = json.loads(resource_path.read_text(encoding="utf-8"))
+        print(f"[reuse] {stage}: {resource_path}", flush=True)
+        return record
+    return run_timed(command, log_path, resource_path)
 
 
 def run_checked(command: list[str], *, log_path: Path) -> None:

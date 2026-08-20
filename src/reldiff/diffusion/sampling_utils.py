@@ -21,7 +21,11 @@ def convert_synthetic_tables(
         print(f"Shape of the generated sample = {syn_data.shape}")
         info = info_dict[table_name]
 
-        num_all_zero_row = (syn_data.sum(dim=1) == 0).sum()
+        num_all_zero_row = (
+            (syn_data.sum(dim=1) == 0).sum()
+            if syn_data.shape[1] > 0
+            else 0
+        )
         if num_all_zero_row:
             print(f"The generated samples contain {num_all_zero_row} Nan instances!!!")
             print({"num_Nan_sample": num_all_zero_row})
