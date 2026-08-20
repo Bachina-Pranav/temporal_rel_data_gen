@@ -664,14 +664,21 @@ def run_checked(command: list[str], *, log_path: Path) -> None:
     with log_path.open("a", encoding="utf-8") as handle:
         handle.write("\n$ " + shlex.join(command) + "\n")
         handle.flush()
-        subprocess.run(
-            command,
-            cwd=ROOT,
-            env=env,
-            stdout=handle,
-            stderr=subprocess.STDOUT,
-            check=True,
-        )
+        try:
+            subprocess.run(
+                command,
+                cwd=ROOT,
+                env=env,
+                stdout=handle,
+                stderr=subprocess.STDOUT,
+                check=True,
+            )
+        except subprocess.CalledProcessError:
+            handle.flush()
+            print(f"Command failed; last lines from {log_path}:", file=sys.stderr)
+            tail = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+            print("\n".join(tail[-80:]), file=sys.stderr)
+            raise
 
 
 def dataset_run_root(

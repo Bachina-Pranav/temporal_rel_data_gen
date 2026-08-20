@@ -20,6 +20,7 @@ from baselines.reldiff.adapter import (  # noqa: E402
     resolve_split_labels,
 )
 from baselines.reldiff.schema import RelDiffDatasetConfig, load_dataset_config  # noqa: E402
+from scripts.preflight_reldiff_baseline import annotate_audit_frame  # noqa: E402
 
 
 def test_declared_datasets_have_requested_roles_and_no_text_surrogates():
@@ -95,6 +96,27 @@ def test_repeated_pair_statistics_count_rows_not_only_extra_duplicates():
     assert summary["max_pair_multiplicity"] == 3
     assert top.iloc[0]["multiplicity"] == 3
     assert set(examples["value"]) == {"A", "B", "C"}
+
+
+def test_audit_annotation_replaces_existing_split_provenance_columns():
+    frame = pd.DataFrame(
+        {
+            "split": ["train"],
+            "dataset": ["source_value"],
+            "record_type": ["source_value"],
+            "multiplicity": [3],
+        }
+    )
+    annotated = annotate_audit_frame(
+        frame,
+        dataset="movielens_100k",
+        split="complete",
+        record_type="repeated_pair_event_example",
+    )
+    assert annotated.columns.tolist()[:3] == ["dataset", "split", "record_type"]
+    assert annotated.loc[0, "dataset"] == "movielens_100k"
+    assert annotated.loc[0, "split"] == "complete"
+    assert annotated.loc[0, "record_type"] == "repeated_pair_event_example"
 
 
 def test_generated_postprocessing_restores_entity_labels_timestamp_and_validity(tmp_path: Path):

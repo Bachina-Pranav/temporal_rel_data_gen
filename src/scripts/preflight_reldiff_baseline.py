@@ -87,15 +87,20 @@ def main() -> None:
                 statistic_rows.append(
                     {"dataset": config.key, "split": split_name, **summary}
                 )
-                top.insert(0, "dataset", config.key)
-                top.insert(1, "split", split_name)
-                top.insert(2, "record_type", "top_20_pair_multiplicity")
+                top = annotate_audit_frame(
+                    top,
+                    dataset=config.key,
+                    split=split_name,
+                    record_type="top_20_pair_multiplicity",
+                )
                 example_frames.append(top)
                 if len(examples):
-                    examples = examples.copy()
-                    examples.insert(0, "dataset", config.key)
-                    examples.insert(1, "split", split_name)
-                    examples.insert(2, "record_type", "repeated_pair_event_example")
+                    examples = annotate_audit_frame(
+                        examples,
+                        dataset=config.key,
+                        split=split_name,
+                        record_type="repeated_pair_event_example",
+                    )
                     example_frames.append(examples)
                 if split_name == "train":
                     repeated_fractions[config.key] = summary[
@@ -311,6 +316,24 @@ def graph_tool_parallel_edge_test() -> dict[str, Any]:
             "error": f"{type(exc).__name__}: {exc}",
             "version": None,
         }
+
+
+def annotate_audit_frame(
+    frame: pd.DataFrame,
+    *,
+    dataset: str,
+    split: str,
+    record_type: str,
+) -> pd.DataFrame:
+    """Add audit provenance without colliding with source-table columns."""
+
+    annotated = frame.drop(
+        columns=["dataset", "split", "record_type"], errors="ignore"
+    ).copy()
+    annotated.insert(0, "dataset", dataset)
+    annotated.insert(1, "split", split)
+    annotated.insert(2, "record_type", record_type)
+    return annotated
 
 
 def code_audit(
