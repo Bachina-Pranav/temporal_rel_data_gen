@@ -1,0 +1,25 @@
+key: movielens_100k
+display_name: MovieLens-100K-induced
+paths:
+  interaction: data/processed/interaction_benchmarks/movielens_100k/interactions.csv
+  source_entity: data/processed/interaction_benchmarks/movielens_100k/users.csv
+  destination_entity: data/processed/interaction_benchmarks/movielens_100k/movies.csv
+  evaluation_config: configs/evaluation/single_event_table_paper_metrics_movielens_100k.yaml
+tables:
+  source: users
+  destination: movies
+  interaction: interactions
+columns:
+  source_pk: user_id
+  destination_pk: movie_id
+  source_fk: user_id
+  destination_fk: movie_id
+  event_id: event_id
+  timestamp: event_time
+  numerical_attributes: []
+  categorical_attributes: [rating]
+  ignored_attributes: []
+timestamp:
+  unit: seconds
+split_policy: explicit_or_chronological_90_5_5
+

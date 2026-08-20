@@ -1,0 +1,25 @@
+key: rel_hm
+display_name: Rel-HM
+paths:
+  interaction: data/processed/interaction_benchmarks/hm_10k_customers/interactions.csv
+  source_entity: data/processed/interaction_benchmarks/hm_10k_customers/customers.csv
+  destination_entity: data/processed/interaction_benchmarks/hm_10k_customers/articles.csv
+  evaluation_config: configs/evaluation/single_event_table_paper_metrics_hm_10k_customers.yaml
+tables:
+  source: customers
+  destination: articles
+  interaction: interactions
+columns:
+  source_pk: customer_id
+  destination_pk: article_id
+  source_fk: customer_id
+  destination_fk: article_id
+  event_id: event_id
+  timestamp: event_time
+  numerical_attributes: [price]
+  categorical_attributes: [sales_channel_id]
+  ignored_attributes: []
+timestamp:
+  unit: seconds
+split_policy: explicit_or_chronological_90_5_5
+

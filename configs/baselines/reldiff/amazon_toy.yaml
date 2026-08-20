@@ -1,0 +1,25 @@
+key: amazon_toy
+display_name: Amazon-Toy
+paths:
+  interaction: data/original/rel-amazon-toy/review.csv
+  source_entity: data/original/rel-amazon-toy/customer.csv
+  destination_entity: data/original/rel-amazon-toy/product.csv
+  evaluation_config: configs/evaluation/single_event_table_paper_metrics_amazon_toy.yaml
+tables:
+  source: customer
+  destination: product
+  interaction: review
+columns:
+  source_pk: customer_id
+  destination_pk: product_id
+  source_fk: customer_id
+  destination_fk: product_id
+  event_id: review_id
+  timestamp: review_time
+  numerical_attributes: []
+  categorical_attributes: [rating, verified]
+  ignored_attributes: [summary, review_text]
+timestamp:
+  unit: seconds
+split_policy: explicit_or_chronological_90_5_5
+

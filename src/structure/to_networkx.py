@@ -12,6 +12,7 @@ from reldiff.data import create_dataset, process_data
 argparser = argparse.ArgumentParser()
 argparser.add_argument("--dataset_name", default="f1_subsampled", type=str)
 argparser.add_argument("--data-path", default="data", type=str)
+argparser.add_argument("--skip-preprocess", action="store_true")
 args = argparser.parse_args()
 
 database_name = args.dataset_name
@@ -24,16 +25,17 @@ metadata_path = os.path.join(data_dir, "original", database_name, "metadata.json
 metadata = Metadata().load_from_json(metadata_path)
 
 
-tables = load_tables(f"{data_dir}/original/{database_name}/", metadata)
-tables, metadata = remove_sdv_columns(tables, metadata)
-for table_name, table in tables.items():
-    process_data(
-        table,
-        name=table_name,
-        metadata=metadata.get_table_meta(table_name, to_dict=False),
-        data_path=data_dir,
-        dataset_name=database_name,
-    )
+if not args.skip_preprocess:
+    tables = load_tables(f"{data_dir}/original/{database_name}/", metadata)
+    tables, metadata = remove_sdv_columns(tables, metadata)
+    for table_name, table in tables.items():
+        process_data(
+            table,
+            name=table_name,
+            metadata=metadata.get_table_meta(table_name, to_dict=False),
+            data_path=data_dir,
+            dataset_name=database_name,
+        )
 
 data_path = os.path.join(data_dir, "processed", database_name)
 

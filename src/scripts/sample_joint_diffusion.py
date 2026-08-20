@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import pickle
+import random
 from glob import glob
 
 import numpy as np
@@ -46,7 +47,22 @@ argparser.add_argument(
 )
 argparser.add_argument("--use-ema", action="store_true", help="Use EMA for training")
 argparser.add_argument("--compile-model", action="store_true", help="Use torch.compile")
+argparser.add_argument("--seed", default=42, type=int)
+argparser.add_argument(
+    "--preserve-explicit-table-nodes",
+    action="store_true",
+    help=(
+        "Keep attributed interaction rows as explicit nodes and avoid treating "
+        "ID-only parent tables as foreign-key-only bridge tables."
+    ),
+)
 args = argparser.parse_args()
+
+random.seed(args.seed)
+np.random.seed(args.seed)
+torch.manual_seed(args.seed)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(args.seed)
 
 database_name = args.dataset_name
 structure = args.structure
@@ -90,6 +106,7 @@ dataset = create_dataset(
     metadata,
     data_path,
     order_cols=order_cols,
+    transform_fk_tables=not args.preserve_explicit_table_nodes,
 )
 
 root_table = sorted(metadata.get_root_tables())[-1]

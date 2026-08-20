@@ -1,6 +1,7 @@
 import os
 import json
 import argparse
+import random
 
 import wandb
 import torch
@@ -44,8 +45,28 @@ argparser.add_argument("--use-ema", action="store_true", help="Use EMA for train
 argparser.add_argument(
     "--mixed-precision", action="store_true", help="Use mixed precision training"
 )
+argparser.add_argument("--seed", default=42, type=int)
+argparser.add_argument(
+    "--preserve-explicit-table-nodes",
+    action="store_true",
+    help=(
+        "Keep attributed interaction rows as explicit nodes and avoid treating "
+        "ID-only parent tables as foreign-key-only bridge tables."
+    ),
+)
+argparser.add_argument(
+    "--skip-preprocess",
+    action="store_true",
+    help="Reuse already materialized official RelDiff processed arrays.",
+)
 
 args = argparser.parse_args()
+
+random.seed(args.seed)
+np.random.seed(args.seed)
+torch.manual_seed(args.seed)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(args.seed)
 
 run_id = args.run_id
 database_name = args.dataset_name
@@ -79,19 +100,20 @@ metadata_path = os.path.join(DATA_DIR, "original", database_name, "metadata.json
 metadata = Metadata().load_from_json(metadata_path)
 
 # Preprocess data
-tables = load_tables(f"{DATA_DIR}/original/{database_name}/", metadata)
-tables, metadata = remove_sdv_columns(tables, metadata)
-for table_name, table in tables.items():
-    process_data(
-        table,
-        name=table_name,
-        metadata=metadata.get_table_meta(table_name, to_dict=False),
-        data_path=DATA_DIR,
-        dataset_name=database_name,
-        normalization=config["data"]["normalization"],
-        standardize=config["data"]["standardize"],
-        sigma_data=config["diffusion_params"]["edm_params"]["sigma_data"],
-    )
+if not args.skip_preprocess:
+    tables = load_tables(f"{DATA_DIR}/original/{database_name}/", metadata)
+    tables, metadata = remove_sdv_columns(tables, metadata)
+    for table_name, table in tables.items():
+        process_data(
+            table,
+            name=table_name,
+            metadata=metadata.get_table_meta(table_name, to_dict=False),
+            data_path=DATA_DIR,
+            dataset_name=database_name,
+            normalization=config["data"]["normalization"],
+            standardize=config["data"]["standardize"],
+            sigma_data=config["diffusion_params"]["edm_params"]["sigma_data"],
+        )
 
 data_path = os.path.join(DATA_DIR, "processed", database_name)
 model_save_path = os.path.join("ckpt", database_name, "multi" + run_id)
@@ -101,6 +123,7 @@ dataset = create_dataset(
     metadata,
     data_path,
     order_cols=order_cols,
+    transform_fk_tables=not args.preserve_explicit_table_nodes,
 )
 
 root_table = sorted(metadata.get_root_tables())[-1]

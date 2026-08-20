@@ -1,0 +1,23 @@
+experiment_name: reldiff_baseline_seed42
+output_root: outputs/baselines/reldiff
+seed: 42
+upstream_repository: https://github.com/ValterH/RelDiff
+upstream_import_commit: 792f4982c9c82c1944dee7099e9fe5dc6eda1094
+official_model_config: src/reldiff/configs/reldiff_config.toml
+datasets:
+  - configs/baselines/reldiff/amazon_toy.yaml
+  - configs/baselines/reldiff/movielens_100k.yaml
+  - configs/baselines/reldiff/rel_hm.yaml
+training:
+  full_epochs: 10000
+  smoke_epochs: 4
+  smoke_train_rows: 1024
+  batch_size: 4096
+  smoke_batch_size: 128
+  sampling_batch_size: 20000
+  device: cuda
+  sampling_device: cuda
+  mixed_precision: false
+structure:
+  split_by_subgraphs: false
+  max_retries: 10
