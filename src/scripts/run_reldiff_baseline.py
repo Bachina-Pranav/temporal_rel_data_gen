@@ -49,7 +49,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--stage",
-        choices=["preflight", "prepare", "smoke", "full", "evaluate", "summary", "all"],
+        choices=[
+            "preflight",
+            "prepare",
+            "profile",
+            "smoke",
+            "full",
+            "evaluate",
+            "summary",
+            "all",
+        ],
         default="all",
     )
     parser.add_argument(
@@ -57,6 +66,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--skip-existing", action="store_true")
     parser.add_argument("--device", default=None)
+    parser.add_argument("--profile-epochs", type=int, default=3)
+    parser.add_argument(
+        "--profile-worker-counts", type=int, nargs="+", default=[0, 4, 8, 16, 28]
+    )
     return parser.parse_args()
 
 
@@ -99,6 +112,16 @@ def main() -> None:
             prepare_one(config, experiment, smoke=False)
         if args.stage == "prepare":
             return
+    if args.stage == "profile":
+        for config in configs:
+            profile_training_workers(
+                config,
+                experiment,
+                epochs=args.profile_epochs,
+                worker_counts=args.profile_worker_counts,
+                skip_existing=args.skip_existing,
+            )
+        return
     if args.stage in {"smoke", "all"}:
         for config in configs:
             run_one(config, experiment, smoke=True, skip_existing=args.skip_existing)
@@ -262,6 +285,7 @@ def run_one(
     batch_size = int(
         experiment["training"]["smoke_batch_size" if smoke else "batch_size"]
     )
+    num_workers = resolve_training_num_workers(run_root, experiment, smoke=smoke)
     run_id = f"_baseline_seed{seed}_{'smoke' if smoke else 'full'}"
     train_command = [
         sys.executable,
@@ -273,6 +297,8 @@ def run_one(
         str(batch_size),
         "--sampling-batch-size",
         str(experiment["training"]["sampling_batch_size"]),
+        "--num-workers",
+        str(num_workers),
         "--run-id",
         run_id,
         "--config-path",
@@ -388,6 +414,7 @@ def run_one(
         "epochs": epochs,
         "batch_size": batch_size,
         "sampling_batch_size": int(experiment["training"]["sampling_batch_size"]),
+        "num_workers": num_workers,
         "diffusion_steps": 100,
         "seed": seed,
         "synthetic_rows": validity["actual_row_count"],
@@ -397,6 +424,128 @@ def run_one(
     write_json(runtime, runtime_dir / "runtime_summary.json")
     write_manifest(config, experiment, work_root, commands, smoke=smoke)
     print(f"[{config.key}] wrote {output_csv}")
+
+
+def profile_training_workers(
+    config: RelDiffDatasetConfig,
+    experiment: dict[str, Any],
+    *,
+    epochs: int,
+    worker_counts: list[int],
+    skip_existing: bool,
+) -> None:
+    """Benchmark full-data loading choices without changing RelDiff training."""
+
+    if epochs < 1:
+        raise ValueError("--profile-epochs must be positive")
+    if any(workers < 0 for workers in worker_counts):
+        raise ValueError("--profile-worker-counts cannot contain negative values")
+
+    seed = int(experiment["seed"])
+    run_root = dataset_run_root(config, experiment)
+    profile_root = run_root / "training_profile"
+    logs = profile_root / "logs"
+    runtime_dir = profile_root / "runtime"
+    logs.mkdir(parents=True, exist_ok=True)
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+
+    manifest = prepare_one(config, experiment, smoke=False)
+    staged_name = manifest["staged_name"]
+    preprocess_command = [
+        sys.executable,
+        "src/scripts/preprocess_data.py",
+        "--dataset_name",
+        staged_name,
+        "--normalization",
+        "quantile",
+        "--sigma-data",
+        "1.0",
+    ]
+    run_timed_or_reuse(
+        preprocess_command,
+        run_root / "logs/preprocess.log",
+        run_root / "runtime/preprocess_resource.json",
+        skip_existing=skip_existing,
+        stage="full-data preprocessing",
+        required_paths=[ROOT / "data/processed" / staged_name],
+    )
+
+    rows = []
+    for workers in dict.fromkeys(worker_counts):
+        profile_path = runtime_dir / f"workers_{workers}.json"
+        resource_path = runtime_dir / f"workers_{workers}_resource.json"
+        if skip_existing and profile_path.is_file() and resource_path.is_file():
+            print(f"[reuse] worker profile {workers}: {profile_path}", flush=True)
+            resource = json.loads(resource_path.read_text(encoding="utf-8"))
+        else:
+            run_id = f"_baseline_seed{seed}_profile_workers{workers}"
+            command = [
+                sys.executable,
+                "src/scripts/train_joint_diffusion.py",
+                staged_name,
+                "--num-epochs",
+                str(epochs),
+                "--batch-size",
+                str(experiment["training"]["batch_size"]),
+                "--sampling-batch-size",
+                str(experiment["training"]["sampling_batch_size"]),
+                "--run-id",
+                run_id,
+                "--config-path",
+                str(experiment["official_model_config"]),
+                "--dataset-config-path",
+                repository_command_path(run_root / "config/reldiff_dataset_config.toml"),
+                "--device",
+                str(experiment["training"]["device"]),
+                "--sampling-device",
+                str(experiment["training"]["sampling_device"]),
+                "--num-workers",
+                str(workers),
+                "--seed",
+                str(seed),
+                "--preserve-explicit-table-nodes",
+                "--skip-preprocess",
+                "--no-wandb",
+                "--profile-output",
+                repository_command_path(profile_path),
+                "--disable-checkpoints",
+            ]
+            resource = run_timed(
+                command,
+                logs / f"workers_{workers}.log",
+                resource_path,
+            )
+
+        profile = json.loads(profile_path.read_text(encoding="utf-8"))
+        seconds_per_epoch = float(profile["seconds_per_epoch"])
+        rows.append(
+            {
+                "num_workers": workers,
+                "profile_epochs": epochs,
+                "total_batches": int(profile["total_batches"]),
+                "seconds_per_epoch": seconds_per_epoch,
+                "seconds_per_batch": float(profile["seconds_per_batch"]),
+                "batch_wait_fraction": float(profile["batch_wait_seconds"])
+                / max(float(profile["training_loop_seconds"]), 1e-12),
+                "projected_10000_epoch_hours": seconds_per_epoch
+                * int(experiment["training"]["full_epochs"])
+                / 3600.0,
+                "process_elapsed_seconds": float(resource["elapsed_seconds"]),
+            }
+        )
+
+    rows.sort(key=lambda row: row["seconds_per_epoch"])
+    summary = {
+        "dataset": config.key,
+        "model_and_objective_changed": False,
+        "checkpointing_disabled_for_profile": True,
+        "full_epochs": int(experiment["training"]["full_epochs"]),
+        "recommended_num_workers": rows[0]["num_workers"],
+        "profiles": rows,
+    }
+    write_json(summary, profile_root / "summary.json")
+    pd.DataFrame(rows).to_csv(profile_root / "summary.csv", index=False)
+    print(json.dumps(summary, indent=2, sort_keys=True))
 
 
 def evaluate_one(
@@ -583,6 +732,8 @@ def write_manifest(
             "CLI explicit-table-node flag in train/sample entry points",
             "CLI skip-preprocess reuse flag",
             "Bias-only equivalent for unsupported Linear(0, dim) dimension projections",
+            "Profile-only timing/checkpoint-I/O controls with canonical defaults unchanged",
+            "Equivalent unique-index and repeated-property lookup optimization in the loader",
             "No change to losses, schedules, diffusion, GNN, or D2K+SBM behavior",
         ],
         "adapter_files": [
@@ -631,6 +782,8 @@ def build_implementation_manifest(
             "Existing cross-version AMP compatibility in trainer",
             "Bias-only equivalent for zero-feature ID-only dimension projections",
             "Adapter CLI seed, explicit-node, and skip-preprocess flags",
+            "Profile-only timing/checkpoint-I/O controls with canonical defaults unchanged",
+            "Equivalent unique-index and repeated-property lookup optimization in the loader",
             "No architecture, loss, schedule, diffusion, GNN, or D2K+SBM change",
         ],
         "adapter_files": [
@@ -730,6 +883,20 @@ def dataset_run_root(
     config: RelDiffDatasetConfig, experiment: dict[str, Any]
 ) -> Path:
     return Path(experiment["output_root"]) / config.key / f"seed_{experiment['seed']}"
+
+
+def resolve_training_num_workers(
+    run_root: Path, experiment: dict[str, Any], *, smoke: bool
+) -> int:
+    configured = experiment["training"].get("num_workers")
+    if configured is not None and configured != "auto":
+        return int(configured)
+    if not smoke:
+        summary_path = run_root / "training_profile/summary.json"
+        if summary_path.is_file():
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            return int(summary["recommended_num_workers"])
+    return int(os.cpu_count() or 1)
 
 
 def repository_command_path(path: str | Path) -> str:

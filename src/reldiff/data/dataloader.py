@@ -139,12 +139,12 @@ class HeteroNeighborLoader(DataLoader):
         }
 
         # Select input nodes
-        input_mask = torch.isin(batch_ids, input_ids)
+        input_mask = torch.isin(batch_ids, input_ids, assume_unique=True)
+        node_types = self.homogeneous.node_type[batch_ids]
+        original_ids = self.homogeneous.original_id[batch_ids]
         for node_type_id, node_type in enumerate(self.data.node_types):
             # Select nodes of the same type
-            node_type_mask = self.homogeneous.node_type[batch_ids] == node_type_id
-
-            original_ids = self.homogeneous.original_id[batch_ids]
+            node_type_mask = node_types == node_type_id
 
             node_ids[node_type] = original_ids[node_type_mask]
             input_nodes[node_type] = original_ids[node_type_mask & input_mask]

@@ -31,6 +31,7 @@ from baselines.reldiff.schema import RelDiffDatasetConfig, load_dataset_config  
 from scripts.preflight_reldiff_baseline import annotate_audit_frame  # noqa: E402
 from scripts.run_reldiff_baseline import ROOT as RUNNER_ROOT  # noqa: E402
 from scripts.run_reldiff_baseline import repository_command_path  # noqa: E402
+from scripts.run_reldiff_baseline import resolve_training_num_workers  # noqa: E402
 from scripts.run_reldiff_baseline import run_timed_or_reuse  # noqa: E402
 
 
@@ -182,6 +183,20 @@ def test_stage_level_skip_existing_reuses_completed_timed_record(tmp_path: Path)
     assert not (tmp_path / "stage.log").exists()
 
 
+def test_full_training_uses_profiled_worker_count_unless_explicitly_overridden(
+    tmp_path: Path,
+):
+    summary = tmp_path / "training_profile/summary.json"
+    summary.parent.mkdir(parents=True)
+    summary.write_text(json.dumps({"recommended_num_workers": 4}), encoding="utf-8")
+    experiment = {"training": {"num_workers": "auto"}}
+
+    assert resolve_training_num_workers(tmp_path, experiment, smoke=False) == 4
+
+    experiment["training"]["num_workers"] = 7
+    assert resolve_training_num_workers(tmp_path, experiment, smoke=False) == 7
+
+
 def test_generated_postprocessing_restores_entity_labels_timestamp_and_validity(tmp_path: Path):
     source = pd.DataFrame({"user_id": ["u1", "u2"]})
     destination = pd.DataFrame({"movie_id": ["m1", "m2"]})
@@ -271,6 +286,15 @@ def test_upstream_entry_points_only_add_adapter_execution_flags():
         "transform_fk_tables=not args.preserve_explicit_table_nodes"
     ) == 2
     assert "--seed" in train and "--seed" in sample
+    assert "--profile-output" in train
+    assert "--disable-checkpoints" in train
+    assert "checkpointing_enabled=not args.disable_checkpoints" in train
+
+
+def test_loader_optimization_preserves_unique_membership_semantics():
+    loader = (ROOT / "src/reldiff/data/dataloader.py").read_text()
+    assert "torch.isin(batch_ids, input_ids, assume_unique=True)" in loader
+    assert loader.count("self.homogeneous.original_id[batch_ids]") == 1
 
 
 def test_zero_feature_projection_is_bias_only_and_avoids_linear_zero_width():

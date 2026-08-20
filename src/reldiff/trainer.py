@@ -764,10 +764,12 @@ class MultiTableTrainer(MultiTableSampler, Trainer):
         timestep_sampling: str = "uniform",
         use_ema: bool = True,
         mixed_precision: bool = False,
+        checkpointing_enabled: bool = True,
         **kwargs,
     ):
         self.diffusion = diffusion
         self.mixed_precision = mixed_precision
+        self.checkpointing_enabled = checkpointing_enabled
         self.device = device
         self.sampling_device = sampling_device
 
@@ -1136,7 +1138,11 @@ class MultiTableTrainer(MultiTableSampler, Trainer):
                 self.ema_model.update()
 
             # Save ckpt base on the best training loss
-            if total_loss < best_loss and self.curr_epoch > self.steps // 2:
+            if (
+                self.checkpointing_enabled
+                and total_loss < best_loss
+                and self.curr_epoch > self.steps // 2
+            ):
                 best_loss = total_loss
                 to_remove = glob.glob(
                     os.path.join(self.model_save_path, "best_model_*")
@@ -1174,7 +1180,8 @@ class MultiTableTrainer(MultiTableSampler, Trainer):
 
                     # Save the best ema ckpt
                     if (
-                        ema_total_loss < best_ema_loss
+                        self.checkpointing_enabled
+                        and ema_total_loss < best_ema_loss
                         and self.curr_epoch > self.steps // 2
                     ):
                         best_ema_loss = ema_total_loss
@@ -1192,7 +1199,10 @@ class MultiTableTrainer(MultiTableSampler, Trainer):
                         )
 
             # Evaluate Sample Quality
-            if (epoch + 1) % self.check_val_every == 0:
+            if (
+                self.checkpointing_enabled
+                and (epoch + 1) % self.check_val_every == 0
+            ):
                 torch.save(
                     self.diffusion.state_dict(),
                     os.path.join(self.model_save_path, f"model_{epoch + 1}.pt"),

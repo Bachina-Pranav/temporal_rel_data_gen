@@ -2,6 +2,8 @@ import os
 import json
 import argparse
 import random
+import time
+from pathlib import Path
 
 import wandb
 import torch
@@ -59,8 +61,53 @@ argparser.add_argument(
     action="store_true",
     help="Reuse already materialized official RelDiff processed arrays.",
 )
+argparser.add_argument(
+    "--profile-output",
+    default=None,
+    help="Write training-loop and data-loading timings to this JSON file.",
+)
+argparser.add_argument(
+    "--disable-checkpoints",
+    action="store_true",
+    help="Disable checkpoint and periodic generation I/O for short profiling runs.",
+)
 
 args = argparser.parse_args()
+
+
+class TimedDataLoader:
+    """Measure iterator startup and batch wait time without changing batches."""
+
+    def __init__(self, dataloader):
+        self.dataloader = dataloader
+        self.epochs = []
+
+    def __len__(self):
+        return len(self.dataloader)
+
+    def __iter__(self):
+        record = {
+            "iterator_setup_seconds": 0.0,
+            "batch_wait_seconds": 0.0,
+            "num_batches": 0,
+        }
+        epoch_start = time.perf_counter()
+        setup_start = time.perf_counter()
+        iterator = iter(self.dataloader)
+        record["iterator_setup_seconds"] = time.perf_counter() - setup_start
+        try:
+            while True:
+                wait_start = time.perf_counter()
+                try:
+                    batch = next(iterator)
+                except StopIteration:
+                    break
+                record["batch_wait_seconds"] += time.perf_counter() - wait_start
+                record["num_batches"] += 1
+                yield batch
+        finally:
+            record["epoch_seconds"] = time.perf_counter() - epoch_start
+            self.epochs.append(record)
 
 random.seed(args.seed)
 np.random.seed(args.seed)
@@ -244,6 +291,10 @@ dataloader = get_subgraph_dataloader(
     num_workers=args.num_workers,
     min_input_nodes=16,  # TODO: hardcoded - move to config
 )
+timed_dataloader = None
+if args.profile_output is not None:
+    timed_dataloader = TimedDataLoader(dataloader)
+    dataloader = timed_dataloader
 
 ## Enable Wandb
 project_name = f"reldiff_{database_name}"
@@ -275,7 +326,37 @@ trainer = MultiTableTrainer(
     sampling_batch_size=args.sampling_batch_size,
     use_ema=args.use_ema,
     mixed_precision=args.mixed_precision,
+    checkpointing_enabled=not args.disable_checkpoints,
 )
 
-
+training_start = time.perf_counter()
 trainer.run_loop()
+training_loop_seconds = time.perf_counter() - training_start
+
+if args.profile_output is not None:
+    profile_path = Path(args.profile_output)
+    profile_path.parent.mkdir(parents=True, exist_ok=True)
+    epochs = timed_dataloader.epochs
+    total_batches = sum(record["num_batches"] for record in epochs)
+    total_batch_wait = sum(record["batch_wait_seconds"] for record in epochs)
+    total_iterator_setup = sum(
+        record["iterator_setup_seconds"] for record in epochs
+    )
+    profile = {
+        "epochs_requested": num_epochs,
+        "epochs_observed": len(epochs),
+        "num_workers": args.num_workers,
+        "batch_size": batch_size,
+        "total_batches": total_batches,
+        "training_loop_seconds": training_loop_seconds,
+        "seconds_per_epoch": training_loop_seconds / max(len(epochs), 1),
+        "seconds_per_batch": training_loop_seconds / max(total_batches, 1),
+        "batch_wait_seconds": total_batch_wait,
+        "iterator_setup_seconds": total_iterator_setup,
+        "non_loader_seconds": max(training_loop_seconds - total_batch_wait, 0.0),
+        "checkpointing_enabled": not args.disable_checkpoints,
+        "mixed_precision": args.mixed_precision,
+        "epoch_records": epochs,
+    }
+    profile_path.write_text(json.dumps(profile, indent=2, sort_keys=True) + "\n")
+    print(profile_path)
