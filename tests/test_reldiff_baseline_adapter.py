@@ -21,6 +21,8 @@ from baselines.reldiff.adapter import (  # noqa: E402
 )
 from baselines.reldiff.schema import RelDiffDatasetConfig, load_dataset_config  # noqa: E402
 from scripts.preflight_reldiff_baseline import annotate_audit_frame  # noqa: E402
+from scripts.run_reldiff_baseline import ROOT as RUNNER_ROOT  # noqa: E402
+from scripts.run_reldiff_baseline import repository_command_path  # noqa: E402
 
 
 def test_declared_datasets_have_requested_roles_and_no_text_surrogates():
@@ -117,6 +119,13 @@ def test_audit_annotation_replaces_existing_split_provenance_columns():
     assert annotated.loc[0, "dataset"] == "movielens_100k"
     assert annotated.loc[0, "split"] == "complete"
     assert annotated.loc[0, "record_type"] == "repeated_pair_event_example"
+
+
+def test_repository_command_path_accepts_relative_and_absolute_repo_paths():
+    relative = Path("outputs/baselines/reldiff/runtime.json")
+    absolute = RUNNER_ROOT / relative
+    assert repository_command_path(relative) == str(relative)
+    assert repository_command_path(absolute) == str(relative)
 
 
 def test_generated_postprocessing_restores_entity_labels_timestamp_and_validity(tmp_path: Path):

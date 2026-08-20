@@ -228,9 +228,9 @@ def run_one(
             "--data-dir",
             "data",
             "--output",
-            str(structure_path.relative_to(ROOT)),
+            repository_command_path(structure_path),
             "--runtime-output",
-            str((runtime_dir / "structure_runtime.json").relative_to(ROOT)),
+            repository_command_path(runtime_dir / "structure_runtime.json"),
             "--seed",
             str(seed),
             "--max-retries",
@@ -263,7 +263,7 @@ def run_one(
         "--config-path",
         str(experiment["official_model_config"]),
         "--dataset-config-path",
-        str((work_root / "config/reldiff_dataset_config.toml").relative_to(ROOT)),
+        repository_command_path(work_root / "config/reldiff_dataset_config.toml"),
         "--device",
         str(experiment["training"]["device"]),
         "--sampling-device",
@@ -298,7 +298,7 @@ def run_one(
         "--config-path",
         str(experiment["official_model_config"]),
         "--dataset-config-path",
-        str((work_root / "config/reldiff_dataset_config.toml").relative_to(ROOT)),
+        repository_command_path(work_root / "config/reldiff_dataset_config.toml"),
         "--structure",
         "generated",
         "--device",
@@ -685,6 +685,16 @@ def dataset_run_root(
     config: RelDiffDatasetConfig, experiment: dict[str, Any]
 ) -> Path:
     return Path(experiment["output_root"]) / config.key / f"seed_{experiment['seed']}"
+
+
+def repository_command_path(path: str | Path) -> str:
+    """Return a stable repo-relative path for subprocesses launched from ROOT."""
+
+    resolved = Path(path).resolve()
+    try:
+        return str(resolved.relative_to(ROOT.resolve()))
+    except ValueError:
+        return str(resolved)
 
 
 def staged_dataset_name(config: RelDiffDatasetConfig, seed: int, smoke: bool) -> str:
