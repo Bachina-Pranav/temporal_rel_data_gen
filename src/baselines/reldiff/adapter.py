@@ -129,6 +129,25 @@ def load_entity_ids(path: Path, primary_key: str) -> pd.DataFrame:
     return frame.reset_index(drop=True)
 
 
+def restrict_entity_tables_to_interactions(
+    source: pd.DataFrame,
+    destination: pd.DataFrame,
+    interactions: pd.DataFrame,
+    config: RelDiffDatasetConfig,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Build a row-induced entity universe for non-reportable smoke tests."""
+
+    source_ids = set(interactions[config.source_fk])
+    destination_ids = set(interactions[config.destination_fk])
+    kept_source = source.loc[source[config.source_pk].isin(source_ids)].reset_index(
+        drop=True
+    )
+    kept_destination = destination.loc[
+        destination[config.destination_pk].isin(destination_ids)
+    ].reset_index(drop=True)
+    return kept_source, kept_destination
+
+
 def prepare_training_database(
     config: RelDiffDatasetConfig,
     *,
@@ -136,6 +155,7 @@ def prepare_training_database(
     staged_name: str,
     provenance_dir: str | Path,
     max_train_rows: int | None = None,
+    restrict_entities_to_train: bool = False,
 ) -> dict[str, Any]:
     """Materialize a train-only three-table database for the upstream pipeline."""
 
@@ -157,6 +177,12 @@ def prepare_training_database(
 
     source = load_entity_ids(config.source_entity_path, config.source_pk)
     destination = load_entity_ids(config.destination_entity_path, config.destination_pk)
+    full_source_count = len(source)
+    full_destination_count = len(destination)
+    if restrict_entities_to_train:
+        source, destination = restrict_entity_tables_to_interactions(
+            source, destination, train, config
+        )
     source_domain = set(source[config.source_pk])
     destination_domain = set(destination[config.destination_pk])
     if not train[config.source_fk].isin(source_domain).all():
@@ -223,6 +249,13 @@ def prepare_training_database(
         "training_rows": int(len(train)),
         "source_entities": int(len(source)),
         "destination_entities": int(len(destination)),
+        "full_source_entity_universe": int(full_source_count),
+        "full_destination_entity_universe": int(full_destination_count),
+        "entity_universe_policy": (
+            "training-row-induced-smoke-only"
+            if restrict_entities_to_train
+            else "complete-fixed-entity-universe"
+        ),
         "text_or_surrogate_columns_included": [],
     }
     write_json(manifest, provenance_dir / "data_manifest.json")

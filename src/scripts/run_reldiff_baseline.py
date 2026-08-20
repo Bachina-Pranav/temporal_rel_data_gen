@@ -143,6 +143,7 @@ def prepare_one(
         staged_name=staged_name,
         provenance_dir=provenance,
         max_train_rows=max_rows,
+        restrict_entities_to_train=smoke,
     )
     shutil.copy2(
         config_path_for_key(config.key, experiment), provenance / "adapter_config.yaml"

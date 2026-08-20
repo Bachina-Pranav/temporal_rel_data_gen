@@ -54,6 +54,11 @@ def main() -> None:
         str(data_dir / "original" / args.dataset_name / "metadata.json")
     )
 
+    print(
+        f"[structure] loaded nodes={original.number_of_nodes():,} "
+        f"edges={original.number_of_edges():,}",
+        flush=True,
+    )
     start = time.perf_counter()
     graph = nx2gt(original)
     transformed, blocks, reverse_fk = preprocess(
@@ -62,12 +67,18 @@ def main() -> None:
         split_by_subgraphs=args.split_by_subgraphs,
         stub_tables=None,
     )
+    print(
+        f"[structure] transformed vertices={transformed.num_vertices():,} "
+        f"edges={transformed.num_edges():,}; fitting nested SBM",
+        flush=True,
+    )
     fit_start = time.perf_counter()
     state = gt.minimize_nested_blockmodel_dl(
         transformed,
         state_args={"deg_corr": True, "clabel": transformed.vp["block"]},
     )
     fit_seconds = time.perf_counter() - fit_start
+    print(f"[structure] nested SBM fit completed in {fit_seconds:.2f}s", flush=True)
     sample_start = time.perf_counter()
     generated = generate_new_graph(
         transformed,

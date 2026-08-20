@@ -17,6 +17,7 @@ from baselines.reldiff.adapter import (  # noqa: E402
     generation_validity,
     postprocess_generated_interactions,
     repeated_pair_summary,
+    restrict_entity_tables_to_interactions,
     resolve_split_labels,
 )
 from baselines.reldiff.schema import RelDiffDatasetConfig, load_dataset_config  # noqa: E402
@@ -80,6 +81,20 @@ def test_timestamp_encoding_uses_supplied_training_origin_and_round_trips():
     assert encoded["event_time"].tolist() == [0.0, 90.0]
     decoded = decode_generated_timestamp(encoded["event_time"], origin)
     assert decoded.tolist() == list(pd.to_datetime(frame["event_time"], utc=True))
+
+
+def test_smoke_entity_restriction_keeps_only_referenced_entities_in_original_order():
+    config = temporary_config(Path("unused"))
+    source = pd.DataFrame({"user_id": ["u3", "u1", "u2"]})
+    destination = pd.DataFrame({"movie_id": ["m2", "m3", "m1"]})
+    interactions = pd.DataFrame(
+        {"user_id": ["u2", "u1"], "movie_id": ["m1", "m2"]}
+    )
+    kept_source, kept_destination = restrict_entity_tables_to_interactions(
+        source, destination, interactions, config
+    )
+    assert kept_source["user_id"].tolist() == ["u1", "u2"]
+    assert kept_destination["movie_id"].tolist() == ["m2", "m1"]
 
 
 def test_repeated_pair_statistics_count_rows_not_only_extra_duplicates():
