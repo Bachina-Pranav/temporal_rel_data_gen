@@ -187,7 +187,11 @@ if structure != "original":
         transform_fk_tables=False,
     )
     dataset = dataset_from_graph(
-        G, dataset, metadata, dimension_tables=dimension_tables
+        G,
+        dataset,
+        metadata,
+        transform_fk_tables=not args.preserve_explicit_table_nodes,
+        dimension_tables=dimension_tables,
     )
     for table in dataset.node_types:
         # Set all nodes as input (target) nodes when using disjoint subgraphs.

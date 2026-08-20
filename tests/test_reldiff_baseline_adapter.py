@@ -228,7 +228,9 @@ def test_upstream_entry_points_only_add_adapter_execution_flags():
     assert "--preserve-explicit-table-nodes" in train
     assert "--preserve-explicit-table-nodes" in sample
     assert "transform_fk_tables=not args.preserve_explicit_table_nodes" in train
-    assert "transform_fk_tables=not args.preserve_explicit_table_nodes" in sample
+    assert sample.count(
+        "transform_fk_tables=not args.preserve_explicit_table_nodes"
+    ) == 2
     assert "--seed" in train and "--seed" in sample
 
 
