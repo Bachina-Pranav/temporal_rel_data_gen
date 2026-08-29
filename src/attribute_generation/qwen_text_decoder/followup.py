@@ -502,7 +502,12 @@ class QwenFollowupExperiment:
                     do_sample=bool(self.config["generation"]["do_sample"]),
                     temperature=float(policy["temperature"]),
                     top_p=float(policy["top_p"]),
-                    repetition_penalty=float(self.config["generation"]["repetition_penalty"]),
+                    repetition_penalty=float(
+                        policy.get(
+                            "repetition_penalty",
+                            self.config["generation"]["repetition_penalty"],
+                        )
+                    ),
                     eos_token_id=tokenizer.eos_token_id,
                     pad_token_id=tokenizer.pad_token_id,
                 )
@@ -534,6 +539,8 @@ class QwenFollowupExperiment:
             "conditioning": policy["conditioning"],
             "summary_mode": summary_mode,
             "diagnostic_only": True,
+            "random_seed": self.seed,
+            "seed_strategy": "reset torch CPU and all CUDA generators before each policy",
             "rows": int(len(result)),
             "seconds": elapsed,
             "rows_per_second": len(result) / elapsed,
@@ -544,7 +551,12 @@ class QwenFollowupExperiment:
             "max_new_tokens": max_new,
             "temperature": float(policy["temperature"]),
             "top_p": float(policy["top_p"]),
-            "repetition_penalty": float(self.config["generation"]["repetition_penalty"]),
+            "repetition_penalty": float(
+                policy.get(
+                    "repetition_penalty",
+                    self.config["generation"]["repetition_penalty"],
+                )
+            ),
             "parse": {
                 key: float(np.mean([flag[key] for flag in flags])) for key in flags[0]
             },
@@ -841,7 +853,13 @@ class QwenFollowupExperiment:
 
 def evaluate_text_consistency(train: pd.DataFrame, real: pd.DataFrame, frames: dict[str, pd.DataFrame], store: EmbeddingStore, model_path: str, seed: int) -> dict[str, Any]:
     from sklearn.linear_model import LogisticRegression
-    from sklearn.metrics import accuracy_score, f1_score, mean_absolute_error, roc_auc_score
+    from sklearn.metrics import (
+        accuracy_score,
+        balanced_accuracy_score,
+        f1_score,
+        mean_absolute_error,
+        roc_auc_score,
+    )
     from sklearn.pipeline import make_pipeline
     from sklearn.preprocessing import StandardScaler
 
@@ -864,6 +882,9 @@ def evaluate_text_consistency(train: pd.DataFrame, real: pd.DataFrame, frames: d
         rating_pred = rating_model.predict(emb).astype(int)
         rating[name] = {
             "accuracy": float(accuracy_score(rating_truth, rating_pred)),
+            "balanced_accuracy": float(
+                balanced_accuracy_score(rating_truth, rating_pred)
+            ),
             "macro_f1": float(f1_score(rating_truth, rating_pred, average="macro", zero_division=0)),
             "mae": float(mean_absolute_error(rating_truth, rating_pred)),
             "rows": int(len(frame)),

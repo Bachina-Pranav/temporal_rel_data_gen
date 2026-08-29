@@ -1,0 +1,74 @@
+experiment_name: qwen_text_decoder_06b_decoding_sweep
+seed: 42
+base_experiment_config: configs/experiments/qwen_text_decoder_06b.yaml
+base_output_dir: outputs/qwen_text_decoder_06b
+phase1_output_dir: outputs/qwen_text_decoder_06b/phase1
+output_dir: outputs/qwen_text_decoder_06b/decoding_sweep
+
+validation_subset:
+  split: validation
+  rows: 2000
+  selection_method: deterministic_without_replacement_sorted_source_indices
+
+generation:
+  batch_size: 32
+  do_sample: true
+  repetition_penalty: 1.05
+  policies:
+    D0_t090_p095_r105:
+      conditioning: rating_verified
+      summary_mode: generated
+      temperature: 0.90
+      top_p: 0.95
+      repetition_penalty: 1.05
+    D1_t105_p095_r105:
+      conditioning: rating_verified
+      summary_mode: generated
+      temperature: 1.05
+      top_p: 0.95
+      repetition_penalty: 1.05
+    D2_t115_p098_r110:
+      conditioning: rating_verified
+      summary_mode: generated
+      temperature: 1.15
+      top_p: 0.98
+      repetition_penalty: 1.10
+
+evaluation:
+  embedding_model: sentence-transformers/all-MiniLM-L6-v2
+  embedding_revision: 1110a243fdf4706b3f48f1d95db1a4f5529b4d41
+  max_rows_per_class: 2000
+  folds: 5
+  seed: 42
+
+memorization:
+  nearest_neighbor_training_rows: 20000
+  max_features: 50000
+
+selection:
+  substantial_macro_improvement: 0.03
+  minimum_macro_improvement: 0.015
+  minimum_review_improvement_for_joint_gate: 0.02
+  maximum_rating_macro_f1_drop: 0.03
+  maximum_rating_balanced_accuracy_drop: 0.03
+  maximum_review_length_ks_increase: 0.05
+  maximum_review_duplicate_rate_increase: 0.03
+  maximum_review_repetition_rate_increase: 0.03
+  maximum_summary_train_overlap_increase: 0.03
+  maximum_review_train_overlap_increase: 0.02
+  maximum_parse_failure_rate: 0.02
+
+confirmation:
+  expected_rows: 3982
+  generated_structured_conditions: outputs/qwen_text_decoder_06b/phase1/generated_structured_qwen/generated_structured.csv
+  baseline:
+    summary_c2st: 0.6030668899
+    review_c2st: 0.7436728715
+    macro_c2st: 0.6733698807
+
+compute_budget:
+  measured_rows_per_second: 1.8
+  validation_evaluation_minutes: 25
+  confirmation_evaluation_minutes: 15
+  target_total_hours: 2.25
+  confirmation_skip_hours: 2.5

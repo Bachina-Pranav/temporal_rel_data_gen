@@ -26,6 +26,12 @@ from attribute_generation.qwen_text_decoder.phase1 import (
     align_exact_population,
     matched_memorization_metrics,
 )
+from attribute_generation.qwen_text_decoder.decoding_sweep import (
+    POLICY_NAMES,
+    audit_phase1_metadata,
+    detailed_diversity_metrics,
+    select_decoding_configuration,
+)
 
 
 def test_serialization_excludes_ids_time_and_lengths():
@@ -264,6 +270,126 @@ def test_phase1_memorization_control_uses_matched_metrics_and_requested_quantile
             assert {"mean", "median", "p90", "p95", "max"}.issubset(
                 result[field][side]["nearest_neighbor"]
             )
+
+
+def test_decoding_sweep_config_is_exactly_the_requested_three_policies():
+    config = yaml.safe_load(
+        Path(
+            "configs/experiments/qwen_text_decoder_06b_decoding_sweep.yaml"
+        ).read_text()
+    )
+    assert tuple(config["generation"]["policies"]) == POLICY_NAMES
+    values = [
+        (
+            policy["temperature"],
+            policy["top_p"],
+            policy["repetition_penalty"],
+        )
+        for policy in config["generation"]["policies"].values()
+    ]
+    assert values == [(0.9, 0.95, 1.05), (1.05, 0.95, 1.05), (1.15, 0.98, 1.1)]
+    assert config["validation_subset"] == {
+        "split": "validation",
+        "rows": 2000,
+        "selection_method": "deterministic_without_replacement_sorted_source_indices",
+    }
+
+
+def test_decoding_diversity_uses_project_repeat_definitions():
+    real = pd.DataFrame(
+        {
+            "summary": ["one two", "three"],
+            "review_text": ["a b c", "d e"],
+        }
+    )
+    synthetic = pd.DataFrame(
+        {
+            "summary": ["same same", "same same"],
+            "review_text": ["repeat pair repeat pair", "repeat pair"],
+        }
+    )
+    metrics = detailed_diversity_metrics(real, synthetic)
+    generated = metrics["review_text"]["synthetic"]
+    assert generated["vocabulary_size"] == 2
+    assert generated["repeated_unigram_rate"] > 0
+    assert generated["repeated_bigram_rate"] > 0
+    assert generated["repeated_ngram_rate"] == generated["repeated_bigram_rate"]
+    assert metrics["summary"]["synthetic"]["exact_duplicate_rate"] == 0.5
+
+
+def test_phase1_metadata_audit_distinguishes_outputs_from_shared_metadata(tmp_path):
+    base = tmp_path / "base"
+    phase1 = base / "phase1"
+    sweep = base / "decoding_sweep"
+    (base / "oracle_structured").mkdir(parents=True)
+    (phase1 / "oracle_summary").mkdir(parents=True)
+    normal = pd.DataFrame({"summary": ["normal"], "review_text": ["normal review"]})
+    omitted = pd.DataFrame({"summary": [""], "review_text": ["omitted review"]})
+    oracle = pd.DataFrame({"summary": ["real"], "review_text": ["oracle review"]})
+    normal.to_csv(base / "oracle_structured/synthetic_text.csv", index=False)
+    normal.to_csv(phase1 / "oracle_summary/normal.csv", index=False)
+    omitted.to_csv(phase1 / "oracle_summary/no_summary.csv", index=False)
+    oracle.to_csv(phase1 / "oracle_summary/oracle_summary.csv", index=False)
+    (phase1 / "oracle_summary/generation_metrics.json").write_text(
+        json.dumps({"policy": "no_summary", "summary_mode": "omitted"})
+    )
+    (phase1 / "phase1_canonical_text_c2st.json").write_text(
+        json.dumps(
+            {
+                "normal": {"per_field": {"review_text": {"error": 0.7}}},
+                "no_summary": {"per_field": {"review_text": {"error": 0.8}}},
+            }
+        )
+    )
+    result = audit_phase1_metadata(base, phase1, sweep)
+    assert result["experimental_outputs_correct"]
+    assert result["metadata_aggregation_wrong"]
+    assert "OUTPUTS CORRECT" in result["verdict"]
+    assert (sweep / "phase1_metadata_audit.md").is_file()
+
+
+def _selection_row(name, macro, review, distinct_2=0.28, repetition=0.72):
+    return {
+        "configuration": name,
+        "macro_c2st": macro,
+        "review_c2st": review,
+        "rating_macro_f1": 0.50,
+        "rating_balanced_accuracy": 0.50,
+        "parse_failure_rate": 0.0,
+        "review_length_ks": 0.10,
+        "review_exact_duplicate_rate": 0.10,
+        "review_repeated_ngram_rate": repetition,
+        "review_distinct_2": distinct_2,
+        "summary_exact_train_overlap": 0.50,
+        "review_exact_train_overlap": 0.10,
+    }
+
+
+def test_decoding_selection_requires_clear_joint_improvement():
+    thresholds = yaml.safe_load(
+        Path(
+            "configs/experiments/qwen_text_decoder_06b_decoding_sweep.yaml"
+        ).read_text()
+    )["selection"]
+    negligible = [
+        _selection_row(POLICY_NAMES[0], 0.65, 0.74),
+        _selection_row(POLICY_NAMES[1], 0.64, 0.73, 0.30, 0.70),
+        _selection_row(POLICY_NAMES[2], 0.645, 0.735, 0.31, 0.69),
+    ]
+    assert (
+        select_decoding_configuration(negligible, thresholds)[
+            "selected_configuration"
+        ]
+        == POLICY_NAMES[0]
+    )
+    clear = [
+        _selection_row(POLICY_NAMES[0], 0.65, 0.74),
+        _selection_row(POLICY_NAMES[1], 0.61, 0.70, 0.31, 0.68),
+        _selection_row(POLICY_NAMES[2], 0.63, 0.72, 0.32, 0.67),
+    ]
+    decision = select_decoding_configuration(clear, thresholds)
+    assert decision["selected_configuration"] == POLICY_NAMES[1]
+    assert decision["clearly_preferable_to_D0"]
 
 
 def test_phase1_config_has_exactly_three_fresh_qwen_generation_policies():

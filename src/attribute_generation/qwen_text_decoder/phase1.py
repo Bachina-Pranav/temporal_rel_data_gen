@@ -710,6 +710,21 @@ class QwenPhase1Experiment(QwenFollowupExperiment):
         base_metrics = self.base_output / "oracle_structured/generation_metrics.json"
         if base_metrics.is_file():
             hardlink_or_copy(base_metrics, normal_destination.parent / "generation_metrics.json")
+            normal_metrics = json.loads(base_metrics.read_text())
+            normal_metrics.update(
+                {
+                    "policy": "normal",
+                    "conditioning": "rating_verified",
+                    "summary_mode": "generated",
+                    "reused_from": str(
+                        self.base_output / "oracle_structured/synthetic_text.csv"
+                    ),
+                    "output_sha256": file_sha256(normal_destination),
+                }
+            )
+            write_json(
+                self.output / "generation_metrics/normal.json", normal_metrics
+            )
 
         adapter = self.base_output / "training/best_adapter"
         tokenizer = AutoTokenizer.from_pretrained(adapter, local_files_only=True)
@@ -815,12 +830,29 @@ class QwenPhase1Experiment(QwenFollowupExperiment):
         gain = float(review_scores["normal"] - review_scores["oracle_summary"])
         generation_metrics = {}
         for name in ("normal", "oracle_summary", "no_summary"):
-            path = (
-                self.output / "oracle_summary/generation_metrics.json"
-                if name == "normal"
-                else self.output / "generation_metrics" / f"{name}.json"
+            path = self.output / "generation_metrics" / f"{name}.json"
+            if name == "normal" and not path.is_file():
+                base_metrics = self.base_output / "oracle_structured/generation_metrics.json"
+                normal_csv = self.output / "oracle_summary/normal.csv"
+                if base_metrics.is_file() and normal_csv.is_file():
+                    repaired = json.loads(base_metrics.read_text())
+                    repaired.update(
+                        {
+                            "policy": "normal",
+                            "conditioning": "rating_verified",
+                            "summary_mode": "generated",
+                            "reused_from": str(
+                                self.base_output
+                                / "oracle_structured/synthetic_text.csv"
+                            ),
+                            "output_sha256": file_sha256(normal_csv),
+                            "metadata_reconstructed_without_regeneration": True,
+                        }
+                    )
+                    write_json(path, repaired)
+            generation_metrics[name] = (
+                json.loads(path.read_text()) if path.is_file() else {}
             )
-            generation_metrics[name] = json.loads(path.read_text()) if path.is_file() else {}
         oracle_summary_result = {
             "review_c2st": review_scores,
             "oracle_summary_gain": gain,
