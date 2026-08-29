@@ -69,6 +69,9 @@ def test_offline_preflight_records_exact_frozen_split_hashes(tmp_path):
 
 def test_huggingface_runtime_is_fully_pinned():
     assert REQUIRED_RUNTIME_VERSIONS == {
+        "torch": "2.2.2",
+        "torchvision": "0.17.2",
+        "torchaudio": "2.2.2",
         "transformers": "4.51.3",
         "tokenizers": "0.21.1",
         "peft": "0.15.2",

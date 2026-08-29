@@ -40,6 +40,9 @@ PREFIX_TEMPLATE = "Rating: {rating}\nVerified: {verified}\n"
 OUTPUT_TEMPLATE = "Summary: {summary}\nReview: {review_text}"
 ALIGNMENT_COLUMNS = ("customer_id", "product_id", "review_time")
 REQUIRED_RUNTIME_VERSIONS = {
+    "torch": "2.2.2",
+    "torchvision": "0.17.2",
+    "torchaudio": "2.2.2",
     "transformers": "4.51.3",
     "tokenizers": "0.21.1",
     "peft": "0.15.2",
@@ -57,11 +60,15 @@ def validate_runtime_dependencies() -> dict[str, str]:
         except importlib_metadata.PackageNotFoundError:
             actual = "missing"
         installed[package] = actual
-        if actual != required:
+        normalized_actual = actual.split("+", 1)[0]
+        if normalized_actual != required:
             mismatches.append(f"{package}=={required} (installed: {actual})")
     if mismatches:
-        command = "pip install --upgrade --force-reinstall " + " ".join(
-            f"'{package}=={version}'" for package, version in REQUIRED_RUNTIME_VERSIONS.items()
+        command = (
+            "pip install --upgrade "
+            "torch==2.2.2 torchvision==0.17.2 torchaudio==2.2.2 "
+            "--index-url https://download.pytorch.org/whl/cu121\n"
+            "pip install -e '.[qwen]'"
         )
         raise RuntimeError(
             "Incompatible Qwen experiment runtime:\n- "

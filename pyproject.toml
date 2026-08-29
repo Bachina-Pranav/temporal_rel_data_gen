@@ -26,7 +26,14 @@ dependencies = [
   "relbench[full]",
   "tomli==2.0.1",
   "syntheval",
-  "sentence-transformers==2.7.0",
+  "sentence-transformers==2.7.0"
+]
+
+[project.optional-dependencies]
+qwen = [
+  "torch==2.2.2",
+  "torchvision==0.17.2",
+  "torchaudio==2.2.2",
   "transformers==4.51.3",
   "tokenizers==0.21.1",
   "peft==0.15.2",
