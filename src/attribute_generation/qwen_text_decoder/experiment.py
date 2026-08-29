@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import csv
 import hashlib
+try:
+    from importlib import metadata as importlib_metadata
+except ImportError:  # pragma: no cover - compatibility for legacy dev shells
+    import importlib_metadata
 import json
 import math
 import os
@@ -35,6 +39,36 @@ from evaluation.text_c2st_audit import (
 PREFIX_TEMPLATE = "Rating: {rating}\nVerified: {verified}\n"
 OUTPUT_TEMPLATE = "Summary: {summary}\nReview: {review_text}"
 ALIGNMENT_COLUMNS = ("customer_id", "product_id", "review_time")
+REQUIRED_RUNTIME_VERSIONS = {
+    "transformers": "4.51.3",
+    "tokenizers": "0.21.1",
+    "peft": "0.15.2",
+    "accelerate": "1.6.0",
+    "huggingface-hub": "0.30.2",
+}
+
+
+def validate_runtime_dependencies() -> dict[str, str]:
+    installed: dict[str, str] = {}
+    mismatches = []
+    for package, required in REQUIRED_RUNTIME_VERSIONS.items():
+        try:
+            actual = importlib_metadata.version(package)
+        except importlib_metadata.PackageNotFoundError:
+            actual = "missing"
+        installed[package] = actual
+        if actual != required:
+            mismatches.append(f"{package}=={required} (installed: {actual})")
+    if mismatches:
+        command = "pip install --upgrade --force-reinstall " + " ".join(
+            f"'{package}=={version}'" for package, version in REQUIRED_RUNTIME_VERSIONS.items()
+        )
+        raise RuntimeError(
+            "Incompatible Qwen experiment runtime:\n- "
+            + "\n- ".join(mismatches)
+            + f"\nInstall the pinned stack with:\n{command}"
+        )
+    return installed
 
 
 def normalize_rating(value: Any) -> str:
@@ -278,6 +312,7 @@ class QwenTextExperiment:
         return result
 
     def train(self, device: str = "cuda") -> dict[str, Any]:
+        runtime_versions = validate_runtime_dependencies()
         from peft import LoraConfig, TaskType, get_peft_model
         from torch.utils.data import Dataset
         from transformers import AutoModelForCausalLM, AutoTokenizer, EarlyStoppingCallback, Trainer, TrainerCallback, TrainingArguments
@@ -372,11 +407,13 @@ class QwenTextExperiment:
         observed_tokens = sum(len(item["input_ids"]) for item in train_dataset.items) * completed_epochs
         peak_vram = max((row["peak_vram_bytes"] for row in epoch_runtime), default=int(torch.cuda.max_memory_allocated()) if torch.cuda.is_available() else 0)
         efficiency = {"model_id": source["model_id"], "revision": source["revision"], "license": source["license"], "preprocessing_seconds": preflight.get("elapsed_seconds"), "model_load_seconds": model_load_seconds, "tokenization_seconds": tokenization_seconds, "training_seconds": training_seconds, "completed_epochs": completed_epochs, "seconds_per_epoch": training_seconds / completed_epochs, "examples_per_second": result.metrics.get("train_samples_per_second"), "tokens_per_second": observed_tokens / training_seconds, "peak_gpu_memory_bytes": peak_vram, "gpu_model": torch.cuda.get_device_name() if torch.cuda.is_available() else None, "total_parameters": total, "trainable_parameters": trainable, "trainable_fraction": trainable / total, "lora_rank": int(lora["lora_rank"]), "lora_alpha": int(lora["lora_alpha"]), "target_modules": target_modules, "chosen_max_length": max_length, "length_statistics": length_stats}
+        efficiency["runtime_versions"] = runtime_versions
         write_json(out / "training_efficiency.json", efficiency)
         write_json(out / "config.json", self.config)
         return efficiency
 
     def generate(self, mode: str, device: str = "cuda") -> dict[str, Any]:
+        validate_runtime_dependencies()
         from peft import AutoPeftModelForCausalLM
         from transformers import AutoTokenizer
         if mode not in {"oracle_structured", "generated_structured"}: raise ValueError(mode)
@@ -430,6 +467,7 @@ class QwenTextExperiment:
         return max(16, int(stats_["combined"]["p99"]) - prefix)
 
     def evaluate(self, mode: str, device: str = "cuda") -> dict[str, Any]:
+        validate_runtime_dependencies()
         real = pd.read_csv(self.benchmark / "test_real.csv", low_memory=False)
         synthetic = pd.read_csv(self.output_dir / mode / "synthetic_text.csv", low_memory=False)
         evaluation = self.config["evaluation"]

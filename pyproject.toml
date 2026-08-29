@@ -27,10 +27,11 @@ dependencies = [
   "tomli==2.0.1",
   "syntheval",
   "sentence-transformers==2.7.0",
-  "transformers>=4.51,<5",
-  "peft>=0.14,<1",
-  "accelerate>=1.2,<2",
-  "huggingface-hub>=0.27,<1"
+  "transformers==4.51.3",
+  "tokenizers==0.21.1",
+  "peft==0.15.2",
+  "accelerate==1.6.0",
+  "huggingface-hub==0.30.2"
 ]
 
 [project.urls]

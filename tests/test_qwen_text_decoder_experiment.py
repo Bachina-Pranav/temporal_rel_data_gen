@@ -11,6 +11,7 @@ from attribute_generation.qwen_text_decoder.experiment import (
     parse_generated_text,
     serialize_example,
     QwenTextExperiment,
+    REQUIRED_RUNTIME_VERSIONS,
 )
 
 
@@ -64,3 +65,13 @@ def test_offline_preflight_records_exact_frozen_split_hashes(tmp_path):
     assert report["row_counts"] == {"train": 1, "validation": 1, "test": 1}
     assert all(len(item["sha256"]) == 64 for item in report["splits"].values())
     assert (output / "preflight.md").is_file()
+
+
+def test_huggingface_runtime_is_fully_pinned():
+    assert REQUIRED_RUNTIME_VERSIONS == {
+        "transformers": "4.51.3",
+        "tokenizers": "0.21.1",
+        "peft": "0.15.2",
+        "accelerate": "1.6.0",
+        "huggingface-hub": "0.30.2",
+    }
