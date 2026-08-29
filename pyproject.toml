@@ -26,7 +26,11 @@ dependencies = [
   "relbench[full]",
   "tomli==2.0.1",
   "syntheval",
-  "sentence-transformers==2.7.0"
+  "sentence-transformers==2.7.0",
+  "transformers>=4.51,<5",
+  "peft>=0.14,<1",
+  "accelerate>=1.2,<2",
+  "huggingface-hub>=0.27,<1"
 ]
 
 [project.urls]

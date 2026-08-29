@@ -1,0 +1,52 @@
+experiment_name: qwen_text_decoder_06b
+seed: 42
+output_dir: outputs/qwen_text_decoder_06b
+
+model:
+  model_id: Qwen/Qwen3-0.6B-Base
+  revision: resolve-and-pin
+  trust_remote_code: false
+  lora_rank: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+
+data:
+  amazon_config: configs/attribute_generation/conditional_tabdlm_amazon_toy_hierarchical_v41.yaml
+  benchmark_dir: outputs/amazon-toy/hierarchical_diffusion_benchmark
+  structured_candidates:
+    - outputs/architecture_finalization/transfer/amazon_toy/M2_global_support/runs/seed_42/samples/synthetic_interactions.csv
+    - outputs/amazon-toy/conditional_tabdlm_hierarchical_v41/synthetic_review_attrs_full.csv
+  lstm_candidates:
+    - outputs/amazon-toy/lstm_m2_global_support/runs/seed_42/samples/synthetic_interactions.csv
+    - outputs/amazon-toy/conditional_tabdlm_exp5_3_lstm_length_preserving_privacy_sampler/runs/v53_length_preserving_exact_block/synthetic_review_attrs.csv
+  diffusion_text_candidates:
+    - outputs/amazon-toy/conditional_tabdlm_hierarchical_v41/synthetic_review_attrs_full.csv
+
+training:
+  epochs: 5
+  train_batch_size: 8
+  eval_batch_size: 8
+  gradient_accumulation_steps: 8
+  learning_rate: 0.0002
+  weight_decay: 0.01
+  warmup_ratio: 0.03
+  early_stopping_patience: 2
+  max_length_coverage: 0.99
+  dataloader_num_workers: 4
+  gradient_checkpointing: true
+  bf16: true
+
+generation:
+  batch_size: 32
+  do_sample: true
+  temperature: 0.9
+  top_p: 0.95
+  repetition_penalty: 1.05
+  max_new_tokens: data-derived
+
+evaluation:
+  embedding_model: sentence-transformers/all-MiniLM-L6-v2
+  embedding_revision: require-local-pinned-snapshot
+  max_rows_per_class: 50000
+  folds: 5
+  seed: 42
