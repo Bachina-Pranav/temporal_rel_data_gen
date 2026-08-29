@@ -1,0 +1,96 @@
+session:
+  output_dir: outputs/overnight_8h_session
+  duration_hours: 8.0
+  monitor_interval_seconds: 300
+  heartbeat_interval_seconds: 60
+  process_poll_seconds: 15
+  minimum_free_disk_gb: 5.0
+  transient_retry_limit: 1
+
+# The watchdog discovers these entry points in order. Missing entry points are
+# reported as blocked; it never substitutes a different scientific experiment.
+jobs:
+  relational_prefix_probe:
+    entrypoints:
+      - src/scripts/run_qwen_relational_prefix_probe.py
+      - src/scripts/run_qwen_text_decoder_relational_prefix_probe.py
+    arguments: [--stage, all, --device, "{device}", --skip-existing]
+    timeout_minutes: 200
+    estimated_minutes: 180
+    checkpointable: true
+    gpu_job: true
+    output_dir: outputs/qwen_text_decoder_06b/relational_prefix_probe
+    decision_files:
+      - outputs/qwen_text_decoder_06b/relational_prefix_probe/relational_decision.json
+      - outputs/qwen_text_decoder_06b/relational_prefix_probe/decision.json
+    completion_files:
+      - outputs/qwen_text_decoder_06b/relational_prefix_probe/relational_decision.json
+
+  relational_prefix_full:
+    entrypoints:
+      - src/scripts/run_qwen_relational_prefix_full.py
+      - src/scripts/run_qwen_text_decoder_relational_prefix_full.py
+    arguments: [--stage, all, --device, "{device}", --max-epochs, "2", --skip-existing]
+    one_epoch_arguments: [--stage, all, --device, "{device}", --max-epochs, "1", --skip-existing]
+    timeout_minutes: 220
+    estimated_minutes: 210
+    one_epoch_estimated_minutes: 110
+    checkpointable: true
+    gpu_job: true
+    output_dir: outputs/qwen_text_decoder_06b/relational_prefix_full
+
+  qwen_capacity_probe:
+    entrypoints:
+      - src/scripts/run_qwen_capacity_probe.py
+      - src/scripts/run_qwen_text_decoder_capacity_probe.py
+    arguments: [--stage, all, --device, "{device}", --skip-existing]
+    timeout_minutes: 180
+    estimated_minutes: 170
+    checkpointable: true
+    gpu_job: true
+    output_dir: outputs/qwen_capacity_probe
+
+  clavaddpm:
+    entrypoints:
+      - src/scripts/run_clavaddpm_movielens_baseline.py
+      - src/scripts/run_clavaddpm_baseline.py
+    common_arguments: [--dataset, movielens_100k, --device, "{device}", --skip-existing]
+    output_dir: outputs/baselines/clavaddpm/movielens
+    preflight:
+      arguments: [--stage, preflight]
+      timeout_minutes: 30
+      estimated_minutes: 20
+      gpu_job: false
+    smoke:
+      arguments: [--stage, smoke]
+      timeout_minutes: 60
+      estimated_minutes: 40
+      gpu_job: true
+    full:
+      arguments: [--stage, full]
+      timeout_minutes: 180
+      estimated_minutes: 120
+      checkpointable: true
+      gpu_job: true
+
+  pending_canonical_evaluation:
+    entrypoints:
+      - src/scripts/run_overnight_pending_canonical_evaluations.py
+    arguments: [--device, "{device}", --skip-existing]
+    timeout_minutes: 45
+    estimated_minutes: 30
+    gpu_job: false
+
+  repeated_seed_c2st:
+    entrypoints:
+      - src/scripts/run_cached_text_c2st_seed_robustness.py
+    arguments: [--seeds, "17", "42", "73", "101", "137", --device, "{device}", --skip-existing]
+    timeout_minutes: 60
+    estimated_minutes: 45
+    gpu_job: false
+
+artifact_roots:
+  - outputs/qwen_text_decoder_06b/relational_prefix_probe
+  - outputs/qwen_text_decoder_06b/relational_prefix_full
+  - outputs/qwen_capacity_probe
+  - outputs/baselines/clavaddpm/movielens
