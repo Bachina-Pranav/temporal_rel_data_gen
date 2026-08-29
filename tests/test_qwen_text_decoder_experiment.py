@@ -13,6 +13,13 @@ from attribute_generation.qwen_text_decoder.experiment import (
     QwenTextExperiment,
     REQUIRED_RUNTIME_VERSIONS,
 )
+from attribute_generation.qwen_text_decoder.followup import (
+    build_prompt,
+    discover_diffusion_artifacts,
+    parse_policy_continuation,
+    select_fixed_subset,
+    trim_generated_ids,
+)
 
 
 def test_serialization_excludes_ids_time_and_lengths():
@@ -78,3 +85,76 @@ def test_huggingface_runtime_is_fully_pinned():
         "accelerate": "1.6.0",
         "huggingface-hub": "0.30.2",
     }
+
+
+def test_followup_prompts_exclude_ids_time_and_lengths():
+    row = pd.Series(
+        {
+            "customer_id": 99,
+            "product_id": 44,
+            "review_time": "2020-01-01",
+            "rating": 2,
+            "verified": True,
+            "summary": "short summary",
+            "review_text_length": 800,
+        }
+    )
+    oracle = build_prompt(row, "rating_verified", "oracle")
+    assert oracle == "Rating: 2\nVerified: true\nSummary: short summary\nReview:"
+    assert "99" not in oracle and "2020" not in oracle and "800" not in oracle
+    assert build_prompt(row, "none", "generated") == "Summary:"
+    assert build_prompt(row, "rating", "generated") == "Rating: 2\nSummary:"
+    assert build_prompt(row, "verified", "generated") == "Verified: true\nSummary:"
+
+
+def test_followup_parser_supports_generated_oracle_and_omitted_summary():
+    summary, review, status = parse_policy_continuation(
+        "A useful item. Review: It worked well.", summary_mode="generated"
+    )
+    assert (summary, review) == ("A useful item.", "It worked well.")
+    assert not status["parse_failure"]
+    summary, review, status = parse_policy_continuation(
+        "It worked well.", summary_mode="oracle", oracle_summary="Useful"
+    )
+    assert (summary, review) == ("Useful", "It worked well.")
+    summary, review, _ = parse_policy_continuation(
+        "It worked well.", summary_mode="omitted"
+    )
+    assert (summary, review) == ("", "It worked well.")
+    assert trim_generated_ids([10, 11, 2, 2, 2], 2) == [10, 11, 2]
+    assert trim_generated_ids([10, 11], 2) == [10, 11]
+
+
+def test_followup_subset_uses_complete_small_validation_and_seeded_large_sample():
+    small = pd.DataFrame({"value": range(3982)})
+    subset, metadata = select_fixed_subset(
+        small, target_rows=5000, maximum_rows=10000, seed=42
+    )
+    assert len(subset) == 3982
+    assert subset["_source_row_index"].tolist() == list(range(3982))
+    assert "complete frozen validation split" in metadata["selection_reason"]
+    large = pd.DataFrame({"value": range(6000)})
+    first, _ = select_fixed_subset(large, target_rows=5000, maximum_rows=10000, seed=42)
+    second, _ = select_fixed_subset(large, target_rows=5000, maximum_rows=10000, seed=42)
+    assert first["_source_row_index"].tolist() == second["_source_row_index"].tolist()
+    assert first["_source_row_index"].is_monotonic_increasing
+
+
+def test_followup_diffusion_discovery_requires_complete_latest_root(tmp_path):
+    older = tmp_path / "diagnostics" / "older"
+    newer = tmp_path / "diagnostics" / "newer"
+    for root in (older, newer):
+        for index, label in enumerate(("O1", "O2", "O3", "O4"), start=1):
+            run = root / f"{index:03d}_{label}_seed42"
+            run.mkdir(parents=True)
+            (run / "synthetic_table.csv").write_text("summary,review_text\na,b\n")
+            (run / "run_manifest.json").write_text(
+                json.dumps({"status": "completed", "label": label, "seed": 42})
+            )
+    newer.touch()
+    selected, artifacts = discover_diffusion_artifacts(
+        [tmp_path / "diagnostics"], ["O1", "O2", "O3", "O4"]
+    )
+    assert selected == newer
+    assert {item["label"] for item in artifacts} == {"O1", "O2", "O3", "O4"}
+    assert all("description" in item["conditioning"] for item in artifacts)

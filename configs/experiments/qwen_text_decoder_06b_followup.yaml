@@ -1,0 +1,45 @@
+experiment_name: qwen_text_decoder_06b_followup
+seed: 42
+base_experiment_config: configs/experiments/qwen_text_decoder_06b.yaml
+base_output_dir: outputs/qwen_text_decoder_06b
+output_dir: outputs/qwen_text_decoder_06b/followup
+
+evaluation_subset:
+  split: validation
+  target_rows: 5000
+  maximum_rows: 10000
+
+generation:
+  batch_size: 32
+  repetition_penalty: 1.05
+  do_sample: true
+  policies:
+    normal: {conditioning: rating_verified, summary_mode: generated, temperature: 0.9, top_p: 0.95}
+    oracle_summary: {conditioning: rating_verified, summary_mode: oracle, temperature: 0.9, top_p: 0.95}
+    no_summary: {conditioning: rating_verified, summary_mode: omitted, temperature: 0.9, top_p: 0.95}
+    B0_none: {conditioning: none, summary_mode: generated, temperature: 0.9, top_p: 0.95}
+    B1_rating: {conditioning: rating, summary_mode: generated, temperature: 0.9, top_p: 0.95}
+    B2_verified: {conditioning: verified, summary_mode: generated, temperature: 0.9, top_p: 0.95}
+    temp07_p090: {reuse: normal, temperature: 0.7, top_p: 0.90}
+    temp09_p095: {reuse: normal, temperature: 0.9, top_p: 0.95}
+    temp11_p095: {reuse: normal, temperature: 1.1, top_p: 0.95}
+
+evaluation:
+  embedding_model: sentence-transformers/all-MiniLM-L6-v2
+  embedding_revision: require-local-pinned-snapshot
+  max_rows_per_class: 50000
+  folds: 5
+  seed: 42
+
+diffusion_oracle:
+  roots:
+    - outputs/amazon-toy/hierarchical_diffusion_diagnostics
+  labels: [O1, O2, O3, O4]
+  preferred_seed: 42
+
+compute_budget:
+  main_suite_gpu_hours: 3.0
+  model_scaling_probe_in_main_suite: false
+  scaling_trigger_macro_c2st_min: 0.55
+  scaling_trigger_macro_c2st_max: 0.70
+
