@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-import pandas as pd
 import json
+from pathlib import Path
+
+import pandas as pd
 import yaml
 
 from attribute_generation.qwen_text_decoder.experiment import (
@@ -19,6 +21,10 @@ from attribute_generation.qwen_text_decoder.followup import (
     parse_policy_continuation,
     select_fixed_subset,
     trim_generated_ids,
+)
+from attribute_generation.qwen_text_decoder.phase1 import (
+    align_exact_population,
+    matched_memorization_metrics,
 )
 
 
@@ -188,3 +194,97 @@ def test_followup_does_not_require_unavailable_generated_structured_mode(tmp_pat
 
     required = QwenFollowupExperiment(followup_path)._required_base_artifacts()
     assert not any("generated_structured" in str(path) for path in required)
+
+
+def test_phase1_alignment_reorders_exact_heldout_multiset_without_positional_slice():
+    real = pd.DataFrame(
+        {
+            "customer_id": [1, 2, 1],
+            "product_id": [9, 8, 9],
+            "review_time": ["2020-01-01", "2020-01-02", "2020-01-01"],
+        }
+    )
+    candidate = real.assign(
+        summary=["first", "middle", "second"],
+        review_text=["a", "b", "c"],
+    ).iloc[[2, 0, 1]].reset_index(drop=True)
+    aligned, audit = align_exact_population(real, candidate)
+    assert audit["aligned"]
+    assert not audit["positional_slice_used"]
+    assert audit["reference_duplicate_key_groups"] == 1
+    assert aligned.summary.tolist() == ["second", "middle", "first"]
+
+
+def test_phase1_full_table_alignment_locates_test_rows_from_verified_real_identity():
+    full_real = pd.DataFrame(
+        {
+            "customer_id": [1, 1, 2],
+            "product_id": [9, 9, 8],
+            "review_time": ["2020-01-01", "2020-01-01", "2020-01-02"],
+            "rating": [1, 5, 3],
+            "verified": [False, True, True],
+            "summary": ["bad", "good", "fine"],
+            "review_text": ["failed", "worked", "okay"],
+        }
+    )
+    reference = full_real.iloc[[1, 2]].reset_index(drop=True)
+    candidate = full_real[["customer_id", "product_id", "review_time"]].copy()
+    candidate["summary"] = ["synthetic row zero", "synthetic row one", "synthetic row two"]
+    candidate["review_text"] = ["zero", "one", "two"]
+    aligned, audit = align_exact_population(
+        reference, candidate, full_reference=full_real
+    )
+    assert audit["aligned"]
+    assert audit["full_table_ordered_key_match"]
+    assert audit["real_target_content_used_only_for_source_row_location"]
+    assert aligned.summary.tolist() == ["synthetic row one", "synthetic row two"]
+
+
+def test_phase1_memorization_control_uses_matched_metrics_and_requested_quantiles():
+    train = pd.DataFrame(
+        {
+            "summary": ["same", "different title"],
+            "review_text": ["works very well", "failed quickly"],
+        }
+    )
+    real = pd.DataFrame(
+        {"summary": ["same", "new"], "review_text": ["works well", "brand new"]}
+    )
+    qwen = pd.DataFrame(
+        {
+            "summary": ["same", "same"],
+            "review_text": ["works very well", "works well"],
+        }
+    )
+    result = matched_memorization_metrics(train, real, qwen, training_rows=20)
+    assert result["summary"]["real_heldout"]["exact_train_overlap_rate"] == 0.5
+    assert result["summary"]["qwen"]["exact_train_overlap_rate"] == 1.0
+    for field in ("summary", "review_text"):
+        for side in ("real_heldout", "qwen"):
+            assert {"mean", "median", "p90", "p95", "max"}.issubset(
+                result[field][side]["nearest_neighbor"]
+            )
+
+
+def test_phase1_config_has_exactly_three_fresh_qwen_generation_policies():
+    config = yaml.safe_load(
+        (Path(__file__).resolve().parents[1]
+         / "configs/experiments/qwen_text_decoder_06b_phase1.yaml").read_text()
+    )
+    assert set(config["generation"]["policies"]) == {
+        "oracle_summary",
+        "no_summary",
+        "generated_structured",
+    }
+    assert config["compute_budget"]["fresh_qwen_generations"] == 3
+    projected = (
+        config["evaluation_population"]["expected_rows"]
+        * config["compute_budget"]["fresh_qwen_generations"]
+        / config["compute_budget"]["measured_qwen_rows_per_second"]
+        / 3600
+        + config["compute_budget"]["estimated_non_generation_gpu_hours"]
+    )
+    assert projected < config["compute_budget"]["hard_gpu_hours"]
+    assert config["evaluation"]["embedding_revision"] == (
+        "1110a243fdf4706b3f48f1d95db1a4f5529b4d41"
+    )

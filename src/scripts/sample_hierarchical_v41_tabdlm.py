@@ -67,6 +67,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--debug-write-aux-targets", action="store_true")
+    parser.add_argument(
+        "--structured-only",
+        action="store_true",
+        help="Generate structured categorical attributes without running the text stage.",
+    )
     return parser.parse_args()
 
 
@@ -101,6 +106,7 @@ def main() -> None:
         oracle_length_columns=args.oracle_length_columns,
         graph_history_prefix_path=args.graph_history_prefix,
         decoding_policy=args.decoding_policy,
+        structured_only=args.structured_only,
     )
 
 

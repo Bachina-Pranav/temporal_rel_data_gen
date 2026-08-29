@@ -1,0 +1,72 @@
+experiment_name: qwen_text_decoder_06b_phase1
+seed: 42
+base_experiment_config: configs/experiments/qwen_text_decoder_06b.yaml
+base_output_dir: outputs/qwen_text_decoder_06b
+output_dir: outputs/qwen_text_decoder_06b/phase1
+
+evaluation_population:
+  split: test
+  expected_rows: 3982
+  full_real_table: data/original/rel-amazon-toy/review.csv
+
+same_subset_candidates:
+  lstm:
+    - outputs/amazon-toy/lstm_m2_global_support/runs/seed_42/samples/synthetic_interactions.csv
+    - outputs/amazon-toy/conditional_tabdlm_exp5_3_lstm_length_preserving_privacy_sampler/runs/v53_length_preserving_exact_block/synthetic_review_attrs.csv
+  masked_diffusion:
+    - outputs/amazon-toy/conditional_tabdlm_hierarchical_v41/synthetic_review_attrs_full.csv
+
+structured_diffusion:
+  config: configs/attribute_generation/conditional_tabdlm_amazon_toy_hierarchical_v41.yaml
+  checkpoint: outputs/amazon-toy/conditional_tabdlm_hierarchical_v41/checkpoints/best.pt
+  batch_size: 64
+  structured_steps: 10
+  timestep_spacing: uniform
+  inference_dtype: float32
+  graph_mode: correct
+  temperature: 0.9
+
+generation:
+  batch_size: 32
+  do_sample: true
+  repetition_penalty: 1.05
+  policies:
+    oracle_summary:
+      conditioning: rating_verified
+      summary_mode: oracle
+      temperature: 0.9
+      top_p: 0.95
+    no_summary:
+      conditioning: rating_verified
+      summary_mode: omitted
+      temperature: 0.9
+      top_p: 0.95
+    generated_structured:
+      conditioning: rating_verified
+      summary_mode: generated
+      temperature: 0.9
+      top_p: 0.95
+
+evaluation:
+  embedding_model: sentence-transformers/all-MiniLM-L6-v2
+  embedding_revision: 1110a243fdf4706b3f48f1d95db1a4f5529b4d41
+  max_rows_per_class: 50000
+  folds: 5
+  seed: 42
+
+diffusion_oracle:
+  roots:
+    - outputs/amazon-toy/hierarchical_diffusion_diagnostics
+  required_labels: [O1, O2, O3, O4]
+  optional_labels: [O5]
+
+memorization:
+  nearest_neighbor_training_rows: 20000
+  max_features: 50000
+
+compute_budget:
+  measured_qwen_rows_per_second: 1.8
+  fresh_qwen_generations: 3
+  estimated_non_generation_gpu_hours: 0.5
+  target_gpu_hours: 2.5
+  hard_gpu_hours: 3.0

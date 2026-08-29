@@ -154,6 +154,40 @@ def test_hierarchical_sampling_generates_requested_rows_and_valid_domains():
     assert attrs["_sampling_diagnostics"]["uses_generated_structured_attributes_for_text"] is True
 
 
+def test_structured_only_sampling_skips_all_text_forward_passes():
+    frame, schema, raw, config, vocabs, tokenizer, model = fixture()
+    attrs = hierarchical_sample_attributes(
+        model=model,
+        config=config,
+        plan=generation_plan_from_config(raw, schema),
+        categorical_vocabs=vocabs,
+        tokenizer=tokenizer,
+        spine=frame[["customer_id", "product_id", "review_time"]],
+        batch_size=2,
+        temperature=1.0,
+        top_p=1.0,
+        text_top_k=4,
+        device="cpu",
+        seed=7,
+        structured_steps=2,
+        text_steps=2,
+        timestep_spacing="uniform",
+        inference_dtype="float32",
+        graph_encoder=None,
+        graph_history_index=None,
+        graph_mode_override="no_graph",
+        structured_only=True,
+    )
+    assert len(attrs["rating"]) == len(frame)
+    assert "summary" not in attrs
+    assert "review_text" not in attrs
+    diagnostics = attrs["_sampling_diagnostics"]
+    assert diagnostics["structured_only"] is True
+    assert diagnostics["text_steps"] == 0
+    assert diagnostics["text_forward_passes_total"] == 0
+    assert diagnostics["uses_generated_structured_attributes_for_text"] is False
+
+
 def test_text_logits_change_when_structured_conditioning_changes():
     frame, schema, _, _, vocabs, tokenizer, model = fixture()
     foreign_key_ids, datetime_values = encode_conditions(frame.head(1), schema, 64, "cpu")

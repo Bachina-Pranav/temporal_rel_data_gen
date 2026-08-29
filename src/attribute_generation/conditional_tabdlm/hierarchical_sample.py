@@ -98,6 +98,7 @@ def hierarchical_sample_from_config(
     oracle_length_columns: list[str] | tuple[str, ...] | None = None,
     graph_history_prefix_path: str | Path | None = None,
     decoding_policy: str | None = None,
+    structured_only: bool = False,
 ) -> Path:
     sampling = config.raw.get("sampling", {})
     diffusion = config.raw.get("diffusion", {})
@@ -258,6 +259,7 @@ def hierarchical_sample_from_config(
         oracle_conditions=oracle_conditions,
         decoding_policy=decoding_policy,
         profiler=profiler,
+        structured_only=structured_only,
     )
 
     output = spine.loc[:, list(ckpt_config.schema.condition_columns)].copy()
@@ -266,8 +268,9 @@ def hierarchical_sample_from_config(
     if debug_write_aux_targets:
         for column in ckpt_config.schema.auxiliary_categorical_targets:
             output[column] = attrs[column]
-    for column in ckpt_config.schema.text_targets:
-        output[column] = attrs[column]
+    if not structured_only:
+        for column in ckpt_config.schema.text_targets:
+            output[column] = attrs[column]
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with profile_timer(profiler, "csv_writing_seconds"):
@@ -304,6 +307,7 @@ def hierarchical_sample_from_config(
         "output_path": str(output_path),
         "num_rows": int(len(output)),
         "generation_plan": plan.to_dict(),
+        "structured_only": bool(structured_only),
         "valid_generative_baseline": (
             condition_spec.valid_generative_baseline
             if condition_spec is not None
@@ -339,7 +343,7 @@ def hierarchical_sample_from_config(
             "minimum_text_content_tokens", {}
         ),
         "structured_steps": int(structured_steps),
-        "text_steps": int(text_steps),
+        "text_steps": 0 if structured_only else int(text_steps),
         "timestep_spacing": timestep_spacing,
         "text_top_k": text_top_k,
         "temperature": temperature,
@@ -349,10 +353,14 @@ def hierarchical_sample_from_config(
         "batch_size": batch_size,
         "inference_dtype": inference_dtype,
         "runtime_profile_path": str(runtime_output) if profiler.enabled or profile_output is not None else None,
-        "uses_generated_structured_attributes_for_text": not bool(
-            oracle_conditions is not None
-            and set(ckpt_config.schema.categorical_targets).issubset(
-                oracle_conditions.structured_columns
+        "uses_generated_structured_attributes_for_text": (
+            False
+            if structured_only
+            else not bool(
+                oracle_conditions is not None
+                and set(ckpt_config.schema.categorical_targets).issubset(
+                    oracle_conditions.structured_columns
+                )
             )
         ),
         "text_conditioning_tokens_maskable": False,
@@ -422,15 +430,23 @@ def hierarchical_sample_attributes(
     oracle_structured: torch.Tensor | None = None,
     decoding_policy: str = "current",
     profiler: RuntimeProfiler | None = None,
+    structured_only: bool = False,
 ) -> dict[str, Any]:
     set_seed(seed)
     schema = config.schema
     rng = random.Random(int(seed))
     train_timesteps = int(config.raw.get("diffusion", {}).get("timesteps", 50))
     structured_schedule = masked_denoising_schedule(train_timesteps, structured_steps, timestep_spacing)
-    text_schedule = masked_denoising_schedule(train_timesteps, text_steps, timestep_spacing)
+    text_schedule = (
+        []
+        if structured_only
+        else masked_denoising_schedule(train_timesteps, text_steps, timestep_spacing)
+    )
     autocast_dtype, autocast_enabled = resolve_inference_dtype(inference_dtype, device)
-    result: dict[str, Any] = {column: [] for column in schema.model_categorical_targets + schema.text_targets}
+    output_columns = schema.model_categorical_targets + (
+        () if structured_only else schema.text_targets
+    )
+    result: dict[str, Any] = {column: [] for column in output_columns}
     model.eval()
     if graph_encoder is not None:
         graph_encoder.eval()
@@ -507,63 +523,68 @@ def hierarchical_sample_attributes(
                 and bool(override_mask.any())
             ):
                 cat_input[:, override_mask] = batch_oracle[:, override_mask]
-        with profile_timer(profiler, "length_target_preparation_seconds"):
-            exact_lengths = exact_lengths_from_length_buckets(
-                schema,
-                categorical_vocabs,
-                tokenizer,
-                cat_input,
-                rng,
-                device,
-            )
-            if oracle_conditions is not None:
-                for column, values in oracle_conditions.exact_lengths.items():
-                    exact_lengths[column] = values[
-                        start : start + len(batch_frame)
-                    ].to(device)
-            for column, minimum in minimum_content_lengths.items():
-                if (
-                    oracle_conditions is not None
-                    and column in oracle_conditions.exact_lengths
-                ):
-                    continue
-                exact_lengths[column] = exact_lengths[column].clamp(
-                    min=int(minimum)
+        if not structured_only:
+            with profile_timer(profiler, "length_target_preparation_seconds"):
+                exact_lengths = exact_lengths_from_length_buckets(
+                    schema,
+                    categorical_vocabs,
+                    tokenizer,
+                    cat_input,
+                    rng,
+                    device,
                 )
-            text_input, text_attention, text_remaining = initial_length_masked_text_inputs(schema, tokenizer, exact_lengths, device, len(batch_frame))
-        sample_text_stage(
-            model,
-            schema,
-            foreign_key_ids,
-            datetime_values,
-            cat_input,
-            text_input,
-            text_attention,
-            text_remaining,
-            graph_context,
-            text_schedule,
-            train_timesteps,
-            temperature,
-            top_p,
-            text_top_k,
-            tokenizer,
-            decoding_policy,
-            device,
-            autocast_dtype,
-            autocast_enabled,
-            profiler,
-        )
+                if oracle_conditions is not None:
+                    for column, values in oracle_conditions.exact_lengths.items():
+                        exact_lengths[column] = values[
+                            start : start + len(batch_frame)
+                        ].to(device)
+                for column, minimum in minimum_content_lengths.items():
+                    if (
+                        oracle_conditions is not None
+                        and column in oracle_conditions.exact_lengths
+                    ):
+                        continue
+                    exact_lengths[column] = exact_lengths[column].clamp(
+                        min=int(minimum)
+                    )
+                text_input, text_attention, text_remaining = initial_length_masked_text_inputs(
+                    schema, tokenizer, exact_lengths, device, len(batch_frame)
+                )
+            sample_text_stage(
+                model,
+                schema,
+                foreign_key_ids,
+                datetime_values,
+                cat_input,
+                text_input,
+                text_attention,
+                text_remaining,
+                graph_context,
+                text_schedule,
+                train_timesteps,
+                temperature,
+                top_p,
+                text_top_k,
+                tokenizer,
+                decoding_policy,
+                device,
+                autocast_dtype,
+                autocast_enabled,
+                profiler,
+            )
         for idx, column in enumerate(schema.model_categorical_targets):
             decoded = [decode_category_id(column, categorical_vocabs[column], value) for value in cat_input[:, idx].detach().cpu().tolist()]
             result[column].extend(decoded)
-        for column in schema.text_targets:
-            decoded = [tokenizer.decode(row) for row in text_input[column].detach().cpu().tolist()]
-            result[column].extend(decoded)
+        if not structured_only:
+            for column in schema.text_targets:
+                decoded = [tokenizer.decode(row) for row in text_input[column].detach().cpu().tolist()]
+                result[column].extend(decoded)
 
     num_batches = int(math.ceil(len(spine) / max(int(batch_size), 1)))
     result["_sampling_diagnostics"] = {
         "structured_steps": int(len(structured_schedule)),
         "text_steps": int(len(text_schedule)),
+        "structured_only": bool(structured_only),
         "structured_timestep_sequence": [int(value) for value in structured_schedule],
         "text_timestep_sequence": [int(value) for value in text_schedule],
         "num_batches": num_batches,
@@ -571,10 +592,14 @@ def hierarchical_sample_attributes(
         "text_forward_passes_total": int(num_batches * len(text_schedule)),
         "model_forward_passes_total": int(num_batches * (len(structured_schedule) + len(text_schedule))),
         "structured_conditioning_tokens_maskable": False,
-        "uses_generated_structured_attributes_for_text": not bool(
-            oracle_conditions is not None
-            and set(schema.categorical_targets).issubset(
-                oracle_conditions.structured_columns
+        "uses_generated_structured_attributes_for_text": (
+            False
+            if structured_only
+            else not bool(
+                oracle_conditions is not None
+                and set(schema.categorical_targets).issubset(
+                    oracle_conditions.structured_columns
+                )
             )
         ),
         "oracle_structured_columns": (
