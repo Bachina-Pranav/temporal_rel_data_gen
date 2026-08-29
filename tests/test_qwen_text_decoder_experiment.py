@@ -137,6 +137,17 @@ def test_followup_parser_supports_generated_oracle_and_omitted_summary():
     assert trim_generated_ids([10, 11], 2) == [10, 11]
 
 
+def test_generated_summary_policy_does_not_require_true_summary_column():
+    row = pd.Series({"rating": 5, "verified": True})
+    summary, review, status = parse_policy_continuation(
+        "Generated title\nReview: Generated body",
+        summary_mode="generated",
+        oracle_summary=row.get("summary", ""),
+    )
+    assert (summary, review) == ("Generated title", "Generated body")
+    assert not status["parse_failure"]
+
+
 def test_followup_subset_uses_complete_small_validation_and_seeded_large_sample():
     small = pd.DataFrame({"value": range(3982)})
     subset, metadata = select_fixed_subset(

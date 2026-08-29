@@ -521,7 +521,7 @@ class QwenFollowupExperiment:
                 summary, review, status = parse_policy_continuation(
                     continuation,
                     summary_mode=summary_mode,
-                    oracle_summary=row["summary"],
+                    oracle_summary=row.get("summary", ""),
                 )
                 outputs.append({"summary": summary, "review_text": review})
                 flags.append(status)
