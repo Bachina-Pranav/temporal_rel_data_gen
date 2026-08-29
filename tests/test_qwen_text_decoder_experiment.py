@@ -158,3 +158,33 @@ def test_followup_diffusion_discovery_requires_complete_latest_root(tmp_path):
     assert selected == newer
     assert {item["label"] for item in artifacts} == {"O1", "O2", "O3", "O4"}
     assert all("description" in item["conditioning"] for item in artifacts)
+
+
+def test_followup_does_not_require_unavailable_generated_structured_mode(tmp_path):
+    config_path = tmp_path / "base.yaml"
+    benchmark = tmp_path / "benchmark"
+    benchmark.mkdir()
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "seed": 42,
+                "output_dir": str(tmp_path / "base"),
+                "data": {"benchmark_dir": str(benchmark)},
+            }
+        )
+    )
+    followup_path = tmp_path / "followup.yaml"
+    followup_path.write_text(
+        yaml.safe_dump(
+            {
+                "seed": 42,
+                "base_experiment_config": str(config_path),
+                "base_output_dir": str(tmp_path / "base"),
+                "output_dir": str(tmp_path / "base" / "followup"),
+            }
+        )
+    )
+    from attribute_generation.qwen_text_decoder.followup import QwenFollowupExperiment
+
+    required = QwenFollowupExperiment(followup_path)._required_base_artifacts()
+    assert not any("generated_structured" in str(path) for path in required)

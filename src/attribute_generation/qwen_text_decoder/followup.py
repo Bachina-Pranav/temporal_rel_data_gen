@@ -241,8 +241,6 @@ class QwenFollowupExperiment:
             self.base_output / "training/best_adapter/adapter_config.json",
             self.base_output / "oracle_structured/synthetic_text.csv",
             self.base_output / "oracle_structured/canonical_text_c2st.json",
-            self.base_output / "generated_structured/synthetic_text.csv",
-            self.base_output / "generated_structured/canonical_text_c2st.json",
             self.base_output / "experiment_report.md",
             self.base.benchmark / "benchmark_manifest.json",
             self.base.benchmark / "train_real.csv",
@@ -321,6 +319,10 @@ class QwenFollowupExperiment:
         report["required_artifact_warnings"] = [
             description
             for description, value in (
+                (
+                    "Main Qwen generated-structured output is unavailable because no frozen structured artifact aligned with the held-out spine; oracle validation follow-ups remain valid",
+                    report["existing_qwen_outputs"].get("generated_structured"),
+                ),
                 ("Frozen LSTM output not found", report["existing_lstm_output"]),
                 ("Frozen diffusion output not found", report["existing_diffusion_output"]),
                 ("Complete historical O1/O2/O3/O4 output root not found", report["diffusion_diagnostic_root"]),
