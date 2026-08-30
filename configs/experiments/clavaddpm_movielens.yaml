@@ -1,0 +1,61 @@
+experiment_name: clavaddpm_movielens_100k
+seed: 42
+output_dir: outputs/baselines/clavaddpm/movielens
+
+official:
+  repository: https://github.com/weipang142857/ClavaDDPM.git
+  commit: fa6ef4d7c6d2c584b45a398c4471bb51e0bb5e17
+  checkout_dir: outputs/baselines/clavaddpm/vendor/ClavaDDPM
+  python_executable: auto
+
+data:
+  interactions: data/processed/interaction_benchmarks/movielens_100k/interactions.csv
+  users: data/processed/interaction_benchmarks/movielens_100k/users.csv
+  movies: data/processed/interaction_benchmarks/movielens_100k/movies.csv
+  evaluation_config: configs/evaluation/single_event_table_paper_metrics_movielens_100k.yaml
+  split: train
+
+clava:
+  clustering:
+    parent_scale: 1.0
+    num_clusters: 50
+    clustering_method: both
+  diffusion:
+    d_layers: [512, 1024, 1024, 1024, 1024, 512]
+    dropout: 0.0
+    num_timesteps: 2000
+    model_type: mlp
+    iterations: 200000
+    batch_size: 4096
+    lr: 0.0006
+    gaussian_loss_type: mse
+    weight_decay: 0.00001
+    scheduler: cosine
+  classifier:
+    d_layers: [128, 256, 512, 1024, 512, 256, 128]
+    lr: 0.0001
+    dim_t: 128
+    batch_size: 4096
+    iterations: 20000
+  sampling:
+    batch_size: 20000
+    classifier_scale: 1.0
+  matching:
+    num_matching_clusters: 1
+    matching_batch_size: 1000
+    # This selects ClavaDDPM's batched FAISS implementation. It remains a
+    # one-to-one child-row match and avoids the serial default implementation.
+    unique_matching: false
+    no_matching: false
+
+smoke:
+  train_rows: 2048
+  sample_scale: 0.25
+  num_clusters: 5
+  diffusion_iterations: 20
+  classifier_iterations: 20
+  num_timesteps: 20
+  diffusion_layers: [64, 64]
+  classifier_layers: [64, 64]
+  batch_size: 256
+

@@ -1,0 +1,47 @@
+experiment_name: qwen_relational_prefix_full
+seed: 42
+base_experiment_config: configs/experiments/qwen_text_decoder_06b.yaml
+decoding_config: configs/experiments/qwen_text_decoder_06b_decoding_sweep.yaml
+output_dir: outputs/qwen_text_decoder_06b/relational_prefix_full
+probe_output_dir: outputs/qwen_text_decoder_06b/relational_prefix_probe
+
+graph:
+  checkpoint: outputs/amazon-toy/lstm_m2_global_support/runs/seed_42/checkpoints/best.pt
+  batch_size: 1024
+  expected_mode: structure_only_temporal
+
+prefix:
+  num_tokens: 4
+  projector_hidden_dim: 512
+  dropout: 0.05
+  gate_initial_value: 0.10
+
+training:
+  train_rows: all
+  validation_rows: 2000
+  epochs: 2
+  batch_size: 8
+  gradient_accumulation_steps: 8
+  learning_rate: 0.0002
+  weight_decay: 0.01
+  gradient_clip_norm: 1.0
+  dataloader_num_workers: 2
+  early_stopping_patience: 1
+
+generation:
+  batch_size: 32
+  temperature: 1.05
+  top_p: 0.95
+  repetition_penalty: 1.05
+
+evaluation:
+  embedding_model: sentence-transformers/all-MiniLM-L6-v2
+  embedding_revision: 1110a243fdf4706b3f48f1d95db1a4f5529b4d41
+  folds: 5
+  max_rows_per_class: 3982
+  source_history_max_events: 20
+
+confirmation:
+  expected_rows: 3982
+  generated_structured_conditions: outputs/qwen_text_decoder_06b/phase1/generated_structured_qwen/generated_structured.csv
+

@@ -1,0 +1,32 @@
+experiment_name: qwen_capacity_probe
+seed: 42
+base_experiment_config: configs/experiments/qwen_text_decoder_06b.yaml
+output_dir: outputs/qwen_capacity_probe
+
+data:
+  train_rows: 20000
+  validation_rows: 2000
+
+models:
+  qwen3_06b:
+    model_id: Qwen/Qwen3-0.6B-Base
+  qwen3_17b:
+    model_id: Qwen/Qwen3-1.7B-Base
+
+training:
+  epochs: 1
+  train_batch_size: 8
+  eval_batch_size: 8
+  gradient_accumulation_steps: 8
+
+generation:
+  batch_size: 32
+  do_sample: true
+  temperature: 1.05
+  top_p: 0.95
+  repetition_penalty: 1.05
+
+evaluation:
+  max_rows_per_class: 2000
+  folds: 5
+
